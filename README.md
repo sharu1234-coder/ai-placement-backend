@@ -43,12 +43,21 @@ A `CloudProvider` implementation is added when a production AI service is chosen
 
 ## Status
 
-Stage 5 complete — Resume pipeline: `POST /resumes` (PDF upload → PyMuPDF text extraction →
-AI-structured parsing → persisted `Resume`/`ResumeAnalysis`) and `GET /resumes/{id}/analysis`.
-Structured AI output is validated against `ParsedResume` (Pydantic), with one retry on
-validation failure before a graceful `parse_status="failed"` (upload still succeeds — the
-student sees the file was received even if parsing didn't work). Also complete: FastAPI app,
-SQLAlchemy + Alembic-managed SQLite DB, JWT auth, student profile + role selection + sub-resources,
-global error handling. Not yet built: JD intelligence, Prepare Me engine, tests/interviews, roadmap.
+Stage 6 complete — JD Intelligence: `POST /jobs` (paste JD text → AI-structured parsing →
+role detection → persisted `JobDescription`/`Requirement` rows), `GET /jobs/{id}/requirements`,
+and `POST /jobs/{id}/match` (deterministic, non-AI skill matching against the profile's latest
+completed resume analysis — see `app/services/matching_service.py` — producing `JobMatch` +
+`SkillGap` rows with an explainable weighted score). Role detection is a case-insensitive
+substring match against the seeded `Role` catalog (the AI has no knowledge of our internal
+role ids); a smarter match can replace this heuristic later without changing the API contract.
+
+Also complete: FastAPI app, SQLAlchemy + Alembic-managed SQLite DB, JWT auth, student profile +
+role selection + sub-resources, resume pipeline (PDF → AI-structured analysis), global error
+handling. Not yet built: Prepare Me engine, tests/interviews, weakness engine, roadmap.
+
+**Known schema deviations from `PROJECT_HANDOFF.md`** (documented where they occur):
+`SkillGap.skill_name` (string) instead of `skill_id` (FK) — there's no global skill catalog
+table, only per-profile `Skill` entries (see Stage 4 notes), so gaps are keyed by name, matching
+how `JobMatch.matching_skills`/`missing_skills` are also name-based.
 
 **Security note:** `JWT_SECRET_KEY` in `.env.example` is a dev-only placeholder. It must be overridden with a real secret via `.env` (never committed) before any deployment beyond local development.
