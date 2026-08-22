@@ -23,6 +23,9 @@ SAMPLE_GENERATED_EVALUATION = GeneratedInterviewEvaluation(
 )
 
 
+SAMPLE_TRANSCRIPT = "Um, so I basically used a debugger and, like, bisected the change."
+
+
 class FakeAIProvider(AIProvider):
     def generate_structured(self, prompt, schema):
         if schema is GeneratedInterviewQuestion:
@@ -33,6 +36,12 @@ class FakeAIProvider(AIProvider):
 
     def generate_text(self, prompt):
         return "fake text"
+
+    def transcribe(self, audio: bytes) -> str:
+        return SAMPLE_TRANSCRIPT
+
+    def synthesize_speech(self, text: str) -> bytes:
+        return b"FAKEWAVDATA"
 
 
 @pytest.fixture()
@@ -76,9 +85,10 @@ def test_start_interview_defaults(client, auth_headers, role_selected):
     assert body["status"] == "in_progress"
 
 
-def test_start_interview_voice_mode_rejected(client, auth_headers, role_selected):
+def test_start_interview_voice_mode(client, auth_headers, role_selected):
     resp = client.post("/interviews", json={"mode": "voice"}, headers=auth_headers)
-    assert resp.status_code == 422
+    assert resp.status_code == 201
+    assert resp.json()["mode"] == "voice"
 
 
 def test_start_interview_unknown_jd_rejected(client, auth_headers, role_selected):
@@ -152,10 +162,57 @@ def test_answer_unknown_question_not_found(client, auth_headers, role_selected):
     assert resp.status_code == 404
 
 
-def test_audio_answer_not_implemented(client, auth_headers, role_selected):
-    interview_id = client.post("/interviews", json={}, headers=auth_headers).json()["id"]
-    resp = client.post(f"/interviews/{interview_id}/answer/audio", headers=auth_headers)
-    assert resp.status_code == 501
+def test_question_audio_synthesizes_and_returns_wav(client, auth_headers, role_selected, use_fake_ai):
+    interview_id = client.post("/interviews", json={"mode": "voice"}, headers=auth_headers).json()["id"]
+    question = client.get(f"/interviews/{interview_id}/next-question", headers=auth_headers).json()["question"]
+
+    resp = client.get(f"/interviews/{interview_id}/questions/{question['id']}/audio", headers=auth_headers)
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "audio/wav"
+    assert resp.content == b"FAKEWAVDATA"
+
+
+def test_question_audio_unknown_question_not_found(client, auth_headers, role_selected, use_fake_ai):
+    interview_id = client.post("/interviews", json={"mode": "voice"}, headers=auth_headers).json()["id"]
+    resp = client.get(f"/interviews/{interview_id}/questions/999999/audio", headers=auth_headers)
+    assert resp.status_code == 404
+
+
+def test_submit_audio_answer_transcribes_and_persists(client, auth_headers, role_selected, use_fake_ai):
+    interview_id = client.post("/interviews", json={"mode": "voice"}, headers=auth_headers).json()["id"]
+    question = client.get(f"/interviews/{interview_id}/next-question", headers=auth_headers).json()["question"]
+
+    resp = client.post(
+        f"/interviews/{interview_id}/answer/audio",
+        data={"interview_question_id": str(question["id"])},
+        files={"file": ("answer.m4a", b"fake-audio-bytes", "audio/mp4")},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["answer_text"] == SAMPLE_TRANSCRIPT
+
+    next_resp = client.get(f"/interviews/{interview_id}/next-question", headers=auth_headers).json()
+    assert next_resp["completed"] is False
+    assert next_resp["question"]["order_index"] == 2
+
+
+def test_submit_audio_answer_rejected_when_already_answered(client, auth_headers, role_selected, use_fake_ai):
+    interview_id = client.post("/interviews", json={"mode": "voice"}, headers=auth_headers).json()["id"]
+    question = client.get(f"/interviews/{interview_id}/next-question", headers=auth_headers).json()["question"]
+
+    client.post(
+        f"/interviews/{interview_id}/answer/audio",
+        data={"interview_question_id": str(question["id"])},
+        files={"file": ("answer.m4a", b"fake-audio-bytes", "audio/mp4")},
+        headers=auth_headers,
+    )
+    resp = client.post(
+        f"/interviews/{interview_id}/answer/audio",
+        data={"interview_question_id": str(question["id"])},
+        files={"file": ("answer2.m4a", b"more-fake-bytes", "audio/mp4")},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 409
 
 
 def test_evaluation_requires_completed_interview(client, auth_headers, role_selected, use_fake_ai):
@@ -205,10 +262,36 @@ def test_full_interview_lifecycle_reaches_evaluation(client, auth_headers, role_
     body = result.json()
     assert 0.0 <= body["overall_score"] <= 1.0
     assert body["grammar"] is not None  # text mode
-    assert body["speaking_pace"] is None  # voice-only, Stage 10
-    assert body["filler_word_rate"] is None
+    assert body["speaking_pace"] is None  # voice-only field, None in text mode
+    assert body["filler_word_rate"] is None  # voice-only field, None in text mode
     assert body["feedback"]
 
     # Result is persisted -- a second call returns the same computed values.
     result_again = client.get(f"/interviews/{interview_id}/evaluation", headers=auth_headers)
     assert result_again.json() == body
+
+
+def test_full_voice_interview_lifecycle_scores_filler_words(client, auth_headers, role_selected, use_fake_ai):
+    interview_id = client.post("/interviews", json={"mode": "voice"}, headers=auth_headers).json()["id"]
+
+    for _ in range(20):
+        next_q = client.get(f"/interviews/{interview_id}/next-question", headers=auth_headers).json()
+        if next_q["completed"]:
+            break
+        question = next_q["question"]
+        answer_resp = client.post(
+            f"/interviews/{interview_id}/answer/audio",
+            data={"interview_question_id": str(question["id"])},
+            files={"file": ("answer.m4a", b"fake-audio-bytes", "audio/mp4")},
+            headers=auth_headers,
+        )
+        assert answer_resp.status_code == 200
+        assert answer_resp.json()["answer_text"] == SAMPLE_TRANSCRIPT
+
+    result = client.get(f"/interviews/{interview_id}/evaluation", headers=auth_headers)
+    assert result.status_code == 200
+    body = result.json()
+    assert body["grammar"] is None  # voice mode -- grammar isn't judged, per the doc's schema
+    assert body["speaking_pace"] is None  # not computable without persisting audio duration
+    # SAMPLE_TRANSCRIPT ("Um, so I basically used ... like, bisected ...") has real fillers.
+    assert body["filler_word_rate"] > 0.0

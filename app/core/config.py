@@ -20,6 +20,10 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "qwen3:8b"
 
+    # Dev-only local STT for OllamaProvider.transcribe -- swap for a cloud STT provider
+    # before real user testing (see CloudProvider note in README).
+    whisper_model_size: str = "tiny.en"
+
     upload_dir: str = "uploads"
 
 

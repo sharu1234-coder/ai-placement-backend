@@ -23,10 +23,14 @@ class AIProvider(ABC):
         ...
 
     def transcribe(self, audio: bytes) -> str:
-        raise NotImplementedError("Voice transcription is not wired yet (Stage 10).")
+        """Default: no voice support. Providers that support it (e.g. OllamaProvider,
+        via local Whisper) override this."""
+        raise NotImplementedError("This AI provider does not support voice transcription.")
 
     def synthesize_speech(self, text: str) -> bytes:
-        raise NotImplementedError("Speech synthesis is not wired yet (Stage 10).")
+        """Default: no voice support. Providers that support it (e.g. OllamaProvider,
+        via local TTS) override this. Returns WAV bytes."""
+        raise NotImplementedError("This AI provider does not support speech synthesis.")
 
 
 def get_ai_provider() -> AIProvider:

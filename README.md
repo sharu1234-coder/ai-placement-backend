@@ -41,14 +41,62 @@ services never call Ollama or any vendor SDK directly. Requires Ollama running l
 A `CloudProvider` implementation is added when a production AI service is chosen; only
 `AI_PROVIDER` in `.env` changes to switch.
 
+`OllamaProvider` also implements `transcribe`/`synthesize_speech` (Stage 10) using local,
+dev-only STT/TTS -- see Status below for details and why these must not ship to production
+as-is.
+
 ## Status
 
-Stage 9 complete — Text Interview Engine: the interview lifecycle (`POST /interviews`,
+Stage 10 complete — Voice Interview (turn-based STT/LLM/TTS), built on Stage 9's lifecycle
+(same endpoints, `mode="voice"` now accepted):
+- `OllamaProvider.transcribe()` (STT) uses local `faster-whisper` (`tiny.en` by default,
+  CPU, int8) -- dev-only, real inference, not a stub. `OllamaProvider.synthesize_speech()`
+  (TTS) uses local Windows SAPI5 via `pyttsx3` -- also dev-only, real (if robotic) audio,
+  never a stub. Both must be swapped for cloud providers before real user testing; both
+  are documented in their own docstrings.
+- `GET /interviews/{id}/questions/{question_id}/audio` -- **not in the documented endpoint
+  table** (section 8.5), added because turn-based voice needs the system to *speak* each
+  question, and the doc's own `AIProvider.synthesize_speech` only makes sense with a route
+  that calls it. Synthesizes on demand every call; nothing is ever written to disk, per
+  "minimize stored voice data" (section 6).
+- `POST /interviews/{id}/answer/audio` (previously a 501 stub) now genuinely transcribes an
+  uploaded recording and persists it as the answer. `InterviewAnswer.audio_url` stays
+  `null` by design -- the raw recording is transcribed in memory and discarded, never
+  persisted, again per "minimize stored voice data". This is a documented deviation from
+  literally storing `audio_url`.
+- `GET .../evaluation`: for `mode="voice"`, `grammar` is `null` (doc labels it text-mode)
+  and `filler_word_rate` is computed deterministically from the transcript (word-count
+  heuristic over common filler phrases -- not AI-judged, matching the codebase's "our own
+  gap engine" philosophy). `speaking_pace` stays `null` for V1 -- it would need audio
+  duration, which isn't available since raw audio is never persisted; a real fix would
+  measure duration transiently at transcribe time without persisting the audio, deferred
+  for now.
+- **Real bug found and fixed via live testing, not present in earlier stages' scope**: the
+  new `POST /answer/audio` route is `async def` (needed for `await file.read()`), and an
+  `async def` route runs directly on the event loop -- FastAPI only auto-threadpools plain
+  `def` routes. Calling `transcribe()` (a slow, blocking, synchronous call) directly inside
+  it froze the *entire server*, not just that request, confirmed by a concurrent `/health`
+  call timing out during a live transcription. Fixed with `starlette.concurrency.
+  run_in_threadpool`. **Known pre-existing instance of the same bug, not fixed here** (out
+  of Stage 10 scope, flagged for the Stage 12 hardening pass): `resumes.py`'s
+  `upload_resume` has the identical shape (`async def` + a blocking `generate_structured`
+  call) and would exhibit the same freeze under concurrent load.
+- Verified live end-to-end against real models (not mocks): synthesized a real question to
+  WAV, fed that same audio back through the transcribe endpoint (a genuine TTS→STT round
+  trip), and got back a near-verbatim transcript of the original question text. Completed a
+  full voice interview lifecycle through evaluation; the AI evaluator correctly caught and
+  penalized repeated/irrelevant answers with accurate, specific feedback rather than
+  rubber-stamping.
+- **First-run note**: `faster-whisper` downloads its model from Hugging Face on first use
+  (~75MB for `tiny.en`). Hugging Face's xet-accelerated download path hung indefinitely in
+  dev testing; `_get_whisper_model()` now sets `HF_HUB_DISABLE_XET=1` automatically before
+  first import to force the reliable plain-HTTPS fallback.
+
+Stage 9 — Text Interview Engine: the interview lifecycle (`POST /interviews`,
 `GET .../next-question`, `POST .../answer`, `GET .../evaluation`) in
 `app/services/interview_service.py`:
 - `POST /interviews` starts an `Interview` of `type` (`technical`/`hr`/`project`) for the
-  caller's profile. `mode` defaults to `"text"`; `mode="voice"` is rejected with 422 --
-  turn-based STT/LLM/TTS is Stage 10 scope. `jd_id` is optional; when given, its
+  caller's profile. `mode` defaults to `"text"`. `jd_id` is optional; when given, its
   `detected_role_id` supplies role context, otherwise the profile's `target_role_id` is
   used (see `_build_context`).
 - `GET .../next-question` generates one `InterviewQuestion` at a time (fixed at 5 per
@@ -129,7 +177,7 @@ encoder can't serialize. Now wrapped in `jsonable_encoder`.
 Also complete: FastAPI app, SQLAlchemy + Alembic-managed SQLite DB, JWT auth, student profile +
 role selection + sub-resources, resume pipeline (PDF → AI-structured analysis), JD intelligence
 (parse/role-detect/match), Prepare Me blueprint generation, role/JD test-taking with adaptive
-difficulty, global error handling. Not yet built: voice interviews (Stage 10), weakness engine,
+difficulty, text + voice interviews, global error handling. Not yet built: weakness engine,
 roadmap (Stage 11).
 
 **Known schema deviations from `PROJECT_HANDOFF.md`** (documented where they occur):

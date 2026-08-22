@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 from typing import List, Optional
 
@@ -26,6 +27,20 @@ _QUESTION_PROMPT_PATH = Path(__file__).resolve().parent.parent / "ai" / "prompts
 _EVALUATION_PROMPT_PATH = Path(__file__).resolve().parent.parent / "ai" / "prompts" / "interview_evaluation_v1.txt"
 
 _QUESTIONS_PER_INTERVIEW = 5
+
+# Deterministic, non-AI (matches the codebase's "our own gap engine" philosophy). Computed
+# from the transcript text alone -- speaking_pace would need audio duration, which isn't
+# available since raw audio is never persisted (see "minimize stored voice data").
+_FILLER_PHRASES = ["um", "uh", "umm", "uhh", "erm", "like", "you know", "sort of", "kind of", "basically"]
+
+
+def _filler_word_rate(text: str) -> float:
+    words = re.findall(r"[a-zA-Z']+", text.lower())
+    if not words:
+        return 0.0
+    lowered = " ".join(words)
+    filler_count = sum(lowered.count(phrase) for phrase in _FILLER_PHRASES)
+    return round(min(filler_count / len(words), 1.0), 3)
 
 
 class InterviewNotFoundError(Exception):
@@ -67,9 +82,6 @@ def _question_read(question: InterviewQuestion) -> InterviewQuestionRead:
 def start_interview(
     db: Session, profile_id: int, interview_type: str, mode: str, jd_id: Optional[int]
 ) -> InterviewRead:
-    if mode != "text":
-        raise InvalidInterviewRequestError("Voice interviews aren't available yet (Stage 10)")
-
     if jd_id is not None:
         jd = db.get(JobDescription, jd_id)
         if jd is None or jd.profile_id != profile_id:
@@ -220,10 +232,58 @@ def submit_answer(
     return InterviewAnswerRead(interview_question_id=interview_question_id, answer_text=answer_text)
 
 
-def _build_evaluation_prompt(interview_type: str, context: dict, transcript: str) -> str:
+def submit_audio_answer(
+    db: Session,
+    profile_id: int,
+    interview_id: int,
+    interview_question_id: int,
+    audio_bytes: bytes,
+    ai_provider: AIProvider,
+) -> InterviewAnswerRead:
+    _get_owned_interview(db, interview_id, profile_id)
+
+    question = db.get(InterviewQuestion, interview_question_id)
+    if question is None or question.interview_id != interview_id:
+        raise InterviewNotFoundError("Interview question not found")
+
+    existing = (
+        db.query(InterviewAnswer)
+        .filter(InterviewAnswer.interview_question_id == interview_question_id)
+        .first()
+    )
+    if existing is not None:
+        raise InterviewQuestionNotPendingError("This question has already been answered")
+
+    answer_text = ai_provider.transcribe(audio_bytes)
+
+    # "Minimize stored voice data" (PROJECT_HANDOFF.md section 6): the transcript is kept,
+    # the raw recording is not persisted -- audio_url stays null by design, a documented
+    # deviation from literally storing it.
+    answer = InterviewAnswer(
+        interview_question_id=interview_question_id, answer_text=answer_text, transcribed=True
+    )
+    db.add(answer)
+    db.commit()
+
+    return InterviewAnswerRead(interview_question_id=interview_question_id, answer_text=answer_text)
+
+
+def synthesize_question_audio(
+    db: Session, profile_id: int, interview_id: int, question_id: int, ai_provider: AIProvider
+) -> bytes:
+    _get_owned_interview(db, interview_id, profile_id)
+
+    question = db.get(InterviewQuestion, question_id)
+    if question is None or question.interview_id != interview_id:
+        raise InterviewNotFoundError("Interview question not found")
+
+    return ai_provider.synthesize_speech(question.question_text)
+
+
+def _build_evaluation_prompt(interview_type: str, mode: str, context: dict, transcript: str) -> str:
     template = _EVALUATION_PROMPT_PATH.read_text(encoding="utf-8")
     return template.format(
-        interview_type=interview_type, role_name=context["role_name"], jd_text=context["jd_text"],
+        interview_type=interview_type, mode=mode, role_name=context["role_name"], jd_text=context["jd_text"],
         transcript=transcript,
     )
 
@@ -281,8 +341,14 @@ def get_evaluation(
     )
 
     context = _build_context(db, profile_id, interview)
-    prompt = _build_evaluation_prompt(interview.type, context, transcript)
+    prompt = _build_evaluation_prompt(interview.type, interview.mode, context, transcript)
     generated: GeneratedInterviewEvaluation = ai_provider.generate_structured(prompt, GeneratedInterviewEvaluation)
+
+    filler_word_rate = None
+    if interview.mode == "voice":
+        answer_texts = [a.answer_text for a in answers_by_question_id.values() if a.answer_text]
+        if answer_texts:
+            filler_word_rate = _filler_word_rate(" ".join(answer_texts))
 
     evaluation = InterviewEvaluation(
         interview_id=interview_id,
@@ -292,9 +358,13 @@ def get_evaluation(
         reasoning=generated.reasoning,
         structure=generated.structure,
         clarity=generated.clarity,
-        grammar=generated.grammar,
+        # grammar is a text-mode field per the doc's schema; voice answers are judged on
+        # speaking_pace/filler_word_rate instead.
+        grammar=generated.grammar if interview.mode == "text" else None,
+        # speaking_pace would need audio duration, which isn't available since raw audio
+        # is never persisted -- left None for V1, see README.
         speaking_pace=None,
-        filler_word_rate=None,
+        filler_word_rate=filler_word_rate,
         role_jd_coverage=generated.role_jd_coverage,
         overall_score=generated.overall_score,
         feedback_text=generated.feedback,
