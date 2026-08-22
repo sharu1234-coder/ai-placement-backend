@@ -5,6 +5,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app.api.auth import router as auth_router
+from app.api.resumes import router as resumes_router
 from app.api.users import router as users_router
 from app.core.config import settings
 from app.core.logging import configure_logging
@@ -16,6 +17,7 @@ app = FastAPI(title=settings.app_name)
 
 app.include_router(auth_router)
 app.include_router(users_router)
+app.include_router(resumes_router)
 
 
 @app.get("/health")

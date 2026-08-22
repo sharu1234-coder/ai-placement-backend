@@ -14,6 +14,8 @@ from app.models.education import Education  # noqa: F401
 from app.models.experience import Experience  # noqa: F401
 from app.models.profile import StudentProfile  # noqa: F401
 from app.models.project import Project  # noqa: F401
+from app.models.resume import Resume  # noqa: F401
+from app.models.resume_analysis import ResumeAnalysis  # noqa: F401
 from app.models.role import Role  # noqa: F401
 from app.models.skill import Skill  # noqa: F401
 from app.models.user import User  # noqa: F401
