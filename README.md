@@ -43,21 +43,38 @@ A `CloudProvider` implementation is added when a production AI service is chosen
 
 ## Status
 
-Stage 6 complete — JD Intelligence: `POST /jobs` (paste JD text → AI-structured parsing →
-role detection → persisted `JobDescription`/`Requirement` rows), `GET /jobs/{id}/requirements`,
-and `POST /jobs/{id}/match` (deterministic, non-AI skill matching against the profile's latest
-completed resume analysis — see `app/services/matching_service.py` — producing `JobMatch` +
-`SkillGap` rows with an explainable weighted score). Role detection is a case-insensitive
-substring match against the seeded `Role` catalog (the AI has no knowledge of our internal
-role ids); a smarter match can replace this heuristic later without changing the API contract.
+Stage 7 complete — Prepare Me Engine: `POST /assessments/blueprint`, the signature "Prepare
+Me" trigger. Deterministic (non-AI) skill-matrix + blueprint generation in
+`app/services/assessment_service.py`:
+- Base skill matrix comes from the seeded `RoleSkillWeight` taxonomy for the given/detected role.
+- If a JD is provided, its extracted skills override/merge into the matrix (`source` becomes
+  `"jd_override"`; a JD-only skill not in the base taxonomy is added with a default
+  `assessment_type="technical"`, since we don't know its true category).
+- Each section's `question_count` and priority ordering account for whether the skill is
+  already covered by the profile's resume (a "gap" skill gets more weight and more questions).
+- `RoleSkillWeight` is seeded for all 11 starter roles (`alembic/versions/*_seed_default_role_skill_weights.py`)
+  — only SDE/Data Analyst/Data Scientist/Data Engineer skill lists come directly from
+  `PROJECT_HANDOFF.md` section 5; the other 7 roles are a reasonable first pass, easily
+  adjusted later (the doc calls these "starting points, not fixed").
+- "project" and "HR" from the doc's informal role skill lists are deliberately excluded from
+  the seeded weights — those map to interview stages (Stage 9/10), not testable skills.
+
+Fixed a real bug while adding tests: the global validation-error handler (Stage 3) crashed
+with an unrelated 500 whenever a Pydantic `model_validator` raised a plain `ValueError` --
+the resulting error dict's `ctx.error` held a raw exception object, which the default JSON
+encoder can't serialize. Now wrapped in `jsonable_encoder`.
 
 Also complete: FastAPI app, SQLAlchemy + Alembic-managed SQLite DB, JWT auth, student profile +
-role selection + sub-resources, resume pipeline (PDF → AI-structured analysis), global error
-handling. Not yet built: Prepare Me engine, tests/interviews, weakness engine, roadmap.
+role selection + sub-resources, resume pipeline (PDF → AI-structured analysis), JD intelligence
+(parse/role-detect/match), global error handling. Not yet built: the actual test-taking
+lifecycle (Question generation, adaptive difficulty -- Stage 8), interviews, weakness engine,
+roadmap.
 
 **Known schema deviations from `PROJECT_HANDOFF.md`** (documented where they occur):
-`SkillGap.skill_name` (string) instead of `skill_id` (FK) — there's no global skill catalog
-table, only per-profile `Skill` entries (see Stage 4 notes), so gaps are keyed by name, matching
-how `JobMatch.matching_skills`/`missing_skills` are also name-based.
+- `SkillGap.skill_name` (string) instead of `skill_id` (FK) — there's no global skill catalog
+  table, only per-profile `Skill` entries (see Stage 4 notes), so gaps are keyed by name,
+  matching how `JobMatch.matching_skills`/`missing_skills` are also name-based.
+- `RoleSkillWeight.skill` (string) instead of `skill_id` (FK) — same reasoning, and it matches
+  the doc's own Pydantic schema (section 8.7) more closely than its prose entity list does.
 
 **Security note:** `JWT_SECRET_KEY` in `.env.example` is a dev-only placeholder. It must be overridden with a real secret via `.env` (never committed) before any deployment beyond local development.

@@ -6,8 +6,9 @@ from app.api.deps import get_current_user, get_db
 from app.models.user import User
 from app.schemas.job import JobDescriptionParseResponse, JobMatchRead, ParseJDRequest, RequirementRead
 from app.services.jd_service import get_requirements, parse_job_description
-from app.services.matching_service import NoResumeAnalysisError, match_resume_to_job
+from app.services.matching_service import match_resume_to_job
 from app.services.profile_service import get_or_create_profile
+from app.services.skill_matching import NoResumeAnalysisError
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 

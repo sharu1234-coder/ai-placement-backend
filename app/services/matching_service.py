@@ -5,39 +5,12 @@ from sqlalchemy.orm import Session
 from app.models.job_description import JobDescription
 from app.models.job_match import JobMatch
 from app.models.requirement import Requirement
-from app.models.resume import Resume
-from app.models.resume_analysis import ResumeAnalysis
 from app.models.skill_gap import SkillGap
 from app.schemas.job import JobMatchRead, SkillGapRead
+from app.services.skill_matching import latest_resume_skills, skill_present
 
 _REQUIRED_POINTS = 2
 _PREFERRED_POINTS = 1
-
-
-class NoResumeAnalysisError(Exception):
-    """Raised when the profile has no completed resume analysis to match against."""
-
-
-def _latest_resume_skills(db: Session, profile_id: int) -> list[str]:
-    resume = (
-        db.query(Resume)
-        .filter(Resume.profile_id == profile_id, Resume.parse_status == "completed")
-        .order_by(Resume.id.desc())
-        .first()
-    )
-    if resume is None:
-        raise NoResumeAnalysisError("No completed resume analysis found for this profile")
-
-    analysis = db.query(ResumeAnalysis).filter(ResumeAnalysis.resume_id == resume.id).first()
-    if analysis is None:
-        raise NoResumeAnalysisError("No completed resume analysis found for this profile")
-
-    return [s.lower() for s in analysis.extracted_skills]
-
-
-def _skill_present(skill_name: str, resume_skills: list[str]) -> bool:
-    skill_lower = skill_name.lower()
-    return any(skill_lower in rs or rs in skill_lower for rs in resume_skills)
 
 
 def match_resume_to_job(db: Session, jd_id: int, profile_id: int) -> Optional[JobMatchRead]:
@@ -48,7 +21,7 @@ def match_resume_to_job(db: Session, jd_id: int, profile_id: int) -> Optional[Jo
     if jd is None or jd.profile_id != profile_id:
         return None
 
-    resume_skills = _latest_resume_skills(db, profile_id)
+    resume_skills = latest_resume_skills(db, profile_id)
 
     jd_skill_requirements = (
         db.query(Requirement)
@@ -64,7 +37,7 @@ def match_resume_to_job(db: Session, jd_id: int, profile_id: int) -> Optional[Jo
     for req in jd_skill_requirements:
         points = _REQUIRED_POINTS if req.importance == "required" else _PREFERRED_POINTS
         max_points += points
-        if _skill_present(req.value, resume_skills):
+        if skill_present(req.value, resume_skills):
             matching.append(req.value)
             earned_points += points
         else:

@@ -1,9 +1,11 @@
 import logging
 
 from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
+from app.api.assessments import router as assessments_router
 from app.api.auth import router as auth_router
 from app.api.jobs import router as jobs_router
 from app.api.resumes import router as resumes_router
@@ -20,6 +22,7 @@ app.include_router(auth_router)
 app.include_router(users_router)
 app.include_router(resumes_router)
 app.include_router(jobs_router)
+app.include_router(assessments_router)
 
 
 @app.get("/health")
@@ -31,7 +34,7 @@ def health_check() -> dict:
 async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
     return JSONResponse(
         status_code=422,
-        content={"detail": "Validation failed", "errors": exc.errors()},
+        content=jsonable_encoder({"detail": "Validation failed", "errors": exc.errors()}),
     )
 
 

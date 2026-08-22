@@ -9,6 +9,7 @@ from app.core.config import settings
 from app.database.base import Base
 
 # Imported for their side effect of registering tables with Base.metadata.
+from app.models.assessment_blueprint import AssessmentBlueprint  # noqa: F401
 from app.models.certification import Certification  # noqa: F401
 from app.models.education import Education  # noqa: F401
 from app.models.experience import Experience  # noqa: F401
@@ -20,6 +21,7 @@ from app.models.requirement import Requirement  # noqa: F401
 from app.models.resume import Resume  # noqa: F401
 from app.models.resume_analysis import ResumeAnalysis  # noqa: F401
 from app.models.role import Role  # noqa: F401
+from app.models.role_skill_weight import RoleSkillWeight  # noqa: F401
 from app.models.skill import Skill  # noqa: F401
 from app.models.skill_gap import SkillGap  # noqa: F401
 from app.models.user import User  # noqa: F401
