@@ -87,6 +87,48 @@ def test_add_and_list_profile_subresource(client, auth_headers, path, payload, l
     assert items[0][list_field] == payload[list_field]
 
 
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        ("education", {"institution": "IIT Bombay", "degree": "B.Tech"}),
+        ("skills", {"name": "SQL"}),
+        ("projects", {"title": "Placement Tracker"}),
+        ("experience", {"company": "Acme Corp"}),
+        ("certifications", {"name": "AWS Cloud Practitioner"}),
+    ],
+)
+def test_delete_profile_subresource(client, auth_headers, path, payload):
+    created = client.post(f"/users/me/{path}", json=payload, headers=auth_headers).json()
+
+    resp = client.delete(f"/users/me/{path}/{created['id']}", headers=auth_headers)
+    assert resp.status_code == 204
+
+    items = client.get(f"/users/me/{path}", headers=auth_headers).json()
+    assert items == []
+
+
+def test_delete_profile_subresource_not_found(client, auth_headers):
+    resp = client.delete("/users/me/skills/999999", headers=auth_headers)
+    assert resp.status_code == 404
+
+
+def test_delete_profile_subresource_isolated_per_user(client, auth_headers):
+    created = client.post("/users/me/skills", json={"name": "Python"}, headers=auth_headers).json()
+
+    client.post("/auth/signup", json={"email": "other-profile@example.com", "password": "supersecret123"})
+    other_token = client.post(
+        "/auth/login", json={"email": "other-profile@example.com", "password": "supersecret123"}
+    ).json()["access_token"]
+
+    resp = client.delete(
+        f"/users/me/skills/{created['id']}", headers={"Authorization": f"Bearer {other_token}"}
+    )
+    assert resp.status_code == 404
+
+    items = client.get("/users/me/skills", headers=auth_headers).json()
+    assert len(items) == 1
+
+
 def test_profile_subresources_isolated_per_user(client):
     client.post("/auth/signup", json={"email": "a@example.com", "password": "supersecret123"})
     token_a = client.post(

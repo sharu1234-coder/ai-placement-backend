@@ -5,7 +5,12 @@ from app.ai.provider import AIProvider, get_ai_provider
 from app.api.deps import get_current_user, get_db
 from app.models.user import User
 from app.schemas.job import JobDescriptionParseResponse, JobMatchRead, ParseJDRequest, RequirementRead
-from app.services.jd_service import get_requirements, parse_job_description
+from app.services.jd_service import (
+    JobDescriptionInUseError,
+    delete_job_description,
+    get_requirements,
+    parse_job_description,
+)
 from app.services.matching_service import match_resume_to_job
 from app.services.profile_service import get_or_create_profile
 from app.services.skill_matching import NoResumeAnalysisError
@@ -52,3 +57,18 @@ def match_job(
     if result is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job description not found")
     return result
+
+
+@router.delete("/{jd_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_job_description_endpoint(
+    jd_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> None:
+    profile = get_or_create_profile(db, current_user)
+    try:
+        deleted = delete_job_description(db, jd_id, profile.id)
+    except JobDescriptionInUseError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    if deleted is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job description not found")

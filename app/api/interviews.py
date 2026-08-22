@@ -5,6 +5,7 @@ from starlette.concurrency import run_in_threadpool
 
 from app.ai.provider import AIGenerationError, AIProvider, get_ai_provider
 from app.api.deps import get_current_user, get_db
+from app.api.upload_utils import read_upload_limited
 from app.models.user import User
 from app.schemas.interview import (
     InterviewAnswerRead,
@@ -77,12 +78,7 @@ async def submit_audio_answer(
     ai_provider: AIProvider = Depends(get_ai_provider),
 ) -> InterviewAnswerRead:
     profile = get_or_create_profile(db, current_user)
-
-    audio_bytes = await file.read()
-    if len(audio_bytes) > _MAX_AUDIO_UPLOAD_BYTES:
-        raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="Audio file too large (max 10MB)"
-        )
+    audio_bytes = await read_upload_limited(file, _MAX_AUDIO_UPLOAD_BYTES, "Audio file too large (max 10MB)")
 
     try:
         # transcribe() is a slow, blocking, synchronous call (local model inference); this

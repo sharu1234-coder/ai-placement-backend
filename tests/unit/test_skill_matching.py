@@ -20,3 +20,16 @@ def test_no_match():
 
 def test_empty_resume_skills():
     assert not skill_present("SQL", [])
+
+
+def test_short_skill_name_does_not_false_positive_on_substring():
+    # Regression: a plain `"r" in "docker"` substring check used to return True here.
+    assert not skill_present("R", ["docker", "python"])
+
+
+def test_empty_skill_name_never_matches():
+    assert not skill_present("", ["python", "sql"])
+
+
+def test_empty_resume_skill_entry_never_matches():
+    assert not skill_present("SQL", ["", "python"])

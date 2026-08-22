@@ -1,6 +1,7 @@
 import logging
 import os
 import tempfile
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -15,20 +16,28 @@ logger = logging.getLogger(__name__)
 # Module-level cache: the Whisper model is expensive to load (~seconds, plus a one-time
 # download), and OllamaProvider is constructed fresh per request by get_ai_provider(), so
 # this must live outside the instance or every voice-answer request would reload it.
+# Guarded by _whisper_model_lock -- audio answers run via run_in_threadpool (see
+# interviews.py), so two concurrent first requests could otherwise both see None and both
+# construct a WhisperModel.
 _whisper_model = None
+_whisper_model_lock = threading.Lock()
 
 
 def _get_whisper_model():
     global _whisper_model
-    if _whisper_model is None:
-        # The xet-accelerated download path in huggingface_hub hung indefinitely in dev
-        # testing; the plain HTTPS fallback works reliably. Must be set before the first
-        # huggingface_hub/faster_whisper import touches it.
-        os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
-        from faster_whisper import WhisperModel
+    if _whisper_model is not None:
+        return _whisper_model
 
-        logger.info("Loading Whisper model '%s' (first use only)...", settings.whisper_model_size)
-        _whisper_model = WhisperModel(settings.whisper_model_size, device="cpu", compute_type="int8")
+    with _whisper_model_lock:
+        if _whisper_model is None:
+            # The xet-accelerated download path in huggingface_hub hung indefinitely in
+            # dev testing; the plain HTTPS fallback works reliably. Must be set before the
+            # first huggingface_hub/faster_whisper import touches it.
+            os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+            from faster_whisper import WhisperModel
+
+            logger.info("Loading Whisper model '%s' (first use only)...", settings.whisper_model_size)
+            _whisper_model = WhisperModel(settings.whisper_model_size, device="cpu", compute_type="int8")
     return _whisper_model
 
 

@@ -47,6 +47,43 @@ as-is.
 
 ## Status
 
+**Whole-codebase audit (2026-08-23)** — a full review of `app/`, `app/services`, `app/api`,
+`app/ai` against the running test suite surfaced and fixed several real issues, most
+severe first:
+- `skill_matching.skill_present` used plain substring containment (`"r" in "docker"` was
+  `True`), silently fabricating skill matches for short skill names and for an empty JD
+  skill value. Replaced with token-boundary matching (see the function's docstring). This
+  affects the core resume↔JD gap analysis and the assessment blueprint's gap detection.
+- `jd_service.detect_role` matched the *first* seeded role whenever the AI returned a
+  blank `role_title`, because `"" in name_lower"` is trivially `True`. Now returns `None`
+  for a blank/whitespace-only title instead of a wrong role.
+- `resumes.py`'s `upload_resume` had the exact same event-loop-freezing bug already found
+  and fixed in Stage 10's interview audio endpoint (an `async def` route calling a
+  blocking service function directly) -- flagged as a known unfixed instance in the Stage
+  10 notes below, now fixed the same way with `run_in_threadpool`.
+- N+1 queries in `assessment_run_service` (`get_next_question`/`get_result`, one
+  `db.get(Question, ...)` per attempt) replaced with the same bulk `IN (...)` pattern
+  `interview_service` already used correctly for the equivalent problem.
+- A check-then-set race on the lazy-loaded Whisper model (two concurrent first voice
+  answers could each start loading their own model instance) fixed with a
+  `threading.Lock`.
+- Upload size limits (resumes, audio answers) were enforced only *after* the full body was
+  already buffered in memory; `app/api/upload_utils.py`'s `read_upload_limited` now reads
+  in chunks and aborts as soon as the limit is exceeded.
+- Added `max_length` caps on previously-unbounded free-text fields (JD `raw_text`,
+  assessment/interview answer text) that were otherwise embedded directly into AI prompts
+  with no size limit.
+- **New: deletion endpoints.** PROJECT_HANDOFF.md section 6 states "provide deletion
+  controls for user data" and "protect resumes and uploaded documents" as non-negotiable,
+  but no DELETE route existed anywhere before this audit. Added `DELETE /resumes/{id}`
+  (also removes the file from disk, not just the DB row), `DELETE /jobs/{id}` (cascades
+  through its Requirements/JobMatch/SkillGap, but refuses with 409 if an
+  AssessmentBlueprint or Interview already depends on it, to avoid dangling a `jd_id`),
+  and `DELETE /users/me/{education,skills,projects,experience,certifications}/{id}`.
+- 18 new tests added for all of the above (111 passing total). Full findings list
+  (including lower-priority items not fixed, e.g. pagination on list endpoints) available
+  on request -- not all of it is reproduced here.
+
 Stage 10 complete — Voice Interview (turn-based STT/LLM/TTS), built on Stage 9's lifecycle
 (same endpoints, `mode="voice"` now accepted):
 - `OllamaProvider.transcribe()` (STT) uses local `faster-whisper` (`tiny.en` by default,
@@ -77,10 +114,9 @@ Stage 10 complete — Voice Interview (turn-based STT/LLM/TTS), built on Stage 9
   `def` routes. Calling `transcribe()` (a slow, blocking, synchronous call) directly inside
   it froze the *entire server*, not just that request, confirmed by a concurrent `/health`
   call timing out during a live transcription. Fixed with `starlette.concurrency.
-  run_in_threadpool`. **Known pre-existing instance of the same bug, not fixed here** (out
-  of Stage 10 scope, flagged for the Stage 12 hardening pass): `resumes.py`'s
-  `upload_resume` has the identical shape (`async def` + a blocking `generate_structured`
-  call) and would exhibit the same freeze under concurrent load.
+  run_in_threadpool`. **Update:** the identical pre-existing bug in `resumes.py`'s
+  `upload_resume` flagged here as out-of-scope for Stage 10 was fixed in the whole-codebase
+  audit above -- see that section instead of treating this as still-open.
 - Verified live end-to-end against real models (not mocks): synthesized a real question to
   WAV, fed that same audio back through the transcribe endpoint (a genuine TTS→STT round
   trip), and got back a near-verbatim transcript of the original question text. Completed a

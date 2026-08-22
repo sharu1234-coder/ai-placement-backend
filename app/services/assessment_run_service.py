@@ -79,6 +79,14 @@ def _pending_attempt(db: Session, assessment_id: int) -> Optional[QuestionAttemp
     )
 
 
+def _skill_tags_by_question_id(db: Session, question_ids: List[int]) -> dict:
+    """Single bulk lookup instead of one `db.get(Question, ...)` per attempt -- same
+    pattern interview_service already uses for the equivalent problem."""
+    if not question_ids:
+        return {}
+    return {q.id: q.skill_tag for q in db.query(Question).filter(Question.id.in_(question_ids)).all()}
+
+
 def _question_read(question: Question) -> QuestionRead:
     return QuestionRead(
         id=question.id,
@@ -133,10 +141,12 @@ def get_next_question(
     blueprint = db.get(AssessmentBlueprint, assessment.blueprint_id)
     sections = _sections(blueprint)
 
+    answered = _answered_attempts(db, assessment_id)
+    skill_tags = _skill_tags_by_question_id(db, [a.question_id for a in answered])
     answered_counts: dict = {}
-    for attempt in _answered_attempts(db, assessment_id):
-        question = db.get(Question, attempt.question_id)
-        answered_counts[question.skill_tag] = answered_counts.get(question.skill_tag, 0) + 1
+    for attempt in answered:
+        skill_tag = skill_tags[attempt.question_id]
+        answered_counts[skill_tag] = answered_counts.get(skill_tag, 0) + 1
 
     current_section = next(
         (s for s in sections if answered_counts.get(s.skill, 0) < s.question_count), None
@@ -233,10 +243,11 @@ def get_result(db: Session, profile_id: int, assessment_id: int) -> AssessmentRe
             priority_weaknesses=existing.priority_weaknesses,
         )
 
+    answered = _answered_attempts(db, assessment_id)
+    skill_tags = _skill_tags_by_question_id(db, [a.question_id for a in answered])
     scores_by_skill: dict = {}
-    for attempt in _answered_attempts(db, assessment_id):
-        question = db.get(Question, attempt.question_id)
-        scores_by_skill.setdefault(question.skill_tag, []).append(attempt.score)
+    for attempt in answered:
+        scores_by_skill.setdefault(skill_tags[attempt.question_id], []).append(attempt.score)
 
     skill_scores = {skill: sum(vals) / len(vals) for skill, vals in scores_by_skill.items()}
     overall_score = sum(skill_scores.values()) / len(skill_scores) if skill_scores else 0.0

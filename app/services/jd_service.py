@@ -5,10 +5,19 @@ from sqlalchemy.orm import Session
 
 from app.ai.provider import AIProvider
 from app.ai.schemas.jd import AIParsedJD
+from app.models.assessment_blueprint import AssessmentBlueprint
+from app.models.interview import Interview
 from app.models.job_description import JobDescription
+from app.models.job_match import JobMatch
 from app.models.requirement import Requirement
 from app.models.role import Role
+from app.models.skill_gap import SkillGap
 from app.schemas.job import JobDescriptionParseResponse, RequirementRead
+
+
+class JobDescriptionInUseError(Exception):
+    """Raised when trying to delete a JD that an AssessmentBlueprint or Interview still
+    references -- deleting it would leave those with a dangling jd_id."""
 
 _PROMPT_PATH = Path(__file__).resolve().parent.parent / "ai" / "prompts" / "jd_parser_v1.txt"
 
@@ -23,7 +32,11 @@ def detect_role(db: Session, role_title: str) -> Optional[Role]:
     The AI has no knowledge of our internal role ids, so this is resolved here rather
     than trusting a model-generated id. A future stage can replace this heuristic with
     something smarter (embeddings, an AI-assisted match) without changing the contract."""
-    title_lower = role_title.lower()
+    title_lower = role_title.strip().lower()
+    if not title_lower:
+        # An empty role_title would make `title_lower in name_lower` trivially True for
+        # every role, silently detecting whichever role happens to be iterated first.
+        return None
     for role in db.query(Role).all():
         name_lower = role.name.lower()
         if name_lower in title_lower or title_lower in name_lower:
@@ -122,3 +135,32 @@ def get_requirements(db: Session, jd_id: int, profile_id: int) -> Optional[List[
 
     requirements = db.query(Requirement).filter(Requirement.jd_id == jd_id).all()
     return [_requirement_read(r) for r in requirements]
+
+
+def delete_job_description(db: Session, jd_id: int, profile_id: int) -> Optional[bool]:
+    """PROJECT_HANDOFF.md section 6: "Provide deletion controls for user data" -- returns
+    None if not found/not owned, raises JobDescriptionInUseError if a blueprint or
+    interview already depends on this JD (deleting it would dangle their jd_id), True on
+    success."""
+    jd = db.get(JobDescription, jd_id)
+    if jd is None or jd.profile_id != profile_id:
+        return None
+
+    in_use = (
+        db.query(AssessmentBlueprint).filter(AssessmentBlueprint.jd_id == jd_id).first() is not None
+        or db.query(Interview).filter(Interview.jd_id == jd_id).first() is not None
+    )
+    if in_use:
+        raise JobDescriptionInUseError(
+            "This job description has already been used to generate a preparation plan or "
+            "interview and can't be deleted"
+        )
+
+    job_match_ids = [m.id for m in db.query(JobMatch.id).filter(JobMatch.jd_id == jd_id).all()]
+    if job_match_ids:
+        db.query(SkillGap).filter(SkillGap.job_match_id.in_(job_match_ids)).delete(synchronize_session=False)
+    db.query(JobMatch).filter(JobMatch.jd_id == jd_id).delete(synchronize_session=False)
+    db.query(Requirement).filter(Requirement.jd_id == jd_id).delete(synchronize_session=False)
+    db.delete(jd)
+    db.commit()
+    return True

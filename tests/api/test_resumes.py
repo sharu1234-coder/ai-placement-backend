@@ -149,6 +149,49 @@ def test_get_resume_analysis_not_found(client, auth_headers):
     assert resp.status_code == 404
 
 
+def test_delete_resume(client, auth_headers, use_fake_ai):
+    use_fake_ai(FakeAIProvider(parsed=SAMPLE_PARSED_RESUME))
+
+    upload_resp = client.post(
+        "/resumes",
+        files={"file": ("resume.pdf", make_pdf_with_text("Some resume text."), "application/pdf")},
+        headers=auth_headers,
+    )
+    resume_id = upload_resp.json()["id"]
+
+    resp = client.delete(f"/resumes/{resume_id}", headers=auth_headers)
+    assert resp.status_code == 204
+
+    assert client.get(f"/resumes/{resume_id}/analysis", headers=auth_headers).status_code == 404
+    # Deleting again should 404 -- it's actually gone, not just hidden.
+    assert client.delete(f"/resumes/{resume_id}", headers=auth_headers).status_code == 404
+
+
+def test_delete_resume_not_found(client, auth_headers):
+    resp = client.delete("/resumes/999999", headers=auth_headers)
+    assert resp.status_code == 404
+
+
+def test_delete_resume_isolated_per_user(client, auth_headers, use_fake_ai):
+    use_fake_ai(FakeAIProvider(parsed=SAMPLE_PARSED_RESUME))
+
+    upload_resp = client.post(
+        "/resumes",
+        files={"file": ("resume.pdf", make_pdf_with_text("Some resume text."), "application/pdf")},
+        headers=auth_headers,
+    )
+    resume_id = upload_resp.json()["id"]
+
+    client.post("/auth/signup", json={"email": "other-delete@example.com", "password": "supersecret123"})
+    other_token = client.post(
+        "/auth/login", json={"email": "other-delete@example.com", "password": "supersecret123"}
+    ).json()["access_token"]
+
+    resp = client.delete(f"/resumes/{resume_id}", headers={"Authorization": f"Bearer {other_token}"})
+    assert resp.status_code == 404
+    assert client.get(f"/resumes/{resume_id}/analysis", headers=auth_headers).status_code == 200
+
+
 def test_get_resume_analysis_isolated_per_user(client, auth_headers, use_fake_ai):
     use_fake_ai(FakeAIProvider(parsed=SAMPLE_PARSED_RESUME))
 

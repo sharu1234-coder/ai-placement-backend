@@ -1,6 +1,6 @@
 from typing import List, Optional
 
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, Field, model_validator
 
 
 class PrepareMeRequest(BaseModel):
@@ -59,8 +59,8 @@ class NextQuestionResponse(BaseModel):
 
 class SubmitAnswerRequest(BaseModel):
     question_id: int
-    student_answer: str
-    time_taken_seconds: Optional[int] = None
+    student_answer: str = Field(max_length=5_000)
+    time_taken_seconds: Optional[int] = Field(default=None, ge=0)
 
 
 class AnswerResult(BaseModel):

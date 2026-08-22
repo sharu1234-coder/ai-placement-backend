@@ -27,6 +27,17 @@ from app.services.profile_service import get_or_create_profile
 router = APIRouter(tags=["users"])
 
 
+def _delete_owned(db: Session, model, item_id: int, profile_id: int) -> None:
+    """Shared by the education/skills/projects/experience/certifications DELETE routes
+    below -- PROJECT_HANDOFF.md section 6 requires "deletion controls for user data";
+    these sub-resources previously had no delete path at all."""
+    item = db.get(model, item_id)
+    if item is None or item.profile_id != profile_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    db.delete(item)
+    db.commit()
+
+
 @router.get("/roles", response_model=list[RoleRead])
 def list_roles(db: Session = Depends(get_db)) -> list[Role]:
     return db.query(Role).order_by(Role.name).all()
@@ -94,6 +105,14 @@ def list_education(
     return db.query(Education).filter(Education.profile_id == profile.id).all()
 
 
+@router.delete("/users/me/education/{item_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_education(
+    item_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
+) -> None:
+    profile = get_or_create_profile(db, current_user)
+    _delete_owned(db, Education, item_id, profile.id)
+
+
 @router.post("/users/me/skills", response_model=SkillRead, status_code=status.HTTP_201_CREATED)
 def add_skill(
     payload: SkillCreate,
@@ -114,6 +133,14 @@ def list_skills(
 ) -> list[Skill]:
     profile = get_or_create_profile(db, current_user)
     return db.query(Skill).filter(Skill.profile_id == profile.id).all()
+
+
+@router.delete("/users/me/skills/{item_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_skill(
+    item_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
+) -> None:
+    profile = get_or_create_profile(db, current_user)
+    _delete_owned(db, Skill, item_id, profile.id)
 
 
 @router.post(
@@ -140,6 +167,14 @@ def list_projects(
     return db.query(Project).filter(Project.profile_id == profile.id).all()
 
 
+@router.delete("/users/me/projects/{item_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_project(
+    item_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
+) -> None:
+    profile = get_or_create_profile(db, current_user)
+    _delete_owned(db, Project, item_id, profile.id)
+
+
 @router.post(
     "/users/me/experience", response_model=ExperienceRead, status_code=status.HTTP_201_CREATED
 )
@@ -162,6 +197,14 @@ def list_experience(
 ) -> list[Experience]:
     profile = get_or_create_profile(db, current_user)
     return db.query(Experience).filter(Experience.profile_id == profile.id).all()
+
+
+@router.delete("/users/me/experience/{item_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_experience(
+    item_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
+) -> None:
+    profile = get_or_create_profile(db, current_user)
+    _delete_owned(db, Experience, item_id, profile.id)
 
 
 @router.post(
@@ -188,3 +231,11 @@ def list_certifications(
 ) -> list[Certification]:
     profile = get_or_create_profile(db, current_user)
     return db.query(Certification).filter(Certification.profile_id == profile.id).all()
+
+
+@router.delete("/users/me/certifications/{item_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_certification(
+    item_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
+) -> None:
+    profile = get_or_create_profile(db, current_user)
+    _delete_owned(db, Certification, item_id, profile.id)

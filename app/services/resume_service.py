@@ -123,3 +123,23 @@ def get_resume_analysis(db: Session, resume_id: int, profile_id: int) -> Optiona
         return None
 
     return to_analysis_read(analysis)
+
+
+def delete_resume(db: Session, resume_id: int, profile_id: int) -> bool:
+    """PROJECT_HANDOFF.md section 6: "Provide deletion controls for user data" /
+    "Protect resumes and uploaded documents" -- there was previously no way to delete an
+    uploaded resume at all. Removes the DB rows and the stored file itself."""
+    resume = db.get(Resume, resume_id)
+    if resume is None or resume.profile_id != profile_id:
+        return False
+
+    db.query(ResumeAnalysis).filter(ResumeAnalysis.resume_id == resume.id).delete()
+
+    try:
+        Path(resume.file_path).unlink(missing_ok=True)
+    except OSError:
+        logger.warning("Could not delete resume file %s for resume_id=%s", resume.file_path, resume.id)
+
+    db.delete(resume)
+    db.commit()
+    return True

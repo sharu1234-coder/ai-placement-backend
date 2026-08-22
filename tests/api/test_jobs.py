@@ -97,6 +97,17 @@ def test_create_job_description_success(client, auth_headers, use_fake_ai):
     assert skill_reqs == {"SQL": "required", "Excel": "required", "Python": "preferred"}
 
 
+def test_blank_role_title_detects_no_role(client, auth_headers, use_fake_ai):
+    # Regression: a blank AI-returned role_title used to make `"" in name_lower` trivially
+    # True for every role, silently "detecting" whichever role was iterated first.
+    blank_title_jd = SAMPLE_PARSED_JD.model_copy(update={"role_title": "  "})
+    use_fake_ai(FakeAIProvider(jd=blank_title_jd))
+
+    resp = client.post("/jobs", json={"raw_text": "an unclear job description"}, headers=auth_headers)
+    assert resp.status_code == 201
+    assert resp.json()["detected_role_id"] is None
+
+
 def test_get_job_requirements(client, auth_headers, use_fake_ai):
     use_fake_ai(FakeAIProvider(jd=SAMPLE_PARSED_JD))
 
@@ -139,6 +150,44 @@ def test_match_without_resume_returns_422(client, auth_headers, use_fake_ai):
 def test_match_not_found(client, auth_headers):
     resp = client.post("/jobs/999999/match", headers=auth_headers)
     assert resp.status_code == 404
+
+
+def test_delete_job_description(client, auth_headers, use_fake_ai):
+    use_fake_ai(FakeAIProvider(jd=SAMPLE_PARSED_JD))
+    jd_id = client.post("/jobs", json={"raw_text": "some jd text"}, headers=auth_headers).json()["id"]
+
+    resp = client.delete(f"/jobs/{jd_id}", headers=auth_headers)
+    assert resp.status_code == 204
+    assert client.get(f"/jobs/{jd_id}/requirements", headers=auth_headers).status_code == 404
+
+
+def test_delete_job_description_not_found(client, auth_headers):
+    resp = client.delete("/jobs/999999", headers=auth_headers)
+    assert resp.status_code == 404
+
+
+def test_delete_job_description_isolated_per_user(client, auth_headers, use_fake_ai):
+    use_fake_ai(FakeAIProvider(jd=SAMPLE_PARSED_JD))
+    jd_id = client.post("/jobs", json={"raw_text": "some jd text"}, headers=auth_headers).json()["id"]
+
+    client.post("/auth/signup", json={"email": "other-delete-jd@example.com", "password": "supersecret123"})
+    other_token = client.post(
+        "/auth/login", json={"email": "other-delete-jd@example.com", "password": "supersecret123"}
+    ).json()["access_token"]
+
+    resp = client.delete(f"/jobs/{jd_id}", headers={"Authorization": f"Bearer {other_token}"})
+    assert resp.status_code == 404
+
+
+def test_delete_job_description_blocked_when_blueprint_exists(client, auth_headers, use_fake_ai):
+    use_fake_ai(FakeAIProvider(jd=SAMPLE_PARSED_JD))
+    jd_id = client.post("/jobs", json={"raw_text": "some jd text"}, headers=auth_headers).json()["id"]
+
+    blueprint_resp = client.post("/assessments/blueprint", json={"jd_id": jd_id}, headers=auth_headers)
+    assert blueprint_resp.status_code == 201
+
+    resp = client.delete(f"/jobs/{jd_id}", headers=auth_headers)
+    assert resp.status_code == 409
 
 
 def test_match_with_resume_success(client, auth_headers, use_fake_ai):

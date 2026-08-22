@@ -1,6 +1,6 @@
 from typing import List, Literal, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class StartInterviewRequest(BaseModel):
@@ -31,7 +31,7 @@ class NextInterviewQuestionResponse(BaseModel):
 
 class SubmitInterviewAnswerRequest(BaseModel):
     interview_question_id: int
-    answer_text: str
+    answer_text: str = Field(max_length=5_000)
 
 
 class InterviewAnswerRead(BaseModel):
