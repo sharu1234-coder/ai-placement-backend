@@ -28,3 +28,55 @@ class AssessmentBlueprintRead(BaseModel):
     jd_id: Optional[int]
     source: str
     sections: List[BlueprintSection]
+
+
+class StartAssessmentRequest(BaseModel):
+    blueprint_id: int
+
+
+class AssessmentRead(BaseModel):
+    id: int
+    blueprint_id: int
+    status: str
+
+
+class QuestionRead(BaseModel):
+    """Deliberately excludes expected_answer_or_rubric and explanation -- those must not
+    reach the client until after the student answers (see AnswerResult)."""
+
+    id: int
+    skill_tag: str
+    type: str
+    difficulty: str
+    prompt: str
+    options: Optional[List[str]]
+
+
+class NextQuestionResponse(BaseModel):
+    completed: bool
+    question: Optional[QuestionRead] = None
+
+
+class SubmitAnswerRequest(BaseModel):
+    question_id: int
+    student_answer: str
+    time_taken_seconds: Optional[int] = None
+
+
+class AnswerResult(BaseModel):
+    question_id: int
+    is_correct: bool
+    score: float
+    explanation: str
+
+
+class SkillScore(BaseModel):
+    skill_tag: str
+    score: float
+
+
+class AssessmentResultRead(BaseModel):
+    assessment_id: int
+    overall_score: float
+    skill_scores: List[SkillScore]
+    priority_weaknesses: List[str]

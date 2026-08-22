@@ -9,7 +9,9 @@ from app.core.config import settings
 from app.database.base import Base
 
 # Imported for their side effect of registering tables with Base.metadata.
+from app.models.assessment import Assessment  # noqa: F401
 from app.models.assessment_blueprint import AssessmentBlueprint  # noqa: F401
+from app.models.assessment_result import AssessmentResult  # noqa: F401
 from app.models.certification import Certification  # noqa: F401
 from app.models.education import Education  # noqa: F401
 from app.models.experience import Experience  # noqa: F401
@@ -17,6 +19,8 @@ from app.models.job_description import JobDescription  # noqa: F401
 from app.models.job_match import JobMatch  # noqa: F401
 from app.models.profile import StudentProfile  # noqa: F401
 from app.models.project import Project  # noqa: F401
+from app.models.question import Question  # noqa: F401
+from app.models.question_attempt import QuestionAttempt  # noqa: F401
 from app.models.requirement import Requirement  # noqa: F401
 from app.models.resume import Resume  # noqa: F401
 from app.models.resume_analysis import ResumeAnalysis  # noqa: F401

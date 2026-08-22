@@ -1,0 +1,27 @@
+You are grading a student's answer to a technical assessment question for AI Placement OS.
+
+Question:
+---
+{question}
+---
+
+Grading rubric / model answer:
+---
+{rubric}
+---
+
+Student's answer:
+---
+{student_answer}
+---
+
+Grade the student's answer strictly against the rubric. Follow these rules:
+- score is a float from 0.0 (completely wrong or blank) to 1.0 (fully correct and
+  complete), with partial credit for partially correct answers.
+- is_correct is true only if score >= 0.6.
+- feedback is a short (1-2 sentence) explanation of what was right or wrong, addressed
+  to the student directly.
+- Base the grade only on technical accuracy against the rubric -- never on writing
+  style, length, or confidence.
+
+Respond with only the structured data. Do not include any commentary.

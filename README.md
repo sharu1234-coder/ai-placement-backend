@@ -43,7 +43,35 @@ A `CloudProvider` implementation is added when a production AI service is chosen
 
 ## Status
 
-Stage 7 complete — Prepare Me Engine: `POST /assessments/blueprint`, the signature "Prepare
+Stage 8 complete — Role/JD Tests + adaptive difficulty: the test-taking lifecycle
+(`POST /assessments`, `GET .../next-question`, `POST .../answer`, `GET .../result`) in
+`app/services/assessment_run_service.py`:
+- `POST /assessments` starts an `Assessment` from a previously generated blueprint (owned by
+  the caller's profile), status `in_progress`.
+- `GET .../next-question` walks the blueprint's sections in priority order (already sorted by
+  gap/weight). For each skill it AI-generates one `Question` at a time via
+  `question_generator_v1.txt` (schema `GeneratedQuestion` — skill_tag/difficulty/source are
+  set server-side, never AI-generated, same pattern as `AIParsedJD` excluding
+  `detected_role_id`). A `QuestionAttempt` row is created immediately with
+  `student_answer=None`, which doubles as "the pending question" — calling next-question again
+  before answering returns the same question instead of generating a new one.
+- **Adaptive difficulty**: a skill's first question starts at `medium`; each subsequent
+  question in that skill escalates one level (easy→medium→hard) after a correct answer and
+  de-escalates after an incorrect one, derived purely from prior `QuestionAttempt` rows (no
+  extra state column needed). Verified live: a correct `medium` DSA answer produced a `hard`
+  follow-up question.
+- `POST .../answer` grades against the pending attempt. MCQ is graded deterministically
+  (exact match against `expected_answer_or_rubric` — no AI call). Every other type is graded
+  by the AI via `answer_grader_v1.txt` (schema `AnswerGrade`), rubric-based, 0.0–1.0 score.
+  `QuestionRead` deliberately omits `expected_answer_or_rubric`/`explanation` so the answer key
+  never reaches the client before they respond.
+- `GET .../result` requires every section to be answered (`Assessment.status == "completed"`,
+  set automatically once the last section's question count is met) — else 409. Computes and
+  persists `AssessmentResult`: per-skill average score, overall average, and
+  `priority_weaknesses` (skills scoring below 0.6, worst first). Idempotent — a second call
+  returns the persisted row rather than recomputing.
+
+Stage 7 — Prepare Me Engine: `POST /assessments/blueprint`, the signature "Prepare
 Me" trigger. Deterministic (non-AI) skill-matrix + blueprint generation in
 `app/services/assessment_service.py`:
 - Base skill matrix comes from the seeded `RoleSkillWeight` taxonomy for the given/detected role.
@@ -66,9 +94,8 @@ encoder can't serialize. Now wrapped in `jsonable_encoder`.
 
 Also complete: FastAPI app, SQLAlchemy + Alembic-managed SQLite DB, JWT auth, student profile +
 role selection + sub-resources, resume pipeline (PDF → AI-structured analysis), JD intelligence
-(parse/role-detect/match), global error handling. Not yet built: the actual test-taking
-lifecycle (Question generation, adaptive difficulty -- Stage 8), interviews, weakness engine,
-roadmap.
+(parse/role-detect/match), Prepare Me blueprint generation, global error handling. Not yet
+built: interviews (Stage 9/10), weakness engine, roadmap (Stage 11).
 
 **Known schema deviations from `PROJECT_HANDOFF.md`** (documented where they occur):
 - `SkillGap.skill_name` (string) instead of `skill_id` (FK) — there's no global skill catalog

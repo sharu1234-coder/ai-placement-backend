@@ -1,10 +1,34 @@
 import pytest
 
 from app.ai.provider import AIProvider, get_ai_provider
+from app.ai.schemas.assessment import AnswerGrade, GeneratedQuestion
 from app.ai.schemas.jd import AIParsedJD, JDRequirementItem
 from app.ai.schemas.resume import ParsedResume
 from app.core.config import settings
 from app.main import app
+
+SAMPLE_GENERATED_MCQ = GeneratedQuestion(
+    type="mcq",
+    prompt="What does SQL stand for?",
+    options=[
+        "Structured Query Language",
+        "Simple Query Logic",
+        "Sequential Query List",
+        "Standard Question Language",
+    ],
+    expected_answer_or_rubric="Structured Query Language",
+    explanation="SQL stands for Structured Query Language.",
+)
+
+SAMPLE_GENERATED_SHORT_ANSWER = GeneratedQuestion(
+    type="short_answer",
+    prompt="Explain what a primary key is.",
+    options=None,
+    expected_answer_or_rubric="A column that uniquely identifies each row in a table.",
+    explanation="Primary keys enforce uniqueness and identify rows.",
+)
+
+SAMPLE_ANSWER_GRADE = AnswerGrade(is_correct=True, score=0.8, feedback="Good answer.")
 
 SAMPLE_PARSED_JD = AIParsedJD(
     role_title="SDE",
@@ -31,11 +55,18 @@ SAMPLE_PARSED_RESUME = ParsedResume(
 
 
 class FakeAIProvider(AIProvider):
+    def __init__(self, generated_question=None):
+        self.generated_question = generated_question or SAMPLE_GENERATED_MCQ
+
     def generate_structured(self, prompt, schema):
         if schema is AIParsedJD:
             return SAMPLE_PARSED_JD
         if schema is ParsedResume:
             return SAMPLE_PARSED_RESUME
+        if schema is GeneratedQuestion:
+            return self.generated_question
+        if schema is AnswerGrade:
+            return SAMPLE_ANSWER_GRADE
         raise AssertionError(f"Unexpected schema requested in test: {schema}")
 
     def generate_text(self, prompt):
@@ -61,6 +92,14 @@ def isolated_upload_dir(tmp_path, monkeypatch):
 @pytest.fixture()
 def use_fake_ai():
     provider = FakeAIProvider()
+    app.dependency_overrides[get_ai_provider] = lambda: provider
+    yield provider
+    app.dependency_overrides.pop(get_ai_provider, None)
+
+
+@pytest.fixture()
+def use_fake_ai_short_answer():
+    provider = FakeAIProvider(generated_question=SAMPLE_GENERATED_SHORT_ANSWER)
     app.dependency_overrides[get_ai_provider] = lambda: provider
     yield provider
     app.dependency_overrides.pop(get_ai_provider, None)
@@ -154,3 +193,194 @@ def test_blueprint_jd_isolated_per_user(client, auth_headers, use_fake_ai):
         headers={"Authorization": f"Bearer {other_token}"},
     )
     assert resp.status_code == 422
+
+
+@pytest.fixture()
+def blueprint_id(client, auth_headers, sde_role_id):
+    return client.post(
+        "/assessments/blueprint", json={"role_id": sde_role_id}, headers=auth_headers
+    ).json()["id"]
+
+
+def test_start_assessment(client, auth_headers, blueprint_id):
+    resp = client.post("/assessments", json={"blueprint_id": blueprint_id}, headers=auth_headers)
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["blueprint_id"] == blueprint_id
+    assert body["status"] == "in_progress"
+
+
+def test_start_assessment_unknown_blueprint(client, auth_headers):
+    resp = client.post("/assessments", json={"blueprint_id": 999999}, headers=auth_headers)
+    assert resp.status_code == 404
+
+
+def test_next_question_generates_first_question_at_medium_difficulty(
+    client, auth_headers, blueprint_id, use_fake_ai
+):
+    assessment_id = client.post(
+        "/assessments", json={"blueprint_id": blueprint_id}, headers=auth_headers
+    ).json()["id"]
+
+    resp = client.get(f"/assessments/{assessment_id}/next-question", headers=auth_headers)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["completed"] is False
+    question = body["question"]
+    assert question["difficulty"] == "medium"
+    assert question["type"] == "mcq"
+    assert len(question["options"]) == 4
+    # The answer key must never be sent to the client before they respond.
+    assert "expected_answer_or_rubric" not in question
+    assert "explanation" not in question
+
+
+def test_next_question_is_idempotent_while_pending(client, auth_headers, blueprint_id, use_fake_ai):
+    assessment_id = client.post(
+        "/assessments", json={"blueprint_id": blueprint_id}, headers=auth_headers
+    ).json()["id"]
+
+    first = client.get(f"/assessments/{assessment_id}/next-question", headers=auth_headers).json()
+    second = client.get(f"/assessments/{assessment_id}/next-question", headers=auth_headers).json()
+    assert first["question"]["id"] == second["question"]["id"]
+
+
+def test_submit_correct_mcq_answer(client, auth_headers, blueprint_id, use_fake_ai):
+    assessment_id = client.post(
+        "/assessments", json={"blueprint_id": blueprint_id}, headers=auth_headers
+    ).json()["id"]
+    question = client.get(
+        f"/assessments/{assessment_id}/next-question", headers=auth_headers
+    ).json()["question"]
+
+    resp = client.post(
+        f"/assessments/{assessment_id}/answer",
+        json={"question_id": question["id"], "student_answer": "Structured Query Language"},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["is_correct"] is True
+    assert body["score"] == 1.0
+    assert body["explanation"]
+
+
+def test_submit_wrong_mcq_answer(client, auth_headers, blueprint_id, use_fake_ai):
+    assessment_id = client.post(
+        "/assessments", json={"blueprint_id": blueprint_id}, headers=auth_headers
+    ).json()["id"]
+    question = client.get(
+        f"/assessments/{assessment_id}/next-question", headers=auth_headers
+    ).json()["question"]
+
+    resp = client.post(
+        f"/assessments/{assessment_id}/answer",
+        json={"question_id": question["id"], "student_answer": "Simple Query Logic"},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["is_correct"] is False
+    assert body["score"] == 0.0
+
+
+def test_submit_short_answer_uses_ai_grading(client, auth_headers, blueprint_id, use_fake_ai_short_answer):
+    assessment_id = client.post(
+        "/assessments", json={"blueprint_id": blueprint_id}, headers=auth_headers
+    ).json()["id"]
+    question = client.get(
+        f"/assessments/{assessment_id}/next-question", headers=auth_headers
+    ).json()["question"]
+    assert question["type"] == "short_answer"
+    assert question["options"] is None
+
+    resp = client.post(
+        f"/assessments/{assessment_id}/answer",
+        json={"question_id": question["id"], "student_answer": "It uniquely identifies a row."},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["is_correct"] is True
+    assert body["score"] == 0.8
+
+
+def test_answer_rejected_when_no_pending_question(client, auth_headers, blueprint_id, use_fake_ai):
+    assessment_id = client.post(
+        "/assessments", json={"blueprint_id": blueprint_id}, headers=auth_headers
+    ).json()["id"]
+    question = client.get(
+        f"/assessments/{assessment_id}/next-question", headers=auth_headers
+    ).json()["question"]
+    client.post(
+        f"/assessments/{assessment_id}/answer",
+        json={"question_id": question["id"], "student_answer": "Structured Query Language"},
+        headers=auth_headers,
+    )
+
+    resp = client.post(
+        f"/assessments/{assessment_id}/answer",
+        json={"question_id": question["id"], "student_answer": "Structured Query Language"},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 409
+
+
+def test_result_requires_completed_assessment(client, auth_headers, blueprint_id, use_fake_ai):
+    assessment_id = client.post(
+        "/assessments", json={"blueprint_id": blueprint_id}, headers=auth_headers
+    ).json()["id"]
+    client.get(f"/assessments/{assessment_id}/next-question", headers=auth_headers)
+
+    resp = client.get(f"/assessments/{assessment_id}/result", headers=auth_headers)
+    assert resp.status_code == 409
+
+
+def test_assessment_isolated_per_user(client, auth_headers, blueprint_id):
+    assessment_id = client.post(
+        "/assessments", json={"blueprint_id": blueprint_id}, headers=auth_headers
+    ).json()["id"]
+
+    client.post("/auth/signup", json={"email": "other-assessment@example.com", "password": "supersecret123"})
+    other_token = client.post(
+        "/auth/login", json={"email": "other-assessment@example.com", "password": "supersecret123"}
+    ).json()["access_token"]
+    other_headers = {"Authorization": f"Bearer {other_token}"}
+
+    resp = client.get(f"/assessments/{assessment_id}/next-question", headers=other_headers)
+    assert resp.status_code == 404
+
+
+def test_full_assessment_lifecycle_reaches_result(client, auth_headers, blueprint_id, use_fake_ai):
+    assessment_id = client.post(
+        "/assessments", json={"blueprint_id": blueprint_id}, headers=auth_headers
+    ).json()["id"]
+
+    answered = 0
+    for _ in range(100):
+        next_q = client.get(f"/assessments/{assessment_id}/next-question", headers=auth_headers).json()
+        if next_q["completed"]:
+            break
+        question = next_q["question"]
+        answer_resp = client.post(
+            f"/assessments/{assessment_id}/answer",
+            json={"question_id": question["id"], "student_answer": "Structured Query Language"},
+            headers=auth_headers,
+        )
+        assert answer_resp.status_code == 200
+        answered += 1
+    else:
+        pytest.fail("Assessment did not complete within 100 questions")
+
+    assert answered > 0
+
+    result = client.get(f"/assessments/{assessment_id}/result", headers=auth_headers)
+    assert result.status_code == 200
+    body = result.json()
+    assert body["overall_score"] == 1.0
+    assert body["priority_weaknesses"] == []
+    assert len(body["skill_scores"]) == 6  # SDE taxonomy: Aptitude/DSA/OOP/DBMS/OS/Networks
+
+    # Result is persisted -- a second call returns the same computed values, not a re-derive.
+    result_again = client.get(f"/assessments/{assessment_id}/result", headers=auth_headers)
+    assert result_again.json() == body
