@@ -47,6 +47,32 @@ as-is.
 
 ## Status
 
+**Architecture confirmation (2026-08-23)** — the user explicitly locked in the following,
+all of which the backend already satisfies with no code changes needed:
+- **FastAPI + SQLAlchemy + PostgreSQL stays the primary backend/database.** No migration of
+  existing data/models to Firestore. `app/database/session.py`'s `create_engine` already
+  takes its driver entirely from `DATABASE_URL` (the SQLite-only `check_same_thread`
+  connect arg is already conditional on the URL scheme) -- switching to Postgres for
+  staging/prod is `DATABASE_URL=postgresql://...` in `.env` plus adding `psycopg2-binary`
+  to `requirements.txt` (not added yet since nothing runs against Postgres today), not an
+  architecture change.
+- **Firebase is for auxiliary services only** (FCM, Crashlytics, Analytics, App Check) --
+  never a replacement for the above. Nothing to change here since no Firebase integration
+  exists in this repo yet; if/when server-triggered push notifications are built, the
+  intended shape is a `FirebaseAdmin`-wrapping service analogous to `AIProvider` (one
+  interface, env-driven credentials), added when a concrete feature needs it -- not built
+  speculatively now.
+- **Existing JWT auth stays** (`app/core/security.py` -- HS256, `jwt_secret_key` from env)
+  unless a specific technical reason to change it comes up. No Firebase Auth migration.
+- **AI provider is already switchable without a rebuild**: `AI_PROVIDER` in `.env` selects
+  the implementation in `app/ai/provider.py:get_ai_provider()`; every service depends only
+  on the abstract `AIProvider` interface. Publishing swaps Ollama for a paid API by adding
+  a `CloudProvider` implementation and changing one env var -- no service/route changes.
+
+See `ai-placement-android/README.md`'s matching entry for the Android-side dev/prod Gradle
+flavor split that makes the same "switch at publishing, don't rebuild" promise concrete
+there too.
+
 **Stage 11 — Weakness Engine + Roadmap (2026-08-23)**, the last V1 milestone
 (`PROJECT_HANDOFF.md` M11), built on every signal the app already produces about a
 student's weak spots:
