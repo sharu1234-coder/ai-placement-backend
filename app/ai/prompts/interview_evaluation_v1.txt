@@ -1,0 +1,32 @@
+You are evaluating a completed {interview_type} interview for AI Placement OS.
+
+Candidate context:
+- Target role: {role_name}
+- Job description: {jd_text}
+
+Full transcript (questions and the candidate's answers, in order):
+---
+{transcript}
+---
+
+Score the candidate's performance across this transcript as a whole. Follow these rules
+strictly:
+- Every numeric field is a float from 0.0 (very poor) to 1.0 (excellent).
+- technical_correctness: factual/conceptual accuracy of technical claims made.
+- relevance: how directly answers addressed what was asked.
+- completeness: whether answers covered the question fully, not just partially.
+- reasoning: quality of the candidate's problem-solving/justification, where applicable.
+- structure: how well-organized each answer was (not rambling, has a clear point).
+- clarity: how easy the answers are to understand.
+- grammar: correctness of written English in the answers.
+- role_jd_coverage: how well the answers, taken together, demonstrate fit for the target
+  role / job description.
+- overall_score: your holistic summary score, not a strict average of the others.
+- feedback is 2-4 sentences of constructive, specific feedback addressed to the candidate.
+- An unanswered question ("(no answer given)") counts against completeness and
+  role_jd_coverage, but must not be treated as a technical error.
+- Score only the content of the answers. Never include personality traits, mental-state
+  guesses, confidence levels, or anything about the candidate as a person -- only their
+  answers.
+
+Respond with only the structured data. Do not include any commentary.

@@ -7,6 +7,7 @@ from fastapi.responses import JSONResponse
 
 from app.api.assessments import router as assessments_router
 from app.api.auth import router as auth_router
+from app.api.interviews import router as interviews_router
 from app.api.jobs import router as jobs_router
 from app.api.resumes import router as resumes_router
 from app.api.users import router as users_router
@@ -23,6 +24,7 @@ app.include_router(users_router)
 app.include_router(resumes_router)
 app.include_router(jobs_router)
 app.include_router(assessments_router)
+app.include_router(interviews_router)
 
 
 @app.get("/health")

@@ -43,7 +43,41 @@ A `CloudProvider` implementation is added when a production AI service is chosen
 
 ## Status
 
-Stage 8 complete — Role/JD Tests + adaptive difficulty: the test-taking lifecycle
+Stage 9 complete — Text Interview Engine: the interview lifecycle (`POST /interviews`,
+`GET .../next-question`, `POST .../answer`, `GET .../evaluation`) in
+`app/services/interview_service.py`:
+- `POST /interviews` starts an `Interview` of `type` (`technical`/`hr`/`project`) for the
+  caller's profile. `mode` defaults to `"text"`; `mode="voice"` is rejected with 422 --
+  turn-based STT/LLM/TTS is Stage 10 scope. `jd_id` is optional; when given, its
+  `detected_role_id` supplies role context, otherwise the profile's `target_role_id` is
+  used (see `_build_context`).
+- `GET .../next-question` generates one `InterviewQuestion` at a time (fixed at 5 per
+  interview) via `interview_question_v1.txt` (schema `GeneratedInterviewQuestion`),
+  prompted with the candidate's resume skills, listed `Project` rows, JD text, and every
+  question already asked (so it never repeats itself). `type="project"` questions probe the
+  candidate's own listed projects; `"technical"` probes role/JD-relevant concepts;
+  `"hr"` is behavioral. A question with no `InterviewAnswer` row yet is "the pending
+  question" -- calling next-question again before answering returns it unchanged, the same
+  pattern as the assessment lifecycle but keyed off row absence instead of a nullable
+  column, since there's no need to pre-reserve an interview answer slot.
+- `POST .../answer` persists the answer text (a unique constraint on
+  `interview_question_id` blocks answering twice -- 409). No per-question score exists in
+  the doc's schema; scoring happens once, for the whole transcript, at evaluation time.
+- `POST .../answer/audio` exists (matching the documented API surface) but always returns
+  501 -- Stage 10 work.
+- `GET .../evaluation` requires the interview to be `completed` (409 otherwise). Builds the
+  full Q&A transcript and asks the AI to score it holistically in one call
+  (`interview_evaluation_v1.txt` / `GeneratedInterviewEvaluation`): technical_correctness,
+  relevance, completeness, reasoning, structure, clarity, grammar, role_jd_coverage,
+  overall_score, plus written feedback -- all 0.0-1.0. `speaking_pace`/`filler_word_rate`
+  are voice-only fields, set to `None` server-side rather than asked of the model in text
+  mode. Idempotent -- a second call returns the persisted row.
+- Verified live against `qwen3:8b`: a `type="project"` interview against a real listed
+  project produced five genuinely project-specific questions (referencing the project's
+  name and tech stack, no two alike) and a coherent final evaluation with sensible scores
+  and actionable feedback.
+
+Stage 8 — Role/JD Tests + adaptive difficulty: the test-taking lifecycle
 (`POST /assessments`, `GET .../next-question`, `POST .../answer`, `GET .../result`) in
 `app/services/assessment_run_service.py`:
 - `POST /assessments` starts an `Assessment` from a previously generated blueprint (owned by
@@ -94,8 +128,9 @@ encoder can't serialize. Now wrapped in `jsonable_encoder`.
 
 Also complete: FastAPI app, SQLAlchemy + Alembic-managed SQLite DB, JWT auth, student profile +
 role selection + sub-resources, resume pipeline (PDF → AI-structured analysis), JD intelligence
-(parse/role-detect/match), Prepare Me blueprint generation, global error handling. Not yet
-built: interviews (Stage 9/10), weakness engine, roadmap (Stage 11).
+(parse/role-detect/match), Prepare Me blueprint generation, role/JD test-taking with adaptive
+difficulty, global error handling. Not yet built: voice interviews (Stage 10), weakness engine,
+roadmap (Stage 11).
 
 **Known schema deviations from `PROJECT_HANDOFF.md`** (documented where they occur):
 - `SkillGap.skill_name` (string) instead of `skill_id` (FK) — there's no global skill catalog

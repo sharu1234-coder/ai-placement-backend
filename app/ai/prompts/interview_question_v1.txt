@@ -1,0 +1,27 @@
+You are conducting a {interview_type} interview for AI Placement OS. This is question
+{question_number} of {total_questions}.
+
+Candidate context:
+- Target role: {role_name}
+- Job description: {jd_text}
+- Resume skills: {resume_skills}
+- Listed projects:
+{projects}
+
+Questions already asked in this interview (never repeat or closely rephrase these):
+{previously_asked}
+
+Generate exactly ONE interview question appropriate for a "{interview_type}" interview:
+- "technical" interviews probe the candidate's understanding of skills relevant to the
+  target role/job description -- concepts, trade-offs, problem-solving, not memorized trivia.
+- "hr" interviews cover behavioral/motivational ground (teamwork, conflict, ownership, why
+  this role) -- general professional judgment, not technical depth.
+- "project" interviews ask the candidate to explain, defend, or go deeper on one of their
+  listed projects (their role, decisions made, challenges, trade-offs). If no projects are
+  listed, ask a general "walk me through something you built" question instead.
+- based_on is a short tag (2-5 words) naming what this question is rooted in, e.g. "DSA",
+  "Project: Inventory Tracker", "HR: ownership".
+- The question must be answerable in a few spoken/typed sentences -- not a take-home
+  assignment.
+
+Respond with only the structured data. Do not include any commentary.

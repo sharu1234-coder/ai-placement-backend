@@ -15,6 +15,10 @@ from app.models.assessment_result import AssessmentResult  # noqa: F401
 from app.models.certification import Certification  # noqa: F401
 from app.models.education import Education  # noqa: F401
 from app.models.experience import Experience  # noqa: F401
+from app.models.interview import Interview  # noqa: F401
+from app.models.interview_answer import InterviewAnswer  # noqa: F401
+from app.models.interview_evaluation import InterviewEvaluation  # noqa: F401
+from app.models.interview_question import InterviewQuestion  # noqa: F401
 from app.models.job_description import JobDescription  # noqa: F401
 from app.models.job_match import JobMatch  # noqa: F401
 from app.models.profile import StudentProfile  # noqa: F401
