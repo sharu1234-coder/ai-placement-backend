@@ -8,5 +8,13 @@ class Settings(BaseSettings):
     environment: str = "development"
     debug: bool = True
 
+    database_url: str = "sqlite:///./app.db"
+
+    # Dev-only default. Must be overridden via JWT_SECRET_KEY in .env before any real deployment.
+    jwt_secret_key: str = "dev-only-insecure-secret-change-in-production"
+    jwt_algorithm: str = "HS256"
+    access_token_expire_minutes: int = 30
+    refresh_token_expire_days: int = 7
+
 
 settings = Settings()

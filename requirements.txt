@@ -3,6 +3,13 @@ uvicorn[standard]==0.34.0
 pydantic==2.10.5
 pydantic-settings==2.7.1
 python-dotenv==1.0.1
+email-validator==2.2.0
+
+sqlalchemy==2.0.36
+greenlet==3.0.3  # pinned: newer greenlet has no prebuilt wheel for this Python, would need MSVC Build Tools to compile
+alembic==1.14.0
+bcrypt==4.0.1  # pinned: 4.2.1 fails to import its native extension on this Windows/Python build
+pyjwt==2.10.1
 
 pytest==8.3.4
 httpx==0.28.1
