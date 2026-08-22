@@ -28,6 +28,8 @@ from app.models.question_attempt import QuestionAttempt  # noqa: F401
 from app.models.requirement import Requirement  # noqa: F401
 from app.models.resume import Resume  # noqa: F401
 from app.models.resume_analysis import ResumeAnalysis  # noqa: F401
+from app.models.roadmap import Roadmap  # noqa: F401
+from app.models.roadmap_task import RoadmapTask  # noqa: F401
 from app.models.role import Role  # noqa: F401
 from app.models.role_skill_weight import RoleSkillWeight  # noqa: F401
 from app.models.skill import Skill  # noqa: F401

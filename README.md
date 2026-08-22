@@ -47,6 +47,40 @@ as-is.
 
 ## Status
 
+**Stage 11 — Weakness Engine + Roadmap (2026-08-23)**, the last V1 milestone
+(`PROJECT_HANDOFF.md` M11), built on every signal the app already produces about a
+student's weak spots:
+- `app/services/weakness_service.py` — deterministic (non-AI) aggregation across three
+  existing signals: JD `SkillGap`s (only when a `jd_id` scope is given), an assessment's
+  `AssessmentResult.priority_weaknesses`, and any `InterviewEvaluation` dimension scoring
+  below 0.6 (surfaced as a synthetic `interview:<dimension>` skill tag, e.g.
+  `interview:clarity`). Same "our own gap engine, not delegated to AI" philosophy as
+  `skill_matching.skill_present` — only the roadmap's task *text* is AI-generated; *which*
+  skills are weak is computed here from real, owned data. The same skill appearing from
+  multiple sources merges into one entry with escalated severity and a combined source
+  list, so e.g. a skill that's both a JD gap and a test-result weakness surfaces once, at
+  its highest severity.
+- `app/services/roadmap_service.py` — `generate_roadmap` calls `compute_weaknesses` and,
+  if none exist, raises a 422 rather than generating a roadmap from nothing (there must be
+  at least one completed test, interview, or JD match first). Only one `Roadmap` is
+  "active" per profile+jd scope at a time; generating a new one (including via reassess)
+  marks the previous one `superseded` rather than deleting it.
+- **`POST /roadmap/{id}/reassess` regenerates from scratch** rather than patching the
+  existing task list in place — same `jd_id`/`duration_days`, fresh weaknesses, fresh AI
+  call. Simpler and safer than merging partial task-list diffs; an explicit scope decision,
+  same reasoning as the JD-delete 409-over-cascade choice in the prior audit.
+- **`GET /roadmap/current`** — not in the documented endpoint table (section 8.5), added so
+  a client can load "my active roadmap" directly rather than only ever holding onto an id
+  returned from `/generate`. Returns `null` (200, not 404) when none exists yet, since "no
+  roadmap generated yet" is a normal state, not an error.
+- `RoadmapTask.due_date` is computed server-side from `date.today() + (day - 1)` at
+  generation time — the AI only assigns relative day numbers (1..duration_days), never
+  calendar dates, so a roadmap's dates are always anchored to when it was actually
+  generated (or regenerated).
+- 20 new tests (11 unit tests directly exercising `compute_weaknesses` against a real
+  in-memory schema, 9 API tests over the full generate/current/patch/reassess lifecycle) —
+  131 passing total.
+
 **Whole-codebase audit (2026-08-23)** — a full review of `app/`, `app/services`, `app/api`,
 `app/ai` against the running test suite surfaced and fixed several real issues, most
 severe first:

@@ -10,6 +10,7 @@ from app.api.auth import router as auth_router
 from app.api.interviews import router as interviews_router
 from app.api.jobs import router as jobs_router
 from app.api.resumes import router as resumes_router
+from app.api.roadmap import router as roadmap_router
 from app.api.users import router as users_router
 from app.core.config import settings
 from app.core.logging import configure_logging
@@ -25,6 +26,7 @@ app.include_router(resumes_router)
 app.include_router(jobs_router)
 app.include_router(assessments_router)
 app.include_router(interviews_router)
+app.include_router(roadmap_router)
 
 
 @app.get("/health")

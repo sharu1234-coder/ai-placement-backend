@@ -19,6 +19,10 @@ class Settings(BaseSettings):
     ai_provider: str = "ollama"
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "qwen3:8b"
+    # A hardcoded 120s was too tight for larger structured-output calls (e.g. a multi-day
+    # roadmap's task list) on modest dev hardware -- found via a live smoke test, not a
+    # guess. Override via OLLAMA_TIMEOUT_SECONDS in .env if a given deployment needs more.
+    ollama_timeout_seconds: int = 240
 
     # Dev-only local STT for OllamaProvider.transcribe -- swap for a cloud STT provider
     # before real user testing (see CloudProvider note in README).

@@ -108,7 +108,9 @@ class OllamaProvider(AIProvider):
             payload["format"] = format_schema
 
         try:
-            response = httpx.post(f"{self.base_url}/api/generate", json=payload, timeout=120)
+            response = httpx.post(
+                f"{self.base_url}/api/generate", json=payload, timeout=settings.ollama_timeout_seconds
+            )
             response.raise_for_status()
         except httpx.HTTPError as exc:
             raise AIGenerationError(f"Could not reach Ollama at {self.base_url}: {exc}") from exc
