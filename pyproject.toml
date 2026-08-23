@@ -1,0 +1,33 @@
+[tool.ruff]
+target-version = "py39"
+# Matches this codebase's existing style (verbose explanatory comments are the established
+# convention throughout -- see README/CLAUDE.md discipline), not a new stylistic mandate.
+# 130 is the longest line already in the codebase; anything past it still gets flagged.
+line-length = 130
+
+[tool.ruff.lint]
+# Pinned to an explicit set rather than ruff's evolving default -- so a future ruff release
+# adding new default-enabled rules can't silently start failing CI on unrelated code.
+select = ["E", "F", "I", "B"]
+ignore = [
+    # 30 existing call sites re-raise inside except without `raise ... from e`. Real, but
+    # fixing all of them is a separate change from standing up CI -- flagged as a follow-up
+    # rather than bundled into this item's diff (production readiness item 14 is CI setup,
+    # not an exception-handling pass).
+    "B904",
+]
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI's dependency-injection pattern is `param: X = Depends(get_x)` -- a function call in
+# a default argument by design, not the mutable-default-argument bug B008 exists to catch.
+extend-immutable-calls = [
+    "fastapi.Depends",
+    "fastapi.Query",
+    "fastapi.Path",
+    "fastapi.Body",
+    "fastapi.Header",
+    "fastapi.Cookie",
+    "fastapi.File",
+    "fastapi.Form",
+    "fastapi.Security",
+]

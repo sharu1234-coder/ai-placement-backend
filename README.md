@@ -66,6 +66,43 @@ as-is.
 
 ## Status
 
+**Production readiness item 14/20 — GitHub Actions CI/CD (2026-08-23).** Android side is in
+`ai-placement-android/README.md`. Backend side: `.github/workflows/ci.yml` — runs on every
+push/PR to `master`, no deployment/publish step (CD is deliberately not implemented; this
+item is CI only, per the master prompt's "keep production deployment/publishing disabled").
+- Pinned to Python 3.9 (matches the pins already in `requirements.txt` — `anthropic==0.125.0`,
+  `greenlet==3.0.3`, etc. are all pinned specifically for 3.9 compatibility). Installs
+  `requirements.txt` + new `requirements-dev.txt` (currently just `ruff==0.16.4`, kept out of
+  the runtime requirements file since it's a dev/CI-only tool), then runs `ruff check` and
+  `pytest -q`. No external services, API keys, or secrets needed — `tests/conftest.py` already
+  uses an in-memory SQLite database per test, so nothing to configure for CI to be green.
+- Added `pyproject.toml` (new) with the actual lint/static-check config:
+  - `target-version = "py39"` — without it, ruff's pyupgrade rules (`UP045`) suggested
+    `X | None` union syntax, which requires Python ≥3.10 at *runtime* (this codebase has no
+    `from __future__ import annotations`, and Pydantic evaluates annotations eagerly) —
+    would have been actively wrong advice for this codebase's pinned interpreter.
+  - `select = ["E", "F", "I", "B"]`, pinned explicitly rather than relying on ruff's default
+    selection, so a future ruff release adding new default-enabled rules can't silently start
+    failing CI on unrelated code.
+  - `extend-immutable-calls` for `fastapi.Depends`/`Query`/`Path`/`Body`/`File`/etc. — without
+    it, bugbear's B008 (function-call-in-default-argument) flagged FastAPI's own dependency-
+    injection pattern (`param: X = Depends(get_x)`) as a bug on ~109 call sites; this is a
+    real, standard config for FastAPI+ruff projects, not a workaround.
+  - `line-length = 130` — matches this codebase's existing verbose-comment style (130 is the
+    longest line already present); not a new stylistic mandate, chosen so CI starts green on
+    existing code rather than demanding an unrelated reformatting pass.
+  - `ignore = ["B904"]` — 30 existing `except:`/`raise` sites re-raise without `from e`
+    (real, but fixing all 30 is a separate change from standing up CI; flagged here as a
+    known follow-up, not silently dropped).
+- Ran ruff against the actual codebase before deciding this config, not against an empty
+  project: it initially reported 308 issues, all attributable to the three points above; the
+  two genuine ones (one unused `typing.List` import, one unsorted import block) were fixed
+  via `ruff check --fix` as part of this change. `ruff check app tests` now passes clean; the
+  full 189-test suite still passes after those two fixes.
+- **Verified the workflow actually runs, not just that the YAML is well-formed** — pushed and
+  watched the real run on GitHub's runners via `gh run watch` (see commit below for the run
+  result); this repo has no Docker/Linux environment available locally to dry-run it first.
+
 **Production readiness item 12/20 — Secrets + release signing (2026-08-23).** Android
 release-signing wiring is in `ai-placement-android/README.md`. Backend side: closes the one
 secret-shaped setting that had no fail-safe.

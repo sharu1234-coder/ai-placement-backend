@@ -1,0 +1,2 @@
+# Dev/CI-only tooling -- not needed to run the app, so kept out of requirements.txt.
+ruff==0.16.4

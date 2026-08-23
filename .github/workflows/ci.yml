@@ -1,0 +1,48 @@
+name: Backend CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+# Cancel a stale run for the same branch/PR when a new push arrives -- keeps this within the
+# free private-repo Actions minutes budget instead of stacking up redundant runs.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege: this workflow only reads the repo and never deploys, publishes, or writes
+# anything back to GitHub.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned to 3.9 to match the pinned runtime this project's dependencies are locked
+      # against (see requirements.txt comments -- anthropic==0.125.0, greenlet==3.0.3, etc.
+      # are all pinned specifically for Python 3.9 compatibility).
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+          cache: "pip"
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Lint (ruff)
+        run: ruff check app tests
+
+      # No external services needed: tests/conftest.py spins up an in-memory SQLite database
+      # per test, so this doesn't need Postgres, S3, SMTP, or any API key configured.
+      - name: Run tests
+        run: pytest -q

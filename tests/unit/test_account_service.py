@@ -22,10 +22,10 @@ from app.models.project import Project
 from app.models.question import Question
 from app.models.question_attempt import QuestionAttempt
 from app.models.requirement import Requirement
-from app.models.roadmap import Roadmap
-from app.models.roadmap_task import RoadmapTask
 from app.models.resume import Resume
 from app.models.resume_analysis import ResumeAnalysis
+from app.models.roadmap import Roadmap
+from app.models.roadmap_task import RoadmapTask
 from app.models.skill import Skill
 from app.models.skill_gap import SkillGap
 from app.models.user import User
