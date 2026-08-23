@@ -66,6 +66,44 @@ as-is.
 
 ## Status
 
+**Production readiness item 8/20 — Forgot password / account recovery (2026-08-23).**
+- New `POST /auth/forgot-password` (email) and `POST /auth/reset-password` (email, code,
+  new_password). A short single-use code (8 hex chars, `secrets.token_hex(4)`, ~4.3B
+  combinations) is generated, only its SHA-256 hash is stored (new `password_reset_tokens`
+  table, migration `f9408c0e3622`, mirrors bcrypt-hashing passwords -- a DB leak alone must
+  never yield a usable code), and it expires after `PASSWORD_RESET_TOKEN_EXPIRE_MINUTES`
+  (15 default). Requesting a new code invalidates any previous unused one for that user, so
+  only the newest code ever works.
+- **Prevents email enumeration**: `/forgot-password` returns the exact same response
+  ("If that email is registered, a reset code has been sent.") whether or not the email
+  belongs to an account -- verified live (see below), not just asserted.
+- New `app/email/provider.py` (`EmailProvider` ABC + `EmailError` + `get_email_provider()`),
+  mirroring the `AIProvider`/`StorageProvider` pattern exactly. `ConsoleEmailProvider`
+  (`EMAIL_PROVIDER=console`, dev default) logs the code instead of sending real email --
+  never claims to have delivered anything. `SMTPEmailProvider` (`EMAIL_PROVIDER=smtp`) uses
+  stdlib `smtplib` over plain SMTP, so it works with any SMTP-speaking service (Gmail app
+  passwords, SendGrid/SES/Postmark/Mailgun SMTP relays, ...) -- same "no vendor lock-in,
+  none chosen yet" reasoning as `S3StorageProvider` in item 4.
+- A successful reset changes `password_hash`, which is what actually invalidates the code
+  from being reused (plus the explicit `used_at` marker) -- a used or expired code fails
+  with 400 either way, no distinction leaked to the caller.
+- **Genuinely verified against real PostgreSQL 17**: ran every migration including the new
+  one, then a live signup → forgot-password (known email) → forgot-password (unknown
+  email, confirmed byte-identical response) → pulled the code from the server's own log
+  (exactly how a real operator using the console provider would) → reset-password →
+  confirmed old password now fails login and new password succeeds → confirmed the
+  used code is rejected on a second attempt. Verification database dropped afterward.
+- 12 new tests: 8 API (`tests/api/test_password_reset.py` -- unknown email, known email,
+  full reset flow, wrong code, single-use enforcement, unknown email on reset, code
+  invalidated by a newer request, expired code) + 4 unit (`tests/unit/test_email_providers.py`
+  -- console logging, SMTP missing-config error, SMTP send via mocked `smtplib.SMTP`, SMTP
+  send failure wrapped as `EmailError`). 181 passing total (was 169).
+- **Not done**: no rate limiting on `/forgot-password` (a determined attacker could spam
+  requests or brute-force an 8-hex-char code within its 15-minute window without one) --
+  that's item 19 (File + AI abuse controls), not this item. No production email vendor
+  chosen yet (same as storage in item 4) -- only SMTP credentials are needed, not a specific
+  provider.
+
 **Production readiness item 7/20 — Terms of Service (2026-08-23).**
 - `GET /legal/terms-of-service` (public, no auth) added alongside item 6's privacy-policy
   endpoint — `app/api/legal.py` was refactored to a small shared `_read_legal_document()`

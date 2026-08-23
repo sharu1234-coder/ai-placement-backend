@@ -54,5 +54,17 @@ class Settings(BaseSettings):
     storage_s3_access_key_id: Optional[str] = None
     storage_s3_secret_access_key: Optional[str] = None
 
+    # EMAIL_PROVIDER=console (dev default, logs the reset code instead of sending real
+    # email) or "smtp" for production. SMTPEmailProvider speaks plain SMTP, so it works
+    # with any SMTP-speaking service (Gmail app passwords, SendGrid/SES/Postmark/Mailgun
+    # SMTP relays, ...) -- which vendor to use in production hasn't been decided yet.
+    email_provider: str = "console"
+    smtp_host: Optional[str] = None
+    smtp_port: int = 587
+    smtp_username: Optional[str] = None
+    smtp_password: Optional[str] = None
+    smtp_from_address: Optional[str] = None
+    password_reset_token_expire_minutes: int = 15
+
 
 settings = Settings()

@@ -21,6 +21,7 @@ from app.models.interview_evaluation import InterviewEvaluation  # noqa: F401
 from app.models.interview_question import InterviewQuestion  # noqa: F401
 from app.models.job_description import JobDescription  # noqa: F401
 from app.models.job_match import JobMatch  # noqa: F401
+from app.models.password_reset_token import PasswordResetToken  # noqa: F401
 from app.models.profile import StudentProfile  # noqa: F401
 from app.models.project import Project  # noqa: F401
 from app.models.question import Question  # noqa: F401
