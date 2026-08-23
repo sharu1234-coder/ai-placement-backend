@@ -66,6 +66,40 @@ as-is.
 
 ## Status
 
+**Production readiness item 4/20 — Production file/resume storage (2026-08-23).**
+- Added `app/storage/provider.py` (`StorageProvider` ABC + `StorageError` + `get_storage_provider()`),
+  mirroring the existing `AIProvider` pattern exactly: services depend only on the
+  interface, never a vendor SDK or the local filesystem directly.
+- `LocalStorageProvider` (dev default, `STORAGE_PROVIDER=local`) preserves the exact prior
+  behavior — writes under `UPLOAD_DIR`. `S3StorageProvider` (`STORAGE_PROVIDER=s3`) speaks
+  the plain S3 API via `boto3`, so it works against real AWS S3 or any S3-compatible
+  service (Cloudflare R2, MinIO, Backblaze B2, DigitalOcean Spaces, ...) by pointing
+  `STORAGE_S3_ENDPOINT_URL` at that provider's endpoint — **no production vendor has been
+  chosen yet**, and none needed to be for this item; any S3-compatible bucket works.
+- `app/services/resume_service.py` and `app/api/resumes.py` updated to take an injected
+  `StorageProvider` (`Depends(get_storage_provider)`) instead of writing to disk directly —
+  upload (`_save_upload`) and delete (`delete_resume`) both route through it. Existing
+  resume upload/parse/analysis flow is otherwise unchanged: same PDF validation, same size
+  limit, same AI parsing pipeline, same response schema.
+- `Resume.file_path` now stores an opaque **storage key** (e.g. `resumes/<profile_id>_<uuid>.pdf`)
+  rather than an absolute filesystem path — a deliberate, minimal-blast-radius change since
+  no endpoint ever returned this field to clients and there is no download endpoint reading
+  it back. Column name unchanged (no migration needed).
+- Delete is best-effort exactly as before: if the underlying object can't be removed (S3
+  network error, permission error, already gone), it's logged and the DB row is still
+  deleted — a stuck file must never block account/resume deletion.
+- 7 new unit tests (`tests/unit/test_storage.py`): local save/delete round-trip, delete of a
+  missing key is a no-op, missing-bucket config raises `StorageError`, S3 save/delete call
+  the right boto3 calls with mocked `_client` (same mocking pattern as
+  `test_anthropic_provider.py`), S3 failures raise/log without ever crashing the caller.
+  158 passing total (was 151).
+- **Not done**: no real S3-compatible bucket/credentials were exercised — this environment
+  has none. To verify live: set `STORAGE_PROVIDER=s3`, `STORAGE_S3_BUCKET`, and credentials
+  in `.env` (plus `STORAGE_S3_ENDPOINT_URL` for a non-AWS provider), then upload a resume
+  and confirm the object exists in the bucket and deletion removes it.
+- **Not done**: choosing the actual production storage vendor/bucket — that's part of item
+  20 (final deployment readiness), not this one.
+
 **Production readiness item 3/20 — PostgreSQL production support (2026-08-23).**
 - Added `psycopg2-binary` driver, `pool_pre_ping=True` (guards against a managed Postgres
   instance silently dropping idle connections -- `app/database/session.py`), and

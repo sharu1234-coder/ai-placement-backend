@@ -42,5 +42,17 @@ class Settings(BaseSettings):
 
     upload_dir: str = "uploads"
 
+    # STORAGE_PROVIDER=local (dev default, writes under upload_dir) or "s3" for production.
+    # S3StorageProvider speaks the plain S3 API, so it works against real AWS S3 or any
+    # S3-compatible service (Cloudflare R2, MinIO, Backblaze B2, DigitalOcean Spaces, ...)
+    # -- which vendor to use in production hasn't been decided yet; set
+    # STORAGE_S3_ENDPOINT_URL to point at whichever one is chosen (leave unset for AWS).
+    storage_provider: str = "local"
+    storage_s3_bucket: Optional[str] = None
+    storage_s3_region: Optional[str] = None
+    storage_s3_endpoint_url: Optional[str] = None
+    storage_s3_access_key_id: Optional[str] = None
+    storage_s3_secret_access_key: Optional[str] = None
+
 
 settings = Settings()

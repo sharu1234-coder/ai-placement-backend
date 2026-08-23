@@ -8,10 +8,10 @@ from sqlalchemy.orm import Session
 
 from app.ai.provider import AIGenerationError, AIProvider
 from app.ai.schemas.resume import ParsedResume
-from app.core.config import settings
 from app.models.resume import Resume
 from app.models.resume_analysis import ResumeAnalysis
 from app.schemas.resume import ResumeAnalysisRead, ResumeUploadResponse
+from app.storage.provider import StorageProvider
 
 logger = logging.getLogger(__name__)
 
@@ -42,14 +42,10 @@ def _build_prompt(raw_text: str) -> str:
     return template.format(resume_text=raw_text)
 
 
-def _save_upload(profile_id: int, filename: str, file_bytes: bytes) -> str:
-    upload_dir = Path(settings.upload_dir) / "resumes"
-    upload_dir.mkdir(parents=True, exist_ok=True)
+def _save_upload(storage: StorageProvider, profile_id: int, filename: str, file_bytes: bytes) -> str:
     suffix = Path(filename).suffix or ".pdf"
-    stored_name = f"{profile_id}_{uuid.uuid4().hex}{suffix}"
-    path = upload_dir / stored_name
-    path.write_bytes(file_bytes)
-    return str(path)
+    key = f"resumes/{profile_id}_{uuid.uuid4().hex}{suffix}"
+    return storage.save(key, file_bytes)
 
 
 def to_analysis_read(analysis: ResumeAnalysis) -> ResumeAnalysisRead:
@@ -73,9 +69,10 @@ def process_resume_upload(
     filename: str,
     file_bytes: bytes,
     ai_provider: AIProvider,
+    storage: StorageProvider,
 ) -> ResumeUploadResponse:
     raw_text = extract_text_from_pdf(file_bytes)
-    file_path = _save_upload(profile_id, filename, file_bytes)
+    file_path = _save_upload(storage, profile_id, filename, file_bytes)
 
     resume = Resume(
         profile_id=profile_id, file_path=file_path, raw_text=raw_text, parse_status="processing"
@@ -125,7 +122,7 @@ def get_resume_analysis(db: Session, resume_id: int, profile_id: int) -> Optiona
     return to_analysis_read(analysis)
 
 
-def delete_resume(db: Session, resume_id: int, profile_id: int) -> bool:
+def delete_resume(db: Session, resume_id: int, profile_id: int, storage: StorageProvider) -> bool:
     """PROJECT_HANDOFF.md section 6: "Provide deletion controls for user data" /
     "Protect resumes and uploaded documents" -- there was previously no way to delete an
     uploaded resume at all. Removes the DB rows and the stored file itself."""
@@ -136,9 +133,9 @@ def delete_resume(db: Session, resume_id: int, profile_id: int) -> bool:
     db.query(ResumeAnalysis).filter(ResumeAnalysis.resume_id == resume.id).delete()
 
     try:
-        Path(resume.file_path).unlink(missing_ok=True)
-    except OSError:
-        logger.warning("Could not delete resume file %s for resume_id=%s", resume.file_path, resume.id)
+        storage.delete(resume.file_path)
+    except Exception as exc:  # best-effort: a stuck file must never block the DB delete
+        logger.warning("Could not delete resume file %s for resume_id=%s: %s", resume.file_path, resume.id, exc)
 
     db.delete(resume)
     db.commit()

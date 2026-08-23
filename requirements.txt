@@ -24,5 +24,9 @@ pywin32==312; sys_platform == "win32"  # pyttsx3's SAPI5 driver needs this on Wi
 # compatible with this project's pinned Python 3.9 (the 1.x line requires Python >=3.10).
 anthropic==0.125.0
 
+# Production object storage (STORAGE_PROVIDER=s3) -- speaks the S3 API, works against AWS
+# S3 or any S3-compatible provider (R2, MinIO, B2, Spaces, ...) via STORAGE_S3_ENDPOINT_URL.
+boto3==1.35.99
+
 pytest==8.3.4
 httpx==0.28.1

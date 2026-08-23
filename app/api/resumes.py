@@ -14,6 +14,7 @@ from app.services.resume_service import (
     get_resume_analysis,
     process_resume_upload,
 )
+from app.storage.provider import StorageProvider, get_storage_provider
 
 router = APIRouter(prefix="/resumes", tags=["resumes"])
 
@@ -27,6 +28,7 @@ async def upload_resume(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
     ai_provider: AIProvider = Depends(get_ai_provider),
+    storage: StorageProvider = Depends(get_storage_provider),
 ) -> ResumeUploadResponse:
     if file.content_type not in _ALLOWED_CONTENT_TYPES:
         raise HTTPException(
@@ -46,7 +48,13 @@ async def upload_resume(
         # the full explanation (found via live testing: a concurrent request froze while
         # this ran uncovered).
         return await run_in_threadpool(
-            process_resume_upload, db, profile.id, file.filename or "resume.pdf", file_bytes, ai_provider
+            process_resume_upload,
+            db,
+            profile.id,
+            file.filename or "resume.pdf",
+            file_bytes,
+            ai_provider,
+            storage,
         )
     except ResumeProcessingError as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
@@ -70,7 +78,8 @@ def delete_resume_endpoint(
     resume_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
+    storage: StorageProvider = Depends(get_storage_provider),
 ) -> None:
     profile = get_or_create_profile(db, current_user)
-    if not delete_resume(db, resume_id, profile.id):
+    if not delete_resume(db, resume_id, profile.id, storage):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Resume not found")
