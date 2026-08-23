@@ -7,6 +7,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from app.api.assessments import router as assessments_router
 from app.api.auth import router as auth_router
@@ -25,6 +26,25 @@ configure_logging()
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title=settings.app_name)
+
+app.add_middleware(
+    TrustedHostMiddleware,
+    allowed_hosts=[host.strip() for host in settings.allowed_hosts.split(",")],
+)
+
+
+@app.middleware("http")
+async def add_hsts_header(request: Request, call_next):
+    """Adds Strict-Transport-Security only for requests that actually arrived over HTTPS in
+    production -- reads request.url.scheme fresh per request (not baked in at import), so
+    it reflects reality even behind a reverse proxy (which requires Uvicorn's
+    --proxy-headers flag to correctly report "https" here -- see README). Harmless no-op in
+    dev, where every request is plain HTTP."""
+    response = await call_next(request)
+    if settings.environment == "production" and request.url.scheme == "https":
+        response.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains"
+    return response
+
 
 app.include_router(auth_router)
 app.include_router(users_router)

@@ -66,6 +66,45 @@ as-is.
 
 ## Status
 
+**Production readiness item 11/20 — HTTPS / network security (2026-08-23).**
+- **Important context this app cannot fix by itself**: TLS termination happens at the
+  reverse proxy / deployment platform in front of this app (nginx, Render, Railway, Fly.io,
+  an AWS ALB, ...), not inside FastAPI/Uvicorn. This item does what the *app* is
+  responsible for once that's in place, and documents what the deployment layer must do.
+- `TrustedHostMiddleware` (Starlette) added, configured via `ALLOWED_HOSTS` (comma-separated,
+  `*` dev default). Rejects requests with a spoofed/unexpected `Host` header — set this to
+  the real domain(s) in production (e.g. `ALLOWED_HOSTS=api.aiplacementos.com`) to close off
+  Host-header-based cache-poisoning/spoofing attacks.
+- New `Strict-Transport-Security` response header, added only when
+  `ENVIRONMENT=production` **and** the request actually arrived over HTTPS
+  (`request.url.scheme`, checked fresh per request, not cached at import) — verified live
+  via a `TestClient(app, base_url="https://testserver")` in tests, not just asserted from
+  reading the code.
+- **Deployment requirement, documented not automated**: if this app runs behind a reverse
+  proxy (the normal case), start Uvicorn with `--proxy-headers` (and
+  `--forwarded-allow-ips` set to the proxy's IP, or `*` if the platform doesn't expose a
+  fixed IP) so it correctly reads `X-Forwarded-Proto` from the proxy — without this,
+  `request.url.scheme` always reports `http` internally even when the public-facing
+  connection is HTTPS, and the HSTS header above would never fire. Deliberately did **not**
+  add Starlette's `HTTPSRedirectMiddleware`: without `--proxy-headers` configured correctly
+  first, it can misfire (redirect loops, or rejecting legitimate HTTPS traffic that arrives
+  internally as plain HTTP from the proxy) — safer to document the real requirement than
+  ship a redirect that silently assumes a specific deployment topology.
+- CORS was deliberately **not** added: there's no browser-based client yet (Android talks
+  to this API via Retrofit, which isn't subject to CORS) — add a restrictive
+  `CORSMiddleware` if/when a web frontend is built, not preemptively.
+- 5 new tests (`tests/api/test_security_middleware.py`): normal requests still work with
+  the default permissive `ALLOWED_HOSTS` (regression safety — the actual "reject a bad
+  host" path isn't unit-tested since `TrustedHostMiddleware` bakes its allowlist in from
+  settings at app-construction time, the same way other settings-derived wiring in this
+  project already is), HSTS present only for production+https, absent for
+  dev+https/production+http/dev+http. 186 passing total (was 181).
+- Android side (cleartext traffic split by build flavor) is in
+  `ai-placement-android/README.md`.
+- **Not done**: no actual reverse proxy/TLS certificate is provisioned anywhere (that's
+  item 20, final deployment) -- this item makes the app itself correct and documents the
+  proxy-side requirement, it doesn't stand up a proxy.
+
 **Production readiness item 10/20 — Real-device voice readiness (2026-08-23).** This item
 is Android-side (see `ai-placement-android/README.md` and
 `ai-placement-android/VOICE_READINESS_CHECKLIST.md` for the full checklist) — no backend

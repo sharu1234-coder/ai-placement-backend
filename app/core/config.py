@@ -66,5 +66,14 @@ class Settings(BaseSettings):
     smtp_from_address: Optional[str] = None
     password_reset_token_expire_minutes: int = 15
 
+    # Comma-separated Host header allowlist (TrustedHostMiddleware, app/main.py). "*" (dev
+    # default) accepts any Host -- fine locally, but a production deployment should set
+    # this to its real domain(s) (e.g. "api.aiplacementos.com") to reject Host-header
+    # spoofing/cache-poisoning attempts. TLS itself is terminated at the reverse proxy /
+    # deployment platform (nginx, Render, Railway, an AWS ALB, ...), not by this app --
+    # see README "HTTPS / network security" for the full picture, including why Uvicorn
+    # needs --proxy-headers when run behind one of those.
+    allowed_hosts: str = "*"
+
 
 settings = Settings()
