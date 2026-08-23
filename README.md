@@ -66,6 +66,18 @@ as-is.
 
 ## Status
 
+**Production readiness item 10/20 — Real-device voice readiness (2026-08-23).** This item
+is Android-side (see `ai-placement-android/README.md` and
+`ai-placement-android/VOICE_READINESS_CHECKLIST.md` for the full checklist) — no backend
+code changed. One finding from that review is worth flagging here: `synthesize_speech()`'s
+`pyttsx3` backend (`app/ai/ollama_provider.py`) is effectively Windows-only as currently
+used (its own docstring says "Windows SAPI5 via pyttsx3," and `pywin32` is conditioned on
+`sys_platform == "win32"` in `requirements.txt`). If this backend is ever deployed to a
+non-Windows host (the common case), TTS will likely fail without installing a Linux backend
+(e.g. espeak) and reconfiguring pyttsx3 — a deployment-portability gap for item 2's
+eventual resolution (STT/TTS vendor, still deferred pending the user's choice), not fixed
+here.
+
 **Production readiness item 8/20 — Forgot password / account recovery (2026-08-23).**
 - New `POST /auth/forgot-password` (email) and `POST /auth/reset-password` (email, code,
   new_password). A short single-use code (8 hex chars, `secrets.token_hex(4)`, ~4.3B
