@@ -66,6 +66,47 @@ as-is.
 
 ## Status
 
+**Production readiness item 16/20 — Database backups / operational readiness (2026-08-24).**
+Backend-only. Full runbook in [`OPERATIONS.md`](OPERATIONS.md) (backup/restore, migration
+rollback, health checks, safe logging, incident recovery); this entry is a summary. **No
+production database exists yet, so no backups are "active" anywhere** — everything here is
+the tested, ready-to-use procedure for once one does.
+- `scripts/backup_db.py` / `scripts/restore_db.py` — work against whichever `DATABASE_URL` is
+  configured (Postgres via `pg_dump -Fc`/`pg_restore`, SQLite via a file copy), same scripts
+  for local dev now and a real production database later. No paid infrastructure.
+  `restore_db.py` requires `--yes` to actually run and refuses `ENVIRONMENT=production`
+  without `--allow-production` (guards against a local restore accidentally pointed at a real
+  prod `DATABASE_URL`).
+- **Verified the full backup → destroy → restore → verify cycle for real against local
+  PostgreSQL 17**: signed up a real user through the running API, backed it up, `DROP
+  DATABASE` + recreate (genuinely destroyed, confirmed empty), restored from the backup, then
+  confirmed via direct SQL that the user row, `alembic_version`, and the seeded role taxonomy
+  were all back — and, the strongest check, booted the app against the restored database and
+  logged in with the original signup credentials successfully.
+- **Verified the full migration rollback chain for real**: `alembic upgrade head` →
+  `downgrade base` → `upgrade head` against a fresh PostgreSQL 17 database — all 13
+  migrations (including the two seed-data ones) downgraded cleanly in reverse order to an
+  empty schema, then all reapplied cleanly.
+- `GET /health/ready` now also checks the database's schema is at the migration revision the
+  running code expects (`app/core/schema_check.py`), not just that the database is reachable
+  — catches "deployed new code but forgot to run `alembic upgrade head`", which previously
+  passed `/health/ready` right up until a request hit a column/table that didn't exist yet.
+  **Verified live**: confirmed `schema: "current"` at head, then ran `alembic downgrade -1`
+  against the same database while the (still-expecting-the-newer-schema) server kept
+  running — `/health/ready` correctly flipped to `503 schema: "out_of_date"` with both
+  revisions in the response.
+- Safe logging: reviewed every logging call site again with an operational-log lens (not just
+  item 15's secrets lens). Found and fixed one: the readiness check's database-connectivity
+  failure previously logged the raw exception, which for some drivers can echo back the DSN
+  (and its embedded password) it failed to connect with — now logs only the exception type.
+- **Not implemented**: automated/scheduled backups (no production database to schedule them
+  against yet — `OPERATIONS.md` recommends using the hosting platform's native automated
+  snapshots first, once one exists, with these scripts as the tested fallback), off-site
+  backup storage, backup encryption at rest, and request correlation IDs (flagged as a good
+  future addition for incident debugging, not built speculatively).
+- 208 tests passing (was 204), `ruff check` clean (now also covers the new `scripts/`
+  directory — added to CI).
+
 **Production readiness item 15/20 — Backend/API security hardening (2026-08-24).** Android-
 only side of this item (there isn't one; the request was backend/API-focused) has no
 equivalent. Started from a full audit (every router, auth flow, upload path, error handler,

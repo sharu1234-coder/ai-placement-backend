@@ -26,6 +26,7 @@ from app.core.body_size_limit import MaxBodySizeMiddleware
 from app.core.config import settings, validate_for_production
 from app.core.logging import configure_logging
 from app.core.rate_limit import limiter
+from app.core.schema_check import get_expected_head_revision, is_schema_current
 from app.core.security_headers import HSTSMiddleware
 
 configure_logging()
@@ -77,13 +78,48 @@ def readiness_check(db: Session = Depends(get_db)) -> JSONResponse:
     """Readiness -- can this instance actually serve traffic right now. Checks the database
     the same way a real request would (via get_db, so it reflects the configured
     DATABASE_URL/session exactly, and is testable via the same dependency override every
-    other test already uses)."""
+    other test already uses), and that the database's schema is actually at the migration
+    revision this deployment's code expects -- catches "deployed new code but forgot to run
+    `alembic upgrade head`" (the process starts fine and /health passes; only this notices)."""
     try:
         db.execute(text("SELECT 1"))
     except SQLAlchemyError as exc:
-        logger.error("Readiness check failed: database unreachable: %s", exc)
+        # Logs only the exception type, not str(exc) -- some drivers' connection-failure
+        # messages can echo back the DSN (and its embedded password) they failed to connect
+        # with.
+        logger.error("Readiness check failed: database unreachable (%s)", type(exc).__name__)
         return JSONResponse(status_code=503, content={"status": "unavailable", "database": "unreachable"})
-    return JSONResponse(status_code=200, content={"status": "ok", "database": "reachable"})
+
+    try:
+        current_revision = db.execute(text("SELECT version_num FROM alembic_version")).scalar()
+    except SQLAlchemyError:
+        db.rollback()  # failed statement leaves the session unusable until rolled back
+        current_revision = None
+
+    expected_revision = get_expected_head_revision()
+    if not is_schema_current(current_revision, expected_revision):
+        logger.error(
+            "Readiness check failed: schema at %s, expected %s", current_revision, expected_revision
+        )
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "unavailable",
+                "database": "reachable",
+                "schema": "out_of_date",
+                "current_revision": current_revision,
+                "expected_revision": expected_revision,
+            },
+        )
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "status": "ok",
+            "database": "reachable",
+            "schema": "current" if current_revision else "not_tracked",
+        },
+    )
 
 
 @app.exception_handler(RequestValidationError)

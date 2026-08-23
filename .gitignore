@@ -17,3 +17,6 @@ htmlcov/
 
 .vscode/
 .idea/
+
+# Local backup output (scripts/backup_db.py) -- never commit a database dump.
+/backups/
