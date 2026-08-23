@@ -66,6 +66,36 @@ as-is.
 
 ## Status
 
+**Production readiness item 7/20 — Terms of Service (2026-08-23).**
+- `GET /legal/terms-of-service` (public, no auth) added alongside item 6's privacy-policy
+  endpoint — `app/api/legal.py` was refactored to a small shared `_read_legal_document()`
+  helper rather than copy-pasting the read-and-wrap logic a second time. Content in
+  `app/legal/terms_of_service_v1.txt`, same versioned-file convention as the privacy policy
+  and the AI prompts.
+- Written from the app's actual features, not boilerplate: section 3 ("AI-generated
+  content — read this") is the load-bearing clause — it states plainly that every
+  AI-produced score, question, and piece of feedback in this app (resume analysis,
+  assessment grading, interview evaluation, roadmap) is practice guidance, not a placement
+  guarantee or professional opinion, and can be wrong. Section 4 covers the content-license
+  grant needed to send user text to the AI provider (items 1/4) without claiming ownership
+  of it or using it for model training. Section 6 points at the item-5 account-deletion
+  flow as how termination works on the user's side.
+- Same drafting-note caveat as item 6: flags that sections 7-8 (warranty/liability
+  disclaimers) need real legal review since enforceability varies by jurisdiction, that no
+  governing-law clause is included yet, and that the contact email
+  (`legal@sgldquantlabs.com`) is a placeholder.
+- Android: new `TermsScreen`, reusing a newly-extracted shared `LegalDocumentViewModel`/
+  `LegalDocumentContent` (the item-6 `PrivacyViewModel` was folded into this generic
+  version rather than duplicating its fetch/Loading/Error/Success logic a second time —
+  `PrivacyScreen` now uses the same shared pieces). New `Screen.Terms` route, wired from a
+  new "Terms of Service" card in Settings next to the existing Privacy one.
+- 2 new backend tests (`tests/api/test_legal.py`: public reachability, no-auth-required,
+  mirroring item 6's tests). 169 passing total (was 167). Android:
+  `compileDevDebugKotlin` BUILD SUCCESSFUL.
+- **Not done**: legal review by a qualified lawyer, a real contact address, and a
+  governing-law/dispute-resolution clause — all flagged in the document itself and in
+  item 6's equivalent note.
+
 **Production readiness item 6/20 — Real Privacy Policy (2026-08-23).**
 - `GET /legal/privacy-policy` (public, no auth — must be reachable before signup, from a
   logged-out state, and from an app store listing) returns `{version, content}`. Content
