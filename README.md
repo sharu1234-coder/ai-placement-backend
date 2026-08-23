@@ -18,7 +18,26 @@ alembic upgrade head          # creates app.db (SQLite) with the current schema
 uvicorn app.main:app --reload
 ```
 
-Visit `http://127.0.0.1:8000/health` to confirm the app is running.
+Visit `http://127.0.0.1:8000/health` to confirm the app is running (liveness -- no
+dependency checks). `http://127.0.0.1:8000/health/ready` additionally checks the database
+is reachable (200 `{"status":"ok","database":"reachable"}`, or 503 if not) -- use this one
+for deployment readiness/orchestrator probes.
+
+## Production database (PostgreSQL)
+
+SQLite (the default) is for local dev only. For staging/production, set `DATABASE_URL` to
+a PostgreSQL URL:
+
+```
+DATABASE_URL=postgresql://<user>:<password>@<host>:5432/<dbname>
+```
+
+`psycopg2-binary` is already in `requirements.txt` and `app/database/session.py`'s engine
+setup is already driver-agnostic (SQLite's `check_same_thread` connect arg is conditional
+on the URL scheme; `pool_pre_ping=True` applies to both, guarding against a managed
+Postgres instance silently dropping idle connections). Alembic migrations were verified
+live against a real local PostgreSQL 17 instance -- see Status below. Never hardcode
+credentials; set `DATABASE_URL` via your deployment platform's secret store.
 
 ## Test
 
@@ -46,6 +65,31 @@ dev-only STT/TTS -- see Status below for details and why these must not ship to 
 as-is.
 
 ## Status
+
+**Production readiness item 3/20 — PostgreSQL production support (2026-08-23).**
+- Added `psycopg2-binary` driver, `pool_pre_ping=True` (guards against a managed Postgres
+  instance silently dropping idle connections -- `app/database/session.py`), and
+  `GET /health/ready` (checks real DB connectivity via the same `get_db` every request
+  uses, 503 if unreachable -- distinct from the existing dependency-free `/health`
+  liveness check).
+- **Genuinely verified against a real PostgreSQL 17 instance**, not just structural
+  driver/dialect checks: installed PostgreSQL 17 locally, ran every Alembic migration
+  against it end to end (`alembic upgrade head` -- all 11 migrations applied cleanly,
+  including the hand-fixed `server_default=CURRENT_TIMESTAMP` migration from the Progress
+  dashboard work, confirming that syntax is genuinely Postgres-compatible and not just
+  assumed to be), then ran the app against it live: signup, login (bcrypt + JWT), the
+  seeded role taxonomy, profile read/update, and a JSON column round-trip
+  (`AssessmentBlueprint.sections`) all worked correctly. Verification database dropped
+  afterward -- nothing about this depends on that local instance still existing.
+- `DATABASE_URL` was already the only thing standing between SQLite and Postgres (the
+  session-setup code was already driver-agnostic) -- this item mainly *proved* that claim
+  true rather than needing to change much to make it true.
+- 1 new test (`tests/api/test_health.py::test_readiness_check_reports_database_reachable`)
+  for the new endpoint. 151 passing total.
+- **Not done**: no actual staging/production Postgres instance exists yet (that's item 20/
+  deployment, and needs a real hosting decision from you -- RDS, Cloud SQL, Supabase,
+  self-hosted, etc.). This item proves the app *works* against Postgres; it doesn't stand
+  up a production one.
 
 **Production readiness item 1/20 — Cloud AI provider (2026-08-23).** Part of a 20-item
 production-hardening pass (subscriptions/payments explicitly out of scope for all 20

@@ -1,12 +1,16 @@
 import logging
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
 
 from app.api.assessments import router as assessments_router
 from app.api.auth import router as auth_router
+from app.api.deps import get_db
 from app.api.interviews import router as interviews_router
 from app.api.jobs import router as jobs_router
 from app.api.progress import router as progress_router
@@ -33,7 +37,23 @@ app.include_router(progress_router)
 
 @app.get("/health")
 def health_check() -> dict:
+    """Liveness only -- is the process up. No dependency checks, so this never fails just
+    because the database is briefly unreachable (see /health/ready for that)."""
     return {"status": "ok", "app": settings.app_name, "environment": settings.environment}
+
+
+@app.get("/health/ready")
+def readiness_check(db: Session = Depends(get_db)) -> JSONResponse:
+    """Readiness -- can this instance actually serve traffic right now. Checks the database
+    the same way a real request would (via get_db, so it reflects the configured
+    DATABASE_URL/session exactly, and is testable via the same dependency override every
+    other test already uses)."""
+    try:
+        db.execute(text("SELECT 1"))
+    except SQLAlchemyError as exc:
+        logger.error("Readiness check failed: database unreachable: %s", exc)
+        return JSONResponse(status_code=503, content={"status": "unavailable", "database": "unreachable"})
+    return JSONResponse(status_code=200, content={"status": "ok", "database": "reachable"})
 
 
 @app.exception_handler(RequestValidationError)

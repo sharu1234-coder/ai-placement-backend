@@ -8,6 +8,7 @@ email-validator==2.2.0
 sqlalchemy==2.0.36
 greenlet==3.0.3  # pinned: newer greenlet has no prebuilt wheel for this Python, would need MSVC Build Tools to compile
 alembic==1.14.0
+psycopg2-binary==2.9.10  # production Postgres driver; SQLite (stdlib) stays the dev default
 bcrypt==4.0.1  # pinned: 4.2.1 fails to import its native extension on this Windows/Python build
 pyjwt==2.10.1
 PyMuPDF==1.24.14
