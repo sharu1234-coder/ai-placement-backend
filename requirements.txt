@@ -19,5 +19,9 @@ faster-whisper==1.2.1
 pyttsx3==2.99
 pywin32==312; sys_platform == "win32"  # pyttsx3's SAPI5 driver needs this on Windows
 
+# Production cloud AI provider (AI_PROVIDER=anthropic) -- 0.125.0 is the latest release
+# compatible with this project's pinned Python 3.9 (the 1.x line requires Python >=3.10).
+anthropic==0.125.0
+
 pytest==8.3.4
 httpx==0.28.1

@@ -47,6 +47,37 @@ as-is.
 
 ## Status
 
+**Production readiness item 1/20 — Cloud AI provider (2026-08-23).** Part of a 20-item
+production-hardening pass (subscriptions/payments explicitly out of scope for all 20
+items). `app/ai/anthropic_provider.py` implements `AIProvider` using the Anthropic Python
+SDK, selected via `AI_PROVIDER=anthropic` -- zero service/route changes needed, since every
+service already depended only on the `AIProvider` interface.
+- Uses `client.messages.parse(output_format=schema)` for structured output -- the SDK
+  enforces the JSON schema server-side and validates the response against the Pydantic
+  model for us. One retry with a correction prompt on `ValidationError`, exactly mirroring
+  `OllamaProvider`'s existing contract (`generate_structured` retries once, then raises
+  `AIGenerationError`) -- callers can't tell which provider they're talking to.
+- Defaults to `claude-sonnet-5` (`ANTHROPIC_MODEL` overrides) -- Anthropic's own guidance
+  recommends Sonnet-tier over Opus-tier for this kind of high-volume production workload
+  (question generation, grading, JD/resume parsing, interview evaluation), at roughly 60%
+  of Opus's per-token cost. Swap per-deployment, or per-task-type in a future pass, if a
+  different quality/cost tradeoff is wanted.
+- `anthropic==0.125.0` pinned in `requirements.txt` -- the newer `anthropic` 1.x line
+  requires Python >=3.10; this project is pinned to 3.9 (see the `greenlet`/`bcrypt` pins
+  already in the file for the same underlying reason).
+- `transcribe()`/`synthesize_speech()` are **not** implemented on this provider (falls
+  through to `AIProvider`'s `NotImplementedError` default) -- that's production-readiness
+  item 2 (STT/TTS), scoped separately.
+- 9 new mocked unit tests (`tests/unit/test_anthropic_provider.py`): structured-output
+  success, retry-then-succeed, both-retries-fail, missing-parsed-output, API status/
+  connection errors (verified *not* retried -- a network failure isn't a schema problem),
+  and text-generation content-block filtering.
+- **Not live-tested against the real Anthropic API** -- this environment has no
+  `ANTHROPIC_API_KEY` (Claude Code sessions don't carry the user's own Anthropic billing
+  key). To verify live: set `ANTHROPIC_API_KEY` and `AI_PROVIDER=anthropic` in `.env`, then
+  run any endpoint that calls `generate_structured`/`generate_text` (e.g.
+  `POST /jobs` with a real JD) against a running server.
+
 **Stage 12 — Progress dashboard (2026-08-23)**, the last piece of V1 scope item #14
 ("Progress/Reassessment") not yet built, and the start of M12's end-to-end pass:
 - `GET /progress/dashboard` (`app/services/progress_service.py`) aggregates three things

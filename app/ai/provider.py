@@ -41,4 +41,9 @@ def get_ai_provider() -> AIProvider:
 
         return OllamaProvider()
 
+    if settings.ai_provider == "anthropic":
+        from app.ai.anthropic_provider import AnthropicProvider
+
+        return AnthropicProvider()
+
     raise NotImplementedError(f"AI provider '{settings.ai_provider}' is not implemented yet")

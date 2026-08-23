@@ -1,3 +1,5 @@
+from typing import Optional
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -23,6 +25,16 @@ class Settings(BaseSettings):
     # roadmap's task list) on modest dev hardware -- found via a live smoke test, not a
     # guess. Override via OLLAMA_TIMEOUT_SECONDS in .env if a given deployment needs more.
     ollama_timeout_seconds: int = 240
+
+    # Production cloud provider (AI_PROVIDER=anthropic). Never hardcode a real key here --
+    # this default is None so a misconfigured deployment fails loudly at first use rather
+    # than silently trying an empty string. claude-sonnet-5 is the documented pick for
+    # high-volume production workloads (vs. claude-opus-5's higher per-token cost) --
+    # override via ANTHROPIC_MODEL in .env per-deployment if a different quality/cost
+    # tradeoff is wanted (e.g. Opus for interview evaluation specifically, Haiku for cheap
+    # extraction) -- see README "Production AI provider" for the full tradeoff.
+    anthropic_api_key: Optional[str] = None
+    anthropic_model: str = "claude-sonnet-5"
 
     # Dev-only local STT for OllamaProvider.transcribe -- swap for a cloud STT provider
     # before real user testing (see CloudProvider note in README).
