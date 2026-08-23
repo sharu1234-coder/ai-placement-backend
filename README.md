@@ -66,6 +66,96 @@ as-is.
 
 ## Status
 
+**Production readiness item 15/20 — Backend/API security hardening (2026-08-24).** Android-
+only side of this item (there isn't one; the request was backend/API-focused) has no
+equivalent. Started from a full audit (every router, auth flow, upload path, error handler,
+and logging call site read, not just grepped) before changing anything — see the per-area
+breakdown below. 204 tests passing (was 189); `ruff check` clean.
+
+- **Rate limiting / brute-force protection (was entirely absent).** New `slowapi`-based
+  limiter (`app/core/rate_limit.py`, in-memory storage — no Redis/paid infra) applied to
+  every auth endpoint: `/auth/login` 5/minute, `/auth/signup` 3/hour, `/auth/forgot-password`
+  3/hour, `/auth/reset-password` 10/minute, `/auth/refresh` 20/minute. **Verified live**, not
+  just unit-tested: 5 wrong-password attempts against a real running instance got a 6th
+  blocked with 429. `tests/conftest.py`'s `client` fixture resets the limiter
+  (`app.state.limiter.reset()`) before every test — otherwise its counters would leak across
+  tests sharing the one module-level `app` object and cause flaky failures unrelated to what
+  a given test is actually checking.
+- **JWT access/refresh token handling — reviewed, and a real gap closed.** Expiry values (30
+  min access / 7 day refresh) were already reasonable and are unchanged. What was missing:
+  no way to revoke a token before its natural expiry. Added `token_version` to `User`
+  (migration `b53876ba4675`, live-applied to a real PostgreSQL 17 database from a clean
+  history as part of verifying this), embedded as a `"tv"` claim in every access/refresh
+  token, checked against the user's current value on every authenticated request
+  (`app/api/deps.py`) and in `/auth/refresh`. New `POST /auth/logout` bumps it, instantly
+  invalidating every token already issued to that user (all sessions/devices at once — there's
+  no per-device session tracking anywhere in this app yet to do anything finer-grained).
+  `reset_password()` now also bumps it, so a token issued before a password reset stops
+  working immediately instead of remaining valid until it naturally expires — closes a real
+  gap the audit found (previously a reset changed the password hash but left every
+  already-issued token for that account valid). **Verified live** against real PostgreSQL:
+  signup → login → confirm token works → logout → confirm the same token is now rejected (401)
+  → confirm the refresh token is rejected too.
+  Algorithm confusion was checked and is a non-issue: `algorithms=[settings.jwt_algorithm]` is
+  an explicit allowlist, not read from the token header.
+- **Upload validation.** Resume upload already had a 10MB streaming size cap and a
+  Content-Type check; the Content-Type check only ever looked at a client-supplied header
+  (fully attacker-controlled). Added a real content check — the actual bytes must start with
+  `%PDF-` — so a non-PDF file can no longer get through just by claiming
+  `Content-Type: application/pdf`. Interview audio upload had *no* type validation at all
+  (found by the audit, not previously known); added a content-type allowlist matching what
+  the Android client actually sends (`audio/mp4` — see `AudioRecorder.kt`). Neither does deep
+  malware/content scanning (would need libmagic or an external scanning service — out of
+  scope per "no paid infrastructure" and not requested).
+- **Global request body size cap (previously nonexistent for anything except the two upload
+  routes).** New `MaxBodySizeMiddleware` (`app/core/body_size_limit.py`, pure ASGI, no new
+  dependency), 12MB ceiling — just above the existing 10MB upload caps so it never interferes
+  with them. Checks both an honestly-declared `Content-Length` (rejected before the body is
+  even read) and the actual streamed byte count (so a client that omits `Content-Length` can't
+  bypass it). **This surfaced a real, separate bug while building it**: a plain
+  `add_middleware()`-registered middleware sits *outside* Starlette's `ExceptionMiddleware`
+  (which only wraps the router), so raising `HTTPException` from inside one doesn't get
+  converted into a normal HTTP response the way it does from a route handler — it silently
+  becomes an unhandled 500 instead. Found this via the middleware's own tests, not by
+  inspection. Fixed by having the middleware construct and send the 413 response directly at
+  the ASGI level instead of relying on exception handling. While tracking this down, also
+  rewrote item 11's HSTS middleware from `@app.middleware("http")` (`BaseHTTPMiddleware`) to
+  plain ASGI (`app/core/security_headers.py`) — `BaseHTTPMiddleware` has a related, documented
+  limitation around exceptions raised while a nested middleware reads the request body.
+  Same external behavior, re-verified against all 5 of its existing tests (still pass
+  unchanged) plus a live HTTP check (an honestly-oversized `Content-Length` against a real
+  running instance got a real 413).
+- **Cross-user access (IDOR) — audited, not found to need any changes.** Traced every
+  ID-taking endpoint across every router to its service function: resumes, job descriptions,
+  assessments, interviews, roadmap tasks, and profile sub-resources (education/skills/
+  projects/experience/certifications) all already filter by the authenticated user's
+  `profile_id`/`user_id` before returning or modifying anything — no gaps found. This was
+  already backed by real regression tests before this item (`test_delete_resume_isolated_
+  per_user`, and equivalents in `test_jobs.py`, `test_assessments.py`, `test_interviews.py`,
+  `test_roadmap.py`, `test_profile.py`, `test_progress.py`) — confirmed they still pass rather
+  than re-deriving the same coverage from scratch.
+- **Sensitive info in error responses/logs.** The global exception handler
+  (`app/main.py`) already never leaks a stack trace or exception message to the client —
+  confirmed by reading it, not assumed. Found one real leak candidate: `ConsoleEmailProvider`
+  (the dev-default email provider) logs password reset codes in plaintext — fine for local
+  dev (there's no other way to get the code without real SMTP configured), but would leak
+  every user's reset code into application logs if a production deployment forgot to switch
+  `EMAIL_PROVIDER` away from the default. `validate_for_production()` (item 12's pattern) now
+  also fails fast at startup if `ENVIRONMENT=production` and `EMAIL_PROVIDER` is still
+  `console`, or if `DEBUG` is still `true` (controls app log verbosity) — same "fail loudly at
+  startup instead of silently running unsafe" approach as the existing JWT-secret check.
+- **Not done / explicitly out of scope**: PDF/malware content scanning beyond the magic-byte
+  check (would need libmagic or an external scanning service); per-device/named-session
+  revocation (logout is all-or-nothing per user, not per-session, since no session concept
+  exists elsewhere in this app); rate limiting on non-auth endpoints (e.g. the AI-calling
+  routes) — flagged as a possible follow-up for cost/DoS control, not requested by this item
+  and not implemented; email-enumeration via `/auth/signup`'s 409 response (`forgot-password`
+  is deliberately enumeration-safe, `signup` isn't and wasn't asked to be — this is normal for
+  most products' signup flows, an intentional non-change, not an oversight); tightening
+  `validate_for_production()`'s exact-string `environment == "production"` match (a typo'd
+  environment value still silently skips all these checks) — real, but changing that gate's
+  fail-open semantics is a bigger, separate behavior change from what this item asked for.
+
 **Production readiness item 14/20 — GitHub Actions CI/CD (2026-08-23).** Android side is in
 `ai-placement-android/README.md`. Backend side: `.github/workflows/ci.yml` — runs on every
 push/PR to `master`, no deployment/publish step (CD is deliberately not implemented; this

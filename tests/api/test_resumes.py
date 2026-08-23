@@ -85,6 +85,20 @@ def test_upload_rejects_non_pdf(client, auth_headers, use_fake_ai):
     assert resp.status_code == 415
 
 
+def test_upload_rejects_spoofed_content_type(client, auth_headers, use_fake_ai):
+    """Content-Type is entirely client-controlled -- claiming application/pdf on bytes that
+    aren't a PDF at all must still be rejected (checked against the actual bytes, not just
+    the header the client chose to send)."""
+    use_fake_ai(FakeAIProvider(parsed=SAMPLE_PARSED_RESUME))
+
+    resp = client.post(
+        "/resumes",
+        files={"file": ("resume.pdf", b"this is definitely not a pdf", "application/pdf")},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 415
+
+
 def test_upload_rejects_unreadable_pdf(client, auth_headers, use_fake_ai):
     use_fake_ai(FakeAIProvider(parsed=SAMPLE_PARSED_RESUME))
 

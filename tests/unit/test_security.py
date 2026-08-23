@@ -18,17 +18,19 @@ def test_hash_and_verify_password_roundtrip() -> None:
 
 
 def test_access_token_roundtrip() -> None:
-    token = create_access_token(subject="42")
+    token = create_access_token(subject="42", token_version=0)
     payload = decode_token(token)
     assert payload["sub"] == "42"
     assert payload["type"] == "access"
+    assert payload["tv"] == 0
 
 
 def test_refresh_token_roundtrip() -> None:
-    token = create_refresh_token(subject="7")
+    token = create_refresh_token(subject="7", token_version=3)
     payload = decode_token(token)
     assert payload["sub"] == "7"
     assert payload["type"] == "refresh"
+    assert payload["tv"] == 3
 
 
 def test_decode_invalid_token_raises() -> None:

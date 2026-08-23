@@ -43,4 +43,9 @@ def get_current_user(
     user = db.get(User, user_id)
     if user is None or not user.is_active:
         raise credentials_error
+    if payload.get("tv") != user.token_version:
+        # Token was valid and unexpired but was issued before the user's most recent
+        # logout/password-reset (app/api/auth.py's logout endpoint,
+        # app/services/password_reset_service.py's reset_password both bump token_version).
+        raise credentials_error
     return user

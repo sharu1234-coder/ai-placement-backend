@@ -4,6 +4,9 @@ from fastapi import Depends, FastAPI, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -19,8 +22,11 @@ from app.api.progress import router as progress_router
 from app.api.resumes import router as resumes_router
 from app.api.roadmap import router as roadmap_router
 from app.api.users import router as users_router
+from app.core.body_size_limit import MaxBodySizeMiddleware
 from app.core.config import settings, validate_for_production
 from app.core.logging import configure_logging
+from app.core.rate_limit import limiter
+from app.core.security_headers import HSTSMiddleware
 
 configure_logging()
 logger = logging.getLogger(__name__)
@@ -29,23 +35,23 @@ validate_for_production()
 
 app = FastAPI(title=settings.app_name)
 
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
+
+# 12MB: just above the 10MB per-file caps already enforced by the streaming upload helper
+# (app/api/upload_utils.py) for resumes/interview audio, so it never interferes with those;
+# every other route (JSON bodies) previously had no cap at all. See
+# app/core/body_size_limit.py for why this checks both Content-Length and the actual
+# streamed byte count.
+app.add_middleware(MaxBodySizeMiddleware, max_body_size=12 * 1024 * 1024)
+
 app.add_middleware(
     TrustedHostMiddleware,
     allowed_hosts=[host.strip() for host in settings.allowed_hosts.split(",")],
 )
 
-
-@app.middleware("http")
-async def add_hsts_header(request: Request, call_next):
-    """Adds Strict-Transport-Security only for requests that actually arrived over HTTPS in
-    production -- reads request.url.scheme fresh per request (not baked in at import), so
-    it reflects reality even behind a reverse proxy (which requires Uvicorn's
-    --proxy-headers flag to correctly report "https" here -- see README). Harmless no-op in
-    dev, where every request is plain HTTP."""
-    response = await call_next(request)
-    if settings.environment == "production" and request.url.scheme == "https":
-        response.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains"
-    return response
+app.add_middleware(HSTSMiddleware)
 
 
 app.include_router(auth_router)

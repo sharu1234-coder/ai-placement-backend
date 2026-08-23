@@ -70,6 +70,11 @@ def reset_password(db: Session, email: str, code: str, new_password: str) -> boo
         return False
 
     user.password_hash = hash_password(new_password)
+    # Invalidates every access/refresh token already issued to this user (checked in
+    # app/api/deps.get_current_user and POST /auth/refresh) -- otherwise a session started
+    # before a password reset (e.g. by whoever the reset was protecting against) would stay
+    # valid until its natural expiry regardless of the password change.
+    user.token_version += 1
     token.used_at = now
     db.commit()
     return True

@@ -80,14 +80,14 @@ settings = Settings()
 
 
 def validate_for_production() -> None:
-    """Called once at app startup (app/main.py). Every other secret-shaped setting
-    (ANTHROPIC_API_KEY, STORAGE_S3_*, SMTP_*) already fails loudly on first use if left
+    """Called once at app startup (app/main.py). Every secret-shaped setting
+    (ANTHROPIC_API_KEY, STORAGE_S3_*, SMTP_*) already fails loudly on first real use if left
     unconfigured -- their provider classes raise immediately (AnthropicProvider,
-    S3StorageProvider, SMTPEmailProvider). JWT_SECRET_KEY is different: it *needs* some
-    value to let dev/tests run at all, so it has a non-None default -- which means nothing
-    else stops a production deployment from silently starting with a secret every other
-    deployment of this same codebase also has, letting anyone forge valid auth tokens. This
-    is the one place that gap needs an explicit check."""
+    S3StorageProvider, SMTPEmailProvider). The checks below cover settings that instead have
+    a *safe-looking but production-unsafe* default -- nothing else would ever complain about
+    them, so a production deployment could silently start in a state every dev checkout of
+    this codebase also starts in: an insecure hardcoded JWT secret, reset codes logged in
+    plaintext (EMAIL_PROVIDER=console), or verbose DEBUG-level logging left on."""
     if settings.environment != "production":
         return
     if settings.jwt_secret_key == Settings.model_fields["jwt_secret_key"].default:
@@ -96,3 +96,18 @@ def validate_for_production() -> None:
             "random secret before running in production, e.g.: "
             'python -c "import secrets; print(secrets.token_urlsafe(64))"'
         )
+    if settings.email_provider == "console":
+        # ConsoleEmailProvider logs password reset codes in plaintext (app/email/
+        # console_provider.py) -- fine for local dev where nothing else can receive the
+        # code, but in production that would put every user's reset code straight into
+        # application logs.
+        raise RuntimeError(
+            "EMAIL_PROVIDER is still 'console' (logs reset codes in plaintext) -- set "
+            "EMAIL_PROVIDER=smtp and the SMTP_* settings before running in production."
+        )
+    if settings.debug:
+        # settings.debug also controls the app's own logging verbosity (app/core/
+        # logging.py) -- DEBUG-level logging in production is noisier than intended, not a
+        # direct secrets leak by itself, but combined with any future debug-only logging
+        # it's a control worth enforcing explicitly rather than trusting it was remembered.
+        raise RuntimeError("DEBUG is still true -- set DEBUG=false before running in production.")

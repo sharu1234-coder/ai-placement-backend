@@ -51,6 +51,11 @@ def client():
             db.close()
 
     app.dependency_overrides[get_db] = override_get_db
+    # app is a single module-level object shared by every test in the session (imported
+    # once), so the rate limiter's in-memory counters (app/core/rate_limit.py) would
+    # otherwise leak across tests -- a rate-limit test consuming its quota could then cause
+    # an unrelated later test hitting the same endpoint from the same client to fail.
+    app.state.limiter.reset()
     with TestClient(app) as test_client:
         yield test_client
     app.dependency_overrides.clear()

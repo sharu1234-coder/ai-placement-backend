@@ -121,6 +121,28 @@ def test_forgot_password_invalidates_previous_code(client, fake_email):
     assert fresh.status_code == 200
 
 
+def test_reset_password_invalidates_existing_access_token(client, fake_email):
+    _signup(client, "invalidate@example.com", "old-password123")
+    login_resp = client.post(
+        "/auth/login", json={"email": "invalidate@example.com", "password": "old-password123"}
+    )
+    headers = {"Authorization": f"Bearer {login_resp.json()['access_token']}"}
+    # Token works before the reset (404 -- not 401/403 -- proves it authenticated fine).
+    assert client.get("/resumes/999999/analysis", headers=headers).status_code == 404
+
+    client.post("/auth/forgot-password", json={"email": "invalidate@example.com"})
+    code = fake_email.sent[0][1]
+    reset_resp = client.post(
+        "/auth/reset-password",
+        json={"email": "invalidate@example.com", "code": code, "new_password": "new-password456"},
+    )
+    assert reset_resp.status_code == 200
+
+    # Whoever had that old token (possibly not the legitimate owner -- this is exactly the
+    # scenario password reset exists to recover from) can no longer use it.
+    assert client.get("/resumes/999999/analysis", headers=headers).status_code == 401
+
+
 def test_reset_password_rejects_expired_code(client, fake_email, monkeypatch):
     monkeypatch.setattr(settings, "password_reset_token_expire_minutes", -1)
     _signup(client, "expired@example.com")

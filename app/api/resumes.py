@@ -38,6 +38,16 @@ async def upload_resume(
 
     file_bytes = await read_upload_limited(file, _MAX_UPLOAD_BYTES, "File too large (max 10MB)")
 
+    # The Content-Type check above only looked at a client-supplied header, which any client
+    # can set to anything -- this checks the actual bytes. Deliberately just the PDF magic
+    # number (not a deeper structural/malware scan, which would need libmagic or an external
+    # scanning service -- out of scope here, see README's security-hardening entry).
+    if not file_bytes.startswith(b"%PDF-"):
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail="File does not look like a valid PDF",
+        )
+
     profile = get_or_create_profile(db, current_user)
 
     try:

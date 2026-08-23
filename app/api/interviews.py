@@ -21,6 +21,11 @@ from app.services.profile_service import get_or_create_profile
 router = APIRouter(prefix="/interviews", tags=["interviews"])
 
 _MAX_AUDIO_UPLOAD_BYTES = 10 * 1024 * 1024  # 10MB
+# Matches what the Android client actually records and sends (MediaRecorder with
+# OutputFormat.MPEG_4 + AudioEncoder.AAC, sent as "audio/mp4" -- see
+# InterviewRepositoryImpl.kt). This had no validation at all before -- any content-type
+# (or none) was accepted.
+_ALLOWED_AUDIO_CONTENT_TYPES = {"audio/mp4", "audio/m4a", "audio/x-m4a"}
 
 
 @router.post("", response_model=InterviewRead, status_code=status.HTTP_201_CREATED)
@@ -77,6 +82,12 @@ async def submit_audio_answer(
     db: Session = Depends(get_db),
     ai_provider: AIProvider = Depends(get_ai_provider),
 ) -> InterviewAnswerRead:
+    if file.content_type not in _ALLOWED_AUDIO_CONTENT_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail="Unsupported audio format",
+        )
+
     profile = get_or_create_profile(db, current_user)
     audio_bytes = await read_upload_limited(file, _MAX_AUDIO_UPLOAD_BYTES, "Audio file too large (max 10MB)")
 

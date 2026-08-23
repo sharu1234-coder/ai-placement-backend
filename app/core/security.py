@@ -14,21 +14,23 @@ def verify_password(password: str, password_hash: str) -> bool:
     return bcrypt.checkpw(password.encode("utf-8"), password_hash.encode("utf-8"))
 
 
-def _create_token(subject: str, token_type: str, expires_delta: datetime.timedelta) -> str:
+def _create_token(
+    subject: str, token_type: str, token_version: int, expires_delta: datetime.timedelta
+) -> str:
     expire = datetime.datetime.now(datetime.timezone.utc) + expires_delta
-    payload = {"sub": subject, "type": token_type, "exp": expire}
+    payload = {"sub": subject, "type": token_type, "tv": token_version, "exp": expire}
     return jwt.encode(payload, settings.jwt_secret_key, algorithm=settings.jwt_algorithm)
 
 
-def create_access_token(subject: str) -> str:
+def create_access_token(subject: str, token_version: int) -> str:
     return _create_token(
-        subject, "access", datetime.timedelta(minutes=settings.access_token_expire_minutes)
+        subject, "access", token_version, datetime.timedelta(minutes=settings.access_token_expire_minutes)
     )
 
 
-def create_refresh_token(subject: str) -> str:
+def create_refresh_token(subject: str, token_version: int) -> str:
     return _create_token(
-        subject, "refresh", datetime.timedelta(days=settings.refresh_token_expire_days)
+        subject, "refresh", token_version, datetime.timedelta(days=settings.refresh_token_expire_days)
     )
 
 
