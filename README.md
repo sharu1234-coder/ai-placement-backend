@@ -66,6 +66,34 @@ as-is.
 
 ## Status
 
+**Production readiness item 12/20 — Secrets + release signing (2026-08-23).** Android
+release-signing wiring is in `ai-placement-android/README.md`. Backend side: closes the one
+secret-shaped setting that had no fail-safe.
+- Every other production-only secret already fails loudly on first real use if left
+  unconfigured: `AnthropicProvider` raises if `ANTHROPIC_API_KEY` is missing,
+  `S3StorageProvider` if `STORAGE_S3_BUCKET` is missing, `SMTPEmailProvider` if
+  `SMTP_HOST`/`SMTP_FROM_ADDRESS` are missing (items 1, 4, 8). `JWT_SECRET_KEY` couldn't
+  follow that pattern — it needs *some* value for dev/tests to run at all, so it has a
+  non-`None` default, which meant nothing previously stopped a production deployment from
+  silently starting with the exact same hardcoded dev secret every checkout of this
+  codebase has, letting anyone forge valid auth tokens.
+- New `validate_for_production()` (`app/core/config.py`), called once at app startup
+  (`app/main.py`, before the `FastAPI(...)` app object is even created): if
+  `ENVIRONMENT=production` and `JWT_SECRET_KEY` still equals the known dev default, it
+  raises `RuntimeError` immediately with the exact command to generate a real one
+  (`python -c "import secrets; print(secrets.token_urlsafe(64))"`) — fails the deployment
+  outright rather than serving a single request with a forgeable secret. Compares against
+  `Settings.model_fields["jwt_secret_key"].default` (the field's own declared default)
+  rather than a duplicated string literal, so the check can't silently drift from the
+  actual default if that default is ever changed.
+- No-op in dev/tests (`ENVIRONMENT` defaults to `"development"`) — confirmed by the full
+  suite still passing with this check running on every test-suite app import.
+- 3 new unit tests (`tests/unit/test_config_validation.py`): no-op outside production,
+  raises with the default secret in production, passes with a real secret in production.
+  189 passing total (was 186).
+- Reviewed for any other hardcoded/committed secrets while here: `.gitignore` already
+  excludes `.env`, no `.env` file is tracked (`git ls-files | grep .env` returns nothing).
+
 **Production readiness item 11/20 — HTTPS / network security (2026-08-23).**
 - **Important context this app cannot fix by itself**: TLS termination happens at the
   reverse proxy / deployment platform in front of this app (nginx, Render, Railway, Fly.io,

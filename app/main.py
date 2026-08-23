@@ -19,11 +19,13 @@ from app.api.progress import router as progress_router
 from app.api.resumes import router as resumes_router
 from app.api.roadmap import router as roadmap_router
 from app.api.users import router as users_router
-from app.core.config import settings
+from app.core.config import settings, validate_for_production
 from app.core.logging import configure_logging
 
 configure_logging()
 logger = logging.getLogger(__name__)
+
+validate_for_production()
 
 app = FastAPI(title=settings.app_name)
 

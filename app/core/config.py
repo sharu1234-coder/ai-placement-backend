@@ -77,3 +77,22 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+def validate_for_production() -> None:
+    """Called once at app startup (app/main.py). Every other secret-shaped setting
+    (ANTHROPIC_API_KEY, STORAGE_S3_*, SMTP_*) already fails loudly on first use if left
+    unconfigured -- their provider classes raise immediately (AnthropicProvider,
+    S3StorageProvider, SMTPEmailProvider). JWT_SECRET_KEY is different: it *needs* some
+    value to let dev/tests run at all, so it has a non-None default -- which means nothing
+    else stops a production deployment from silently starting with a secret every other
+    deployment of this same codebase also has, letting anyone forge valid auth tokens. This
+    is the one place that gap needs an explicit check."""
+    if settings.environment != "production":
+        return
+    if settings.jwt_secret_key == Settings.model_fields["jwt_secret_key"].default:
+        raise RuntimeError(
+            "JWT_SECRET_KEY is still the insecure development default -- set a real, "
+            "random secret before running in production, e.g.: "
+            'python -c "import secrets; print(secrets.token_urlsafe(64))"'
+        )
