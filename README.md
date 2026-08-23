@@ -66,6 +66,39 @@ as-is.
 
 ## Status
 
+**Production readiness item 5/20 — Complete account deletion (2026-08-23).**
+- `DELETE /users/me` (`app/api/users.py`, body: `{"password": "..."}`) requires the current
+  password before deleting — a stolen/leaked access token alone can no longer trigger an
+  irreversible wipe. Wrong password → 403, account untouched.
+- `app/services/account_service.py`'s `delete_account()` erases the profile and **every**
+  row derived from it, not just the `users` row: educations, certifications, experiences,
+  skills, projects, resumes (+ analyses, + the underlying storage object via the
+  `StorageProvider` from item 4), job descriptions (+ requirements), job matches (+ skill
+  gaps), assessment blueprints/assessments (+ results/question attempts), interviews (+
+  questions/answers/evaluations), roadmaps (+ tasks). The global `questions` bank (shared
+  across all users) and `roles`/`role_skill_weights` catalogs are deliberately never
+  touched — deleting one user's data must never affect another's.
+- Deletes are ordered children-before-parents so it works on a real FK-enforcing database,
+  not just SQLite's default (unenforced) FKs — verified two ways: a unit test
+  (`tests/unit/test_account_service.py`) that turns on `PRAGMA foreign_keys=ON` for its
+  in-memory SQLite engine (so an ordering bug would raise an `IntegrityError`, not just
+  pass silently), and a **live run against real PostgreSQL 17** (signup → profile/skills/
+  education → role-based assessment blueprint → delete → confirmed 0 rows in every child
+  table via direct SQL, then successfully re-signed-up with the same email). Test database
+  dropped afterward.
+- File deletion (resume objects) is best-effort exactly like the existing single-resume
+  delete: a stuck/unreachable storage object is logged and skipped rather than blocking the
+  rest of the account wipe.
+- The access token used to call `DELETE /users/me` stops working on the very next request —
+  no separate token-revocation step needed, since `get_current_user`/`refresh` both do
+  `db.get(User, user_id)` and the row is now physically gone (not just deactivated).
+- 7 new unit tests (full-cascade row-by-row assertions, no-profile account, cross-user
+  isolation) + 4 new API tests (auth required, wrong password, full delete-then-401 flow,
+  email freed for re-signup). 165 passing total (was 158).
+- **Not done**: no confirmation email / "are you sure" grace period (e.g. a 30-day
+  soft-delete window before permanent erasure) — this is immediate, hard deletion. Add a
+  grace period later if the product needs one; nothing here blocks that.
+
 **Production readiness item 4/20 — Production file/resume storage (2026-08-23).**
 - Added `app/storage/provider.py` (`StorageProvider` ABC + `StorageError` + `get_storage_provider()`),
   mirroring the existing `AIProvider` pattern exactly: services depend only on the

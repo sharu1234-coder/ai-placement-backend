@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_db
+from app.core.security import verify_password
 from app.models.certification import Certification
 from app.models.education import Education
 from app.models.experience import Experience
@@ -22,7 +23,10 @@ from app.schemas.profile_items import (
     SkillCreate,
     SkillRead,
 )
+from app.schemas.user import AccountDeleteRequest
+from app.services.account_service import delete_account
 from app.services.profile_service import get_or_create_profile
+from app.storage.provider import StorageProvider, get_storage_provider
 
 router = APIRouter(tags=["users"])
 
@@ -62,6 +66,23 @@ def update_my_profile(
     db.commit()
     db.refresh(profile)
     return profile
+
+
+@router.delete("/users/me", status_code=status.HTTP_204_NO_CONTENT)
+def delete_my_account(
+    payload: AccountDeleteRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    storage: StorageProvider = Depends(get_storage_provider),
+) -> None:
+    """Complete account deletion (PROJECT_HANDOFF.md section 6 / production-readiness item
+    5) -- requires the current password so a stolen/leaked access token alone can't trigger
+    an irreversible wipe. Erases the profile and every row derived from it (resumes,
+    assessments, interviews, roadmaps, job matches/descriptions), not just the user row --
+    see app/services/account_service.py for why each table is safe to remove this way."""
+    if not verify_password(payload.password, current_user.password_hash):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Incorrect password")
+    delete_account(db, current_user, storage)
 
 
 @router.post("/users/me/role", response_model=StudentProfileRead)
