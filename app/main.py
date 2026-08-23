@@ -13,6 +13,7 @@ from app.api.auth import router as auth_router
 from app.api.deps import get_db
 from app.api.interviews import router as interviews_router
 from app.api.jobs import router as jobs_router
+from app.api.legal import router as legal_router
 from app.api.progress import router as progress_router
 from app.api.resumes import router as resumes_router
 from app.api.roadmap import router as roadmap_router
@@ -33,6 +34,7 @@ app.include_router(assessments_router)
 app.include_router(interviews_router)
 app.include_router(roadmap_router)
 app.include_router(progress_router)
+app.include_router(legal_router)
 
 
 @app.get("/health")

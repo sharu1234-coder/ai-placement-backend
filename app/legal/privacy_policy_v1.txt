@@ -1,0 +1,104 @@
+AI Placement OS — Privacy Policy
+
+Version: 1
+Effective date: 2026-08-23
+Published by: SGLD Quant Labs
+
+This policy describes what data AI Placement OS ("the App", "we", "us") collects, why, who
+processes it, and the rights you have over it. It is written to accurately describe what the
+App actually does today, not generic boilerplate — sections that describe planned-but-not-yet-
+active features are marked clearly below.
+
+1. Who we are
+AI Placement OS is a placement-preparation app (resume analysis, job matching, mock
+assessments, mock interviews, and a personalized preparation roadmap) published by SGLD
+Quant Labs. Contact us about privacy at privacy@sgldquantlabs.com.
+
+2. Data we collect
+
+Account data: your email address and a securely hashed password (bcrypt — we never store
+or can recover your plaintext password).
+
+Profile data: full name, college, graduation year, and target role, plus anything you add
+yourself: education history, skills, work experience, projects, and certifications.
+
+Resume data: the resume file you upload (PDF), the text extracted from it, and the
+structured analysis produced from that text (skills, education, experience, ATS score,
+flagged weak sections).
+
+Job description data: the text of any job description you paste in, plus the requirements
+and role match we derive from it against your resume.
+
+Assessment data: your answers, scores, and per-skill results from any practice
+assessment you take.
+
+Interview data: the text of your interview answers (typed, or transcribed from your
+spoken answer — see "Voice data" below) and the AI-generated evaluation of them
+(correctness, clarity, structure, etc.).
+
+Roadmap data: the day-by-day preparation plan generated for you and your progress
+against it.
+
+3. Voice data
+If you answer an interview question by speaking, your audio is sent for transcription and
+the resulting text transcript is what gets stored. The raw audio recording itself is not
+saved anywhere, on the device or on our servers, once transcription completes — this is a
+deliberate minimization decision, not an oversight.
+
+4. Who processes your data
+
+Our servers: all the data above is stored in our database and, for resume files, in file
+storage (a local disk in development; a cloud object-storage bucket — Amazon S3 or an
+S3-compatible provider — in production).
+
+Our AI provider: resume text, job description text, and interview answers are sent to an
+AI model to generate the analysis, matching, questions, and feedback described above. In
+development this runs on our own self-hosted model (Ollama) and never leaves our
+infrastructure; in production this is the Anthropic Claude API, operating under
+Anthropic's own data-handling terms (https://www.anthropic.com/legal/privacy). We do not
+use any other third-party AI provider.
+
+We do not sell your data to anyone, for any purpose.
+
+5. Planned integrations (not yet active)
+We plan to add Firebase for push notifications, crash reporting, and product analytics.
+None of these are enabled in the current build. When we turn any of them on, we will update
+this policy first to describe exactly what Firebase collects and how, before it starts
+collecting anything.
+
+6. How long we keep your data
+We keep your data for as long as your account exists. There is no automatic expiry.
+
+7. Your rights
+You can view and edit your profile, education, skills, experience, projects, and
+certifications at any time in the app. You can delete individual resumes and job
+descriptions yourself. You can permanently delete your entire account — and everything
+listed in section 2 above, without exception — from Settings, by re-entering your
+password to confirm. Account deletion is immediate and irreversible: once confirmed, the
+data is gone from our systems, not just hidden from you.
+
+8. Security
+Passwords are hashed with bcrypt and never stored in plaintext. Access to the API requires
+a signed JWT token. Production deployments are required to run over HTTPS (see our
+production readiness checklist — this is enforced at the infrastructure level, not by this
+document).
+
+9. Children's privacy
+The App is intended for students preparing for job placements (typically college-age and
+above) and is not directed at children under 13. We do not knowingly collect data from
+children under 13.
+
+10. Changes to this policy
+We version this policy (see the version number at the top). If we make a material change,
+we will update the version and effective date here.
+
+11. Contact
+Questions about this policy or your data: privacy@sgldquantlabs.com.
+
+---
+Drafting note (not part of the policy itself): this document was generated from the app's
+actual current data flows and code, not a generic template, and should be reviewed by a
+qualified lawyer for your specific jurisdiction (data protection law varies significantly,
+e.g. GDPR, India's DPDP Act, CCPA) before this app is published commercially or used with
+real users. The contact email above is a placeholder — replace it with a real, monitored
+address before publishing.

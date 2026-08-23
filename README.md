@@ -66,6 +66,38 @@ as-is.
 
 ## Status
 
+**Production readiness item 6/20 — Real Privacy Policy (2026-08-23).**
+- `GET /legal/privacy-policy` (public, no auth — must be reachable before signup, from a
+  logged-out state, and from an app store listing) returns `{version, content}`. Content
+  lives in `app/legal/privacy_policy_v1.txt`, versioned the same way this project already
+  versions AI prompts (`app/ai/prompts/*_v1.txt`) — legal text changes without touching
+  route code, and a future revision ships as `_v2.txt` without breaking old clients that
+  cached the version number.
+- The policy text was **written from this app's actual current data flows**, not a generic
+  template: every data category in section 2 (account/profile/resume/JD/assessment/
+  interview/roadmap data) maps to a real table introduced in prior stages; section 3 states
+  plainly that raw interview audio is never persisted (matches `interview_service.py`'s
+  existing "minimize stored voice data" design); section 4 names the real AI processor per
+  environment (self-hosted Ollama in dev, Anthropic Claude API in production, added in item
+  1) and the real storage backend (local disk in dev, S3-compatible in production, added in
+  item 4); section 5 explicitly marks Firebase (FCM/Crashlytics/Analytics) as **not yet
+  active** rather than claiming it's already collecting anything, since it isn't wired into
+  the Android app yet (that's item 17); section 7 points at the account-deletion capability
+  from item 5 as the mechanism for the deletion right it describes.
+- **Explicitly flagged in the document itself** (a "drafting note" at the end, not part of
+  the policy the user reads): this was generated from the code, not reviewed by a lawyer,
+  and the contact email (`privacy@sgldquantlabs.com`) is a placeholder that needs to be a
+  real, monitored address before commercial publishing. This is not a substitute for legal
+  review — see that note for the full caveat.
+- Android: `PrivacyScreen` (previously a `PlaceholderScreen` stub) now fetches and renders
+  the policy via a new `LegalApi`/`LegalRepository`/`PrivacyViewModel`, with the same
+  Loading/Error/Success handling every other data-driven screen already uses.
+- 2 new backend tests (`tests/api/test_legal.py`: public reachability, no-auth-required).
+  167 passing total (was 165). Android: `compileDevDebugKotlin` BUILD SUCCESSFUL.
+- **Not done**: legal review by a qualified lawyer for the target jurisdiction(s) — flagged
+  above and in the document itself. Terms of Service is a separate item (7), not covered
+  here.
+
 **Production readiness item 5/20 — Complete account deletion (2026-08-23).**
 - `DELETE /users/me` (`app/api/users.py`, body: `{"password": "..."}`) requires the current
   password before deleting — a stolen/leaked access token alone can no longer trigger an
