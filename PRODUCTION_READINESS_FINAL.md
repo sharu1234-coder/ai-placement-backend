@@ -207,10 +207,10 @@ chain check) → unit tests (both flavors) → lint → debug builds (both flavo
 release build (re-exercises R8 on every change). **Re-confirmed in this audit**: latest runs
 on both repos' `master` are green (backend
 [32718954592](https://github.com/sharu1234-coder/ai-placement-backend/actions/runs/32718954592),
-Android — see this item's own commit once pushed). **FUTURE ENHANCEMENT**: Dependabot was
-missing entirely from both repos (no automated dependency-vulnerability scanning) — added in
-this audit (`.github/dependabot.yml`, gradle + github-actions ecosystems for Android; the
-backend repo needs the equivalent pip config added too, see Files Changed).
+Android commit `0071f08` — CI run for this exact commit watched below).
+**FUTURE ENHANCEMENT (closed in this audit)**: Dependabot was missing entirely from both
+repos (no automated dependency-vulnerability scanning) — added (`.github/dependabot.yml`:
+pip + github-actions for backend, gradle + github-actions for Android).
 
 ### 17. Secrets and credentials — ensure nothing sensitive is committed — READY
 Re-verified from scratch in this audit, not assumed from prior items' claims:
@@ -376,3 +376,7 @@ of which require real-world resources/decisions (cloud accounts, a domain, a phy
 keystore, vendor choices) that cannot be created inside this environment. No further code
 changes are required to begin a production deployment; the go-live runbook above is the
 path from here.
+
+---
+
+Committed backend `7558bd5`, Android `0071f08`, both pushed.
