@@ -1,7 +1,7 @@
 AI Placement OS — Privacy Policy
 
 Version: 1
-Effective date: 2026-08-23
+Effective date: 2026-08-24
 Published by: SGLD Quant Labs
 
 This policy describes what data AI Placement OS ("the App", "we", "us") collects, why, who
@@ -60,11 +60,25 @@ use any other third-party AI provider.
 
 We do not sell your data to anyone, for any purpose.
 
-5. Planned integrations (not yet active)
-We plan to add Firebase for push notifications, crash reporting, and product analytics.
-None of these are enabled in the current build. When we turn any of them on, we will update
-this policy first to describe exactly what Firebase collects and how, before it starts
-collecting anything.
+5. Firebase services
+The App uses Firebase (a Google service) for four purposes:
+
+- Push notifications: the App generates a device push token so we can send you
+  notifications in the future. This token is not currently sent to or stored on our
+  servers.
+- Crash and error reporting (Crashlytics): if the App encounters an unexpected error, a
+  report is sent to Firebase containing technical details only — the type of error, and
+  for network errors, the API path and HTTP status code involved. This report never
+  contains your resume content, interview answers, passwords, or authentication tokens.
+- Product analytics: Firebase's default, automatic usage analytics (such as app opens and
+  screen views) are active. We do not currently send any custom analytics events beyond
+  Firebase's own automatic collection.
+- App Check: the App asks Firebase to attest that requests come from a genuine installation
+  of the App. This check runs on the device only — our backend does not currently verify
+  App Check tokens, so this does not yet gate access to your account or data.
+
+See Firebase's own privacy policy for how it handles this data:
+https://firebase.google.com/support/privacy
 
 6. How long we keep your data
 We keep your data for as long as your account exists. There is no automatic expiry.
