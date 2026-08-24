@@ -104,7 +104,7 @@ every route that either accepts a file or calls the AI provider before changing 
   paid infra). No friendlier 429 message in the Android UI for these specific endpoints (most
   ViewModels show a generic "failed" message on any non-401 error already, which is correct
   behavior, just not a tailored one — real UX polish, but the rate limits are generous enough
-  that a normal user should never actually see one).
+  that a normal user should never actually see one). Committed backend `5c21472`, pushed.
 
 **Production readiness item 18/20 — Error/performance observability (2026-08-24).**
 Backend-only for this repo (Android side: `ObservabilityInterceptor` in
