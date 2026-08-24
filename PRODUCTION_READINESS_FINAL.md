@@ -22,6 +22,44 @@ created by an agent working in this environment.
 
 ---
 
+## Addendum (2026-08-24, same day): Python runtime moved to 3.12 for CI/production
+
+Follow-up work after the 20-item checklist closed, done in two phases:
+
+**Phase 1 (audit)**: re-inspected both repos fresh — nothing had drifted since the audit
+above, both `master` branches still green on CI. Surfaced that Dependabot (added in item 20)
+had already opened PRs on both repos, several conflicting with deliberate pins (see area #16
+below) — none merged.
+
+**Phase 2 (Python 3.9 → 3.12)**: this project's backend was pinned to Python 3.9 everywhere
+(local dev machine, CI). Checked directly (not assumed): **Python 3.9 reached end-of-life on
+2025-10-31** ([PEP 596](https://peps.python.org/pep-0596/)) — no further security patches,
+from anyone, ever. A throwaway GitHub Actions matrix workflow (never touched `master`, no
+local Python install) tested the *existing, unchanged* pinned `requirements.txt` — including
+`bcrypt==4.0.1` and `greenlet==3.0.3`, both commented as pinned for local Windows-wheel
+reasons — against Python 3.9, 3.11, and 3.12 on the same Linux runner CI already uses. All
+three passed identically: dependency install (no source builds needed for any version), Ruff,
+the full 230-test suite, `alembic upgrade head` against a real PostgreSQL 17 service
+container, a startup + `/health`/`/health/ready` smoke test, and both the positive and
+negative paths of `validate_for_production()`.
+
+**3.12 was chosen** (over 3.11) for its longer remaining support window (EOL 2028-10 vs.
+2027-10) — both worked equally well in testing. **`.github/workflows/ci.yml` now targets
+3.12; `requirements.txt` and `pyproject.toml`'s `ruff` `target-version` (`py39`) were
+deliberately left unchanged** — this project's local dev machine stays on Python 3.9 for now,
+so the codebase needs to remain 3.9-syntax-compatible. That's a safe, intentional split: this
+same test already proved the app behaves identically across versions. Re-verified a second
+time, narrowed to 3.12 only, against the exact merged tree that includes the real `ci.yml`
+change (not just the parallel experiment) — same clean result. Real `master` CI (install +
+Ruff + pytest, now on 3.12) also confirmed green. Committed `2c3b78f`, pushed. Temporary
+assessment branch and its workflow deleted after verification — nothing left behind.
+
+**Updates area #1 and #16 below**: backend production configuration now specifies Python 3.12
+as the CI/production target (was unstated); GitHub Actions CI/CD's Python version pin is
+current as of this addendum.
+
+---
+
 ## Classification key
 
 - **READY** — verified working now, nothing further needed for launch.
