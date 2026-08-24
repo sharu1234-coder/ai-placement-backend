@@ -103,6 +103,7 @@ matches every other item's default-to-no-paid-infra pattern).
   built speculatively without one.
 - 215 tests passing (was 208), `ruff check` clean on all touched files (pre-existing,
   unrelated findings remain in an Alembic migration file — not touched by this item).
+  Committed backend `62c3c25`, pushed.
 
 **Production readiness item 16/20 — Database backups / operational readiness (2026-08-24).**
 Backend-only. Full runbook in [`OPERATIONS.md`](OPERATIONS.md) (backup/restore, migration
