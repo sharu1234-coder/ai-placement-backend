@@ -58,6 +58,49 @@ assessment branch and its workflow deleted after verification — nothing left b
 as the CI/production target (was unstated); GitHub Actions CI/CD's Python version pin is
 current as of this addendum.
 
+## Addendum (2026-08-24, same day): Dependabot PR classification (Phase 3)
+
+**No PRs merged.** Every PR below was actually verified — CI re-run after rebasing onto the
+new 3.12 base for the ones that only failed for a stale-Python reason, or built locally with
+the project's real (gitignored) secrets/config for every Android PR, since Dependabot-
+triggered `pull_request` runs never receive repository secrets on GitHub (confirmed: all 7
+Android PRs failed at the identical `processDevDebugGoogleServices` step regardless of which
+dependency they touched — an empty secret writes an unparseable `google-services.json`, not a
+real incompatibility). Classifications: **SAFE** (verified working, fine to merge),
+**NEEDS TESTING** (a real, specific condition to resolve first, described per-PR),
+**DO NOT MERGE YET** (a real, reproduced failure).
+
+### Backend
+
+| PR | Bump | Classification | Evidence |
+|---|---|---|---|
+| #1 | `actions/checkout` 4→7 | SAFE | CI passed as-is |
+| #2 | `actions/setup-python` 5→7 | SAFE | CI passed as-is |
+| #3 | `pydantic-settings` 2.7.1→2.15.0 | SAFE | Failed pre-rebase only because it needs Python ≥3.10, which 3.9-pinned CI didn't have yet. Rebased onto the new 3.12 base: 230/230 tests, ruff clean. |
+| #4 | `bcrypt` 4.0.1→5.0.0 | SAFE | Passed CI on Linux as-is. The pin to 4.0.1 is a *local Windows* native-extension issue (per its own requirements.txt comment) — doesn't apply to CI/production, which run Linux. |
+| #5 | `anthropic` 0.125.0→1.0.0 | **NEEDS TESTING** — hold, not a code problem | Checked `app/ai/anthropic_provider.py` against the SDK's own official 0.x→1.x migration guide line by line: it only uses `output_format=<class>` (the Pydantic-model form, explicitly *unchanged* in 1.x — only the raw-dict form `output_format={...}` was renamed to `output_config`), never `temperature`/`top_p`/`top_k`, `.with_raw_response`, or the removed Text Completions API. **Zero code changes needed.** Rebased PR: 230/230 tests pass on Python 3.12. The real blocker: `anthropic` 1.x requires Python ≥3.10, and `requirements.txt` lists it unconditionally (not gated on `AI_PROVIDER`) — merging this today would make `pip install -r requirements.txt` fail outright on this project's local Python 3.9 dev machine, confirmed by reproducing the exact pip error locally. Hold until local dev also moves off 3.9, or accept that local `pip install` breaks until then. |
+| #6 | `fastapi` 0.115.6→0.141.1 | **DO NOT MERGE YET** — real behavior change | Rebased onto 3.12, still fails: **4 real test failures**, not flakiness. Unauthenticated requests to `HTTPBearer`-protected endpoints now return `401` instead of `403` (`test_account_deletion.py`, `test_auth.py`, `test_profile.py`, `test_resumes.py` — all asserting `403` for "no Authorization header at all"). This is a known FastAPI/Starlette correctness fix (401 is the RFC 7235-correct code for missing credentials; 403 is for insufficient permission) but it's a real, code-visible break here. Needs either updating the 4 tests to expect 401 (recommended — 401 is arguably more correct, and is also what `TokenAuthenticator` on Android already keys off for refresh) or explicit security-scheme configuration to preserve 403, plus a check that Android's refresh-on-401 flow behaves sanely on a request that was never authenticated to begin with. |
+| #7 | `pyjwt` 2.10.1→2.13.0 | SAFE | Passed CI as-is |
+
+### Android
+
+| PR | Bump | Classification | Evidence |
+|---|---|---|---|
+| #1 | `actions/checkout` 4→7 | SAFE | Logs show checkout/wrapper-validation/setup-gradle/compile all succeeded; only the secrets-less `processDevDebugGoogleServices` step (unrelated) failed. |
+| #7 | `gradle/actions` 4→6 | SAFE | `wrapper-validation@v6` and `setup-gradle@v6` both completed cleanly before the unrelated secrets-step failure. |
+| #2 | `com.squareup.retrofit2:retrofit` 2.11.0→3.0.0 | SAFE, but see note | Built locally with the real dev `google-services.json`: `testDevDebugUnitTest` (30/30), `lintDevDebug`, `assembleDevDebug` all green. It's a major version bump of the app's core networking library, though — automated coverage doesn't exercise a real device talking to a real server, so a real-device/emulator smoke test of an actual API call is worth doing before shipping this to production even though nothing here found a problem. |
+| #3 | `androidx.test.ext:junit` 1.2.1→1.3.0 | SAFE | Built locally, all green. Low-impact either way: this project has zero instrumented (`androidTest`) test files (item 9's known gap), so this dependency isn't exercised by any test that currently exists. |
+| #6 | `kotlinx-serialization-json` 1.7.3→1.11.0 | **DO NOT MERGE YET** — real build failure | Built locally: `compileDevDebugKotlin` fails outright. 1.11.0 was compiled with Kotlin 2.3.0 metadata; this project's Kotlin compiler is pinned to 2.0.21, which cannot read newer-Kotlin-compiled metadata. Exact same failure class item 17 hit and fixed by pinning `firebase-bom`. |
+| #5 | `kotlinx-coroutines-android` 1.9.0→1.11.0 | **DO NOT MERGE YET** — real build failure | Built locally: same Kotlin-metadata error, this time from `kotlinx-coroutines-android`/`-core`/`-play-services` 1.11.0 (compiled with Kotlin 2.2.0). |
+| #4 | `kotlinx-coroutines-test` 1.9.0→1.11.0 | **DO NOT MERGE YET** — real build failure | Built locally: `compileDevDebugUnitTestKotlin` fails the same way — pulls the same incompatible 1.11.0 coroutines-core transitively. |
+
+**Bottom line**: 9 of 14 open PRs are genuinely safe to merge whenever convenient. 3 Kotlin-ecosystem
+bumps are blocked on this project's Kotlin `2.0.21` pin specifically (not a real problem with
+those libraries — bumping Kotlin itself would very likely unblock all three at once, a
+separate decision from any single dependency bump). `anthropic` 1.0.0 is code-clean but
+collides with the local-dev-stays-on-3.9 decision from the Python runtime addendum above.
+`fastapi` 0.141.1 has one real, specific behavior change to resolve before merging.
+
 ---
 
 ## Classification key
