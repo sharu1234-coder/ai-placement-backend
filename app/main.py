@@ -25,6 +25,7 @@ from app.api.users import router as users_router
 from app.core.body_size_limit import MaxBodySizeMiddleware
 from app.core.config import settings, validate_for_production
 from app.core.logging import configure_logging
+from app.core.observability import RequestObservabilityMiddleware
 from app.core.rate_limit import limiter
 from app.core.schema_check import get_expected_head_revision, is_schema_current
 from app.core.security_headers import HSTSMiddleware
@@ -53,6 +54,11 @@ app.add_middleware(
 )
 
 app.add_middleware(HSTSMiddleware)
+
+# Outermost middleware (added last -- see RequestObservabilityMiddleware's docstring for why
+# order matters here): observes and times the final response to every request, including
+# ones the middlewares above reject before a route is ever reached.
+app.add_middleware(RequestObservabilityMiddleware)
 
 
 app.include_router(auth_router)
@@ -126,11 +132,31 @@ def readiness_check(db: Session = Depends(get_db)) -> JSONResponse:
 async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
     return JSONResponse(
         status_code=422,
-        content=jsonable_encoder({"detail": "Validation failed", "errors": exc.errors()}),
+        content=jsonable_encoder(
+            {
+                "detail": "Validation failed",
+                "errors": exc.errors(),
+                "request_id": getattr(request.state, "request_id", None),
+            }
+        ),
     )
 
 
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
-    logger.exception("Unhandled exception on %s %s", request.method, request.url.path)
-    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+    # request_id lets a user/support report this exact ID and have it found in server logs
+    # via RequestObservabilityMiddleware's log line for the same request.
+    #
+    # Starlette special-cases a bare-Exception handler: it runs inside ServerErrorMiddleware,
+    # which sits outside every app.add_middleware() layer (including
+    # RequestObservabilityMiddleware) -- the one path where that middleware's own response
+    # header injection never gets a chance to run. So the X-Request-ID header is set directly
+    # here too, to keep this response consistent with every other response.
+    request_id = getattr(request.state, "request_id", None)
+    logger.exception("Unhandled exception on %s %s [request_id=%s]", request.method, request.url.path, request_id)
+    headers = {"X-Request-ID": request_id} if request_id else {}
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error", "request_id": request_id},
+        headers=headers,
+    )

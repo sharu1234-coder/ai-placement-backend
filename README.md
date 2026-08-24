@@ -66,6 +66,44 @@ as-is.
 
 ## Status
 
+**Production readiness item 18/20 — Error/performance observability (2026-08-24).**
+Backend-only for this repo (Android side: `ObservabilityInterceptor` in
+`ai-placement-android`, see that repo's README). No new dependency, no external APM/error
+vendor picked (a bigger vendor decision than this item asked for; the DIY approach below
+matches every other item's default-to-no-paid-infra pattern).
+- **Request correlation IDs** (`app/core/observability.py`, `RequestObservabilityMiddleware`)
+  — the exact gap flagged as a good future addition back in item 16's entry below. Every
+  request gets an ID (reuses a well-formed client-supplied `X-Request-ID` header if present,
+  generates a `uuid4().hex` otherwise), available as `request.state.request_id`, echoed back
+  as the `X-Request-ID` response header, and included in both error JSON bodies (validation
+  422s and the catch-all 500) so a user/support can report an ID and it's directly greppable
+  in server logs.
+- **Per-request performance logging**: one log line per request (method, path, status,
+  duration in ms, request ID) at INFO, escalated to WARNING for anything over 3 seconds
+  (deliberately generous — AI-inference-backed endpoints can legitimately take well over a
+  second). Plain ASGI middleware, not `BaseHTTPMiddleware` (same reasoning as
+  `HSTSMiddleware`/`MaxBodySizeMiddleware` — see `security_headers.py`'s docstring), added as
+  the *outermost* middleware so it times and logs every response, including ones rejected by
+  `TrustedHostMiddleware`, the rate limiter, or the body-size cap before ever reaching a
+  route.
+- **Found and fixed a real gap while building this**: Starlette special-cases a bare
+  `@app.exception_handler(Exception)` registration to run inside `ServerErrorMiddleware`,
+  which sits *outside* every `app.add_middleware()` layer — including the new observability
+  middleware. That one path's `X-Request-ID` response header would otherwise be silently
+  missing (the JSON body's `request_id` field would still be correct, since it reads from
+  request-scoped state set earlier in the same request). Fixed by setting the header directly
+  in `unhandled_exception_handler` itself, verified by a dedicated test that forces a real
+  unhandled exception through the full app and checks both the body and the header.
+- **Not implemented (deliberately, not silently)**: no external APM/error-tracking vendor
+  (Sentry/Datadog/etc.) — that's a real, recurring-cost vendor decision, same category as the
+  AI provider/storage/email choices this project already defers via a pluggable
+  provider/no-vendor-default pattern; wiring one in later would slot in alongside this
+  middleware, not replace it. No per-endpoint performance metrics/percentiles beyond the
+  single per-request log line — would need a real metrics backend (Prometheus/etc.), not
+  built speculatively without one.
+- 215 tests passing (was 208), `ruff check` clean on all touched files (pre-existing,
+  unrelated findings remain in an Alembic migration file — not touched by this item).
+
 **Production readiness item 16/20 — Database backups / operational readiness (2026-08-24).**
 Backend-only. Full runbook in [`OPERATIONS.md`](OPERATIONS.md) (backup/restore, migration
 rollback, health checks, safe logging, incident recovery); this entry is a summary. **No
