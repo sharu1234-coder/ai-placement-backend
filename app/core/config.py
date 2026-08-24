@@ -87,8 +87,15 @@ def validate_for_production() -> None:
     a *safe-looking but production-unsafe* default -- nothing else would ever complain about
     them, so a production deployment could silently start in a state every dev checkout of
     this codebase also starts in: an insecure hardcoded JWT secret, reset codes logged in
-    plaintext (EMAIL_PROVIDER=console), or verbose DEBUG-level logging left on."""
-    if settings.environment != "production":
+    plaintext (EMAIL_PROVIDER=console), or verbose DEBUG-level logging left on.
+
+    Skips only for the one known-safe non-production value ("development", the default for
+    every dev checkout and the whole test suite) rather than checking `== "production"` --
+    a deployment misconfigured with a typo'd ENVIRONMENT ("Production", "prod", ...) used to
+    fail *open* here (silently skip every check below) rather than fail *closed*. There is no
+    "staging"/"test" environment concept in this app yet; if one is added later, it needs an
+    explicit exemption added here too."""
+    if settings.environment == "development":
         return
     if settings.jwt_secret_key == Settings.model_fields["jwt_secret_key"].default:
         raise RuntimeError(

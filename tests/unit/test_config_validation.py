@@ -45,3 +45,17 @@ def test_validate_for_production_raises_with_debug_true(monkeypatch) -> None:
 
     with pytest.raises(RuntimeError, match="DEBUG"):
         validate_for_production()
+
+
+@pytest.mark.parametrize("typoed_environment", ["Production", "PRODUCTION", "prod", "productoin"])
+def test_validate_for_production_still_validates_a_typoed_environment_value(monkeypatch, typoed_environment) -> None:
+    # Regression: this used to check `environment == "production"` exactly, so any typo'd
+    # deployment value fell into the "not production" branch and silently skipped every check
+    # below -- fail-open on the one setting whose entire job is catching an insecure
+    # production deploy. Anything that isn't the known-safe "development" value must now be
+    # validated, matching real production requirements.
+    monkeypatch.setattr(settings, "environment", typoed_environment)
+    monkeypatch.setattr(settings, "jwt_secret_key", Settings.model_fields["jwt_secret_key"].default)
+
+    with pytest.raises(RuntimeError, match="JWT_SECRET_KEY"):
+        validate_for_production()

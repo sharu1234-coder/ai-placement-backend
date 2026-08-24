@@ -1,0 +1,17 @@
+version: 2
+updates:
+  # requirements.txt / requirements-dev.txt -- catches known-CVE dependency versions (e.g. a
+  # vulnerable transitive package) automatically instead of relying on someone remembering to
+  # check. Several dependencies here are deliberately pinned for this project's Python 3.9 /
+  # Windows-build constraints (see requirements.txt's own comments) -- a Dependabot PR bumping
+  # one of those still needs a human to check that reasoning still applies before merging.
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+
+  # Keeps the CI workflow's own actions (actions/checkout, actions/setup-python) current.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
