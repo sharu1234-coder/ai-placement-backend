@@ -2,6 +2,16 @@
 
 FastAPI backend for AI Placement OS. See `../PROJECT_HANDOFF.md` for full architecture, schemas, and API contracts.
 
+**Python version**: local development on this project currently uses **Python 3.9**;
+CI and the intended production runtime target **Python 3.12** (`.github/workflows/ci.yml`).
+This split is deliberate, not an oversight: Python 3.9 reached end-of-life on 2025-10-31
+(no more security patches), but the local dev machine hasn't been upgraded yet, so the
+codebase stays 3.9-syntax-compatible (`pyproject.toml`'s `ruff` `target-version` is pinned to
+`py39` for the same reason). A dedicated CI matrix (see `PRODUCTION_READINESS_FINAL.md`'s
+Phase 2 audit) verified the existing pinned `requirements.txt` — unchanged — installs and
+passes the full test suite, Alembic migrations against real PostgreSQL, and a startup/health
+smoke test identically on 3.9, 3.11, and 3.12 before this was adopted.
+
 ## Setup
 
 ```bash

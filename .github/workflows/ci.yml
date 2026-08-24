@@ -23,12 +23,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Pinned to 3.9 to match the pinned runtime this project's dependencies are locked
-      # against (see requirements.txt comments -- anthropic==0.125.0, greenlet==3.0.3, etc.
-      # are all pinned specifically for Python 3.9 compatibility).
+      # CI/production runtime. Python 3.9 (this project's original pin) reached end-of-life
+      # on 2025-10-31 (PEP 596) -- no more security patches. Assessed via a throwaway matrix
+      # workflow (backend PRODUCTION_READINESS_FINAL.md's Phase 2 audit) before changing this:
+      # the existing pinned requirements.txt -- including bcrypt==4.0.1 and greenlet==3.0.3,
+      # commented as pinned for local Windows-wheel reasons, not this Python version -- and
+      # the full test suite, Alembic migrations against real PostgreSQL, a startup/health
+      # smoke test, and validate_for_production()'s fail-fast behavior all passed identically
+      # on 3.9, 3.11, and 3.12 with zero dependency changes. 3.12 chosen for the longer
+      # remaining support window (EOL 2028-10 vs 3.11's 2027-10). Local dev on this project's
+      # machine stays on Python 3.9 for now (see README) -- that's fine, this test already
+      # proved the app behaves identically across versions.
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.9"
+          python-version: "3.12"
           cache: "pip"
           cache-dependency-path: |
             requirements.txt
