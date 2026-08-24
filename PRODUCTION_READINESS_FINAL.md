@@ -210,7 +210,17 @@ on both repos' `master` are green (backend
 Android commit `0071f08` — CI run for this exact commit watched below).
 **FUTURE ENHANCEMENT (closed in this audit)**: Dependabot was missing entirely from both
 repos (no automated dependency-vulnerability scanning) — added (`.github/dependabot.yml`:
-pip + github-actions for backend, gradle + github-actions for Android).
+pip + github-actions for backend, gradle + github-actions for Android). **Immediately opened
+7 PRs on backend and 5 on Android**, confirming it's live. **Manual action / caution**:
+several of these must NOT be merged without checking first — Dependabot doesn't know about
+this project's deliberate pins. Notably: `anthropic` 0.125.0 → 1.0.0 (backend PR #5) is
+exactly the major-version jump `requirements.txt`'s own comment says is incompatible (the 1.x
+line needs Python ≥3.10; this project is pinned to 3.9); `bcrypt` 4.0.1 → 5.0.0 (PR #4) may
+hit the same native-extension import issue that pinned it to 4.0.1 in the first place; `fastapi`
+0.115.6 → 0.141.1 (PR #6) is a large jump worth its own regression pass, not a rubber-stamp
+merge. On Android, `retrofit` 2.11.0 → 3.0.0 (PR #2) is a major version with potential
+breaking API changes. Review each PR's CI result and, for anything crossing a pinned/major
+version, re-read the reasoning in that dependency's original pin comment before merging.
 
 ### 17. Secrets and credentials — ensure nothing sensitive is committed — READY
 Re-verified from scratch in this audit, not assumed from prior items' claims:
@@ -323,6 +333,10 @@ billing, domains, or physical keys/devices.
     developer account, store listing content (screenshots, descriptions, content rating
     questionnaire), a privacy policy URL reachable from the listing, and Play's own signing
     key setup (Play App Signing vs. the upload keystore from #6 above) if publishing.
+12. **Review the 7 (backend) + 5 (Android) Dependabot PRs already open** before merging any
+    of them — several conflict with deliberate version pins documented in this project (see
+    #16 above for specifics: `anthropic`, `bcrypt`, `fastapi`, `retrofit`). Dependabot doesn't
+    know about those constraints; a human does need to check each one.
 
 ---
 
