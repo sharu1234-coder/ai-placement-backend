@@ -1,10 +1,11 @@
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.ai.provider import AIProvider, get_ai_provider
 from app.api.deps import get_current_user, get_db
+from app.core.rate_limit import limiter
 from app.models.user import User
 from app.schemas.roadmap import GenerateRoadmapRequest, RoadmapRead, RoadmapTaskRead, UpdateRoadmapTaskRequest
 from app.services import roadmap_service
@@ -14,7 +15,9 @@ router = APIRouter(prefix="/roadmap", tags=["roadmap"])
 
 
 @router.post("/generate", response_model=RoadmapRead, status_code=status.HTTP_201_CREATED)
+@limiter.limit("10/hour")
 def generate_roadmap(
+    request: Request,
     payload: GenerateRoadmapRequest,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -57,7 +60,9 @@ def update_task(
 
 
 @router.post("/{roadmap_id}/reassess", response_model=RoadmapRead)
+@limiter.limit("10/hour")
 def reassess(
+    request: Request,
     roadmap_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),

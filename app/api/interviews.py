@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
@@ -6,6 +6,7 @@ from starlette.concurrency import run_in_threadpool
 from app.ai.provider import AIGenerationError, AIProvider, get_ai_provider
 from app.api.deps import get_current_user, get_db
 from app.api.upload_utils import read_upload_limited
+from app.core.rate_limit import limiter
 from app.models.user import User
 from app.schemas.interview import (
     InterviewAnswerRead,
@@ -42,7 +43,9 @@ def start_interview(
 
 
 @router.get("/{interview_id}/next-question", response_model=NextInterviewQuestionResponse)
+@limiter.limit("60/hour")
 def next_question(
+    request: Request,
     interview_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -74,7 +77,9 @@ def submit_answer(
 
 
 @router.post("/{interview_id}/answer/audio", response_model=InterviewAnswerRead)
+@limiter.limit("60/hour")
 async def submit_audio_answer(
+    request: Request,
     interview_id: int,
     interview_question_id: int = Form(...),
     file: UploadFile = File(...),
@@ -90,6 +95,16 @@ async def submit_audio_answer(
 
     profile = get_or_create_profile(db, current_user)
     audio_bytes = await read_upload_limited(file, _MAX_AUDIO_UPLOAD_BYTES, "Audio file too large (max 10MB)")
+
+    # Same reasoning as resumes.py's %PDF- check: the Content-Type header above is
+    # client-supplied and spoofable, so this checks the actual bytes too. MP4/M4A containers
+    # (ISO base media file format) start with a box whose size is the first 4 bytes and whose
+    # type is the next 4 -- for a well-formed file that first box is almost always "ftyp".
+    if audio_bytes[4:8] != b"ftyp":
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail="File does not look like a valid audio recording",
+        )
 
     try:
         # transcribe() is a slow, blocking, synchronous call (local model inference); this
@@ -110,7 +125,9 @@ async def submit_audio_answer(
 
 
 @router.get("/{interview_id}/questions/{question_id}/audio")
+@limiter.limit("60/hour")
 def get_question_audio(
+    request: Request,
     interview_id: int,
     question_id: int,
     current_user: User = Depends(get_current_user),
@@ -135,7 +152,9 @@ def get_question_audio(
 
 
 @router.get("/{interview_id}/evaluation", response_model=InterviewEvaluationRead)
+@limiter.limit("60/hour")
 def get_evaluation(
+    request: Request,
     interview_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),

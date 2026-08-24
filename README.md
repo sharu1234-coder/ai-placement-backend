@@ -66,6 +66,46 @@ as-is.
 
 ## Status
 
+**Production readiness item 19/20 — File + AI abuse controls (2026-08-24).**
+Backend-only (no Android equivalent requested — the server is what must defend against a
+malicious/scripted client, not trust the client to self-limit). Started from an audit of
+every route that either accepts a file or calls the AI provider before changing anything.
+- **Rate limiting on every AI-calling endpoint** — the exact gap item 15 flagged and
+  deliberately deferred ("rate limiting on non-auth (e.g. AI-calling) endpoints ... not
+  requested here"). All 10 routes that inject `AIProvider` now carry a `@limiter.limit(...)`
+  (same `slowapi` infrastructure item 15 wired up for auth endpoints, IP-keyed, no new
+  dependency): `POST /resumes` and `POST /roadmap/generate` / `POST /roadmap/{id}/reassess`
+  at `10/hour` (heavy, infrequent actions); `POST /jobs` at `20/hour`; the six
+  session-interactive endpoints (`interviews` next-question/answer-audio/question-audio/
+  evaluation, `assessments` next-question/answer) at `60/hour` each — generous enough for a
+  full multi-question interview or assessment session, while still bounding scripted/runaway
+  usage. Text inputs that reach a prompt already had length caps from before this item
+  (`ParseJDRequest.raw_text` 20k chars, `student_answer`/`answer_text` 5k chars each) —
+  verified by reading each schema, not assumed.
+- **Closed a real file-validation inconsistency**: resume uploads already had a
+  content-bytes check (`%PDF-` magic bytes, from item 15) but interview audio uploads only
+  ever checked the client-supplied Content-Type header — spoofable, and inconsistent with the
+  resume path's protection. Added the equivalent check for M4A/MP4: the container's first box
+  is almost always a `ftyp` box, so bytes 4:8 must spell `"ftyp"`. Required updating 4 existing
+  tests whose fake audio payloads didn't have this marker (they were testing business logic,
+  not byte validation, so the fix was giving them a minimal valid-shaped payload, not loosening
+  the new check).
+- 11 new tests: one per rate-limited endpoint (calls each just past its configured limit,
+  asserts 429 on the next call — reusing the fast-fail pattern where a route's own business
+  logic 404s/422s before ever reaching the AI provider, since slowapi counts every call that
+  reaches the route regardless of what it returns) plus one for the audio spoofing rejection.
+  226 tests passing (was 215), `ruff check` clean on all touched files.
+- **Not implemented (deliberately)**: no per-user resume-count or total-storage quota — every
+  upload still creates a new `Resume` row with no cap on how many a user accumulates over
+  time. Rate limiting bounds the *rate* of abuse but not unbounded *accumulation*; flagged as
+  a real gap but a bigger design decision (what's the right cap, does deleting free up quota)
+  than this item's rate-limiting/validation-focused scope. No deep file content/malware
+  scanning (same reasoning as item 15 — needs libmagic or an external scanning service, no
+  paid infra). No friendlier 429 message in the Android UI for these specific endpoints (most
+  ViewModels show a generic "failed" message on any non-401 error already, which is correct
+  behavior, just not a tailored one — real UX polish, but the rate limits are generous enough
+  that a normal user should never actually see one).
+
 **Production readiness item 18/20 — Error/performance observability (2026-08-24).**
 Backend-only for this repo (Android side: `ObservabilityInterceptor` in
 `ai-placement-android`, see that repo's README). No new dependency, no external APM/error

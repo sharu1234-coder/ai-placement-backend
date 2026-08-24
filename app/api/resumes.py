@@ -1,10 +1,11 @@
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
 from app.ai.provider import AIProvider, get_ai_provider
 from app.api.deps import get_current_user, get_db
 from app.api.upload_utils import read_upload_limited
+from app.core.rate_limit import limiter
 from app.models.user import User
 from app.schemas.resume import ResumeAnalysisRead, ResumeUploadResponse
 from app.services.profile_service import get_or_create_profile
@@ -23,7 +24,9 @@ _MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10MB
 
 
 @router.post("", response_model=ResumeUploadResponse, status_code=status.HTTP_201_CREATED)
+@limiter.limit("10/hour")
 async def upload_resume(
+    request: Request,
     file: UploadFile = File(...),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),

@@ -25,6 +25,11 @@ SAMPLE_GENERATED_EVALUATION = GeneratedInterviewEvaluation(
 
 SAMPLE_TRANSCRIPT = "Um, so I basically used a debugger and, like, bisected the change."
 
+# Bytes 4:8 spell "ftyp" -- the minimal structural marker submit_audio_answer's magic-byte
+# check (app/api/interviews.py) requires of a real M4A/MP4 file. The rest is arbitrary; this
+# is a fake payload for testing business logic, not a real audio file.
+FAKE_M4A_BYTES = b"\x00\x00\x00\x00ftyp-fake-audio-bytes"
+
 
 class FakeAIProvider(AIProvider):
     def generate_structured(self, prompt, schema):
@@ -191,6 +196,22 @@ def test_submit_audio_answer_rejects_unsupported_content_type(client, auth_heade
     assert resp.status_code == 415
 
 
+def test_submit_audio_answer_rejects_spoofed_content_type(client, auth_headers, role_selected, use_fake_ai):
+    # Content-Type header says audio/mp4 (would pass the allowlist check), but the actual
+    # bytes don't have the "ftyp" structural marker a real M4A/MP4 file starts with -- same
+    # spoofing scenario resumes.py's %PDF- check exists to catch.
+    interview_id = client.post("/interviews", json={"mode": "voice"}, headers=auth_headers).json()["id"]
+    question = client.get(f"/interviews/{interview_id}/next-question", headers=auth_headers).json()["question"]
+
+    resp = client.post(
+        f"/interviews/{interview_id}/answer/audio",
+        data={"interview_question_id": str(question["id"])},
+        files={"file": ("answer.m4a", b"not actually audio, just text", "audio/mp4")},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 415
+
+
 def test_submit_audio_answer_transcribes_and_persists(client, auth_headers, role_selected, use_fake_ai):
     interview_id = client.post("/interviews", json={"mode": "voice"}, headers=auth_headers).json()["id"]
     question = client.get(f"/interviews/{interview_id}/next-question", headers=auth_headers).json()["question"]
@@ -198,7 +219,7 @@ def test_submit_audio_answer_transcribes_and_persists(client, auth_headers, role
     resp = client.post(
         f"/interviews/{interview_id}/answer/audio",
         data={"interview_question_id": str(question["id"])},
-        files={"file": ("answer.m4a", b"fake-audio-bytes", "audio/mp4")},
+        files={"file": ("answer.m4a", FAKE_M4A_BYTES, "audio/mp4")},
         headers=auth_headers,
     )
     assert resp.status_code == 200
@@ -216,13 +237,13 @@ def test_submit_audio_answer_rejected_when_already_answered(client, auth_headers
     client.post(
         f"/interviews/{interview_id}/answer/audio",
         data={"interview_question_id": str(question["id"])},
-        files={"file": ("answer.m4a", b"fake-audio-bytes", "audio/mp4")},
+        files={"file": ("answer.m4a", FAKE_M4A_BYTES, "audio/mp4")},
         headers=auth_headers,
     )
     resp = client.post(
         f"/interviews/{interview_id}/answer/audio",
         data={"interview_question_id": str(question["id"])},
-        files={"file": ("answer2.m4a", b"more-fake-bytes", "audio/mp4")},
+        files={"file": ("answer2.m4a", FAKE_M4A_BYTES, "audio/mp4")},
         headers=auth_headers,
     )
     assert resp.status_code == 409
@@ -295,7 +316,7 @@ def test_full_voice_interview_lifecycle_scores_filler_words(client, auth_headers
         answer_resp = client.post(
             f"/interviews/{interview_id}/answer/audio",
             data={"interview_question_id": str(question["id"])},
-            files={"file": ("answer.m4a", b"fake-audio-bytes", "audio/mp4")},
+            files={"file": ("answer.m4a", FAKE_M4A_BYTES, "audio/mp4")},
             headers=auth_headers,
         )
         assert answer_resp.status_code == 200

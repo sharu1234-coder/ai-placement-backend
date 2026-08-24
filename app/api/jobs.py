@@ -1,8 +1,9 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.ai.provider import AIProvider, get_ai_provider
 from app.api.deps import get_current_user, get_db
+from app.core.rate_limit import limiter
 from app.models.user import User
 from app.schemas.job import JobDescriptionParseResponse, JobMatchRead, ParseJDRequest, RequirementRead
 from app.services.jd_service import (
@@ -19,7 +20,9 @@ router = APIRouter(prefix="/jobs", tags=["jobs"])
 
 
 @router.post("", response_model=JobDescriptionParseResponse, status_code=status.HTTP_201_CREATED)
+@limiter.limit("20/hour")
 def create_job_description(
+    request: Request,
     payload: ParseJDRequest,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),

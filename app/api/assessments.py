@@ -1,8 +1,9 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.ai.provider import AIProvider, get_ai_provider
 from app.api.deps import get_current_user, get_db
+from app.core.rate_limit import limiter
 from app.models.user import User
 from app.schemas.assessment import (
     AnswerResult,
@@ -48,7 +49,9 @@ def start_assessment(
 
 
 @router.get("/{assessment_id}/next-question", response_model=NextQuestionResponse)
+@limiter.limit("60/hour")
 def next_question(
+    request: Request,
     assessment_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -62,7 +65,9 @@ def next_question(
 
 
 @router.post("/{assessment_id}/answer", response_model=AnswerResult)
+@limiter.limit("60/hour")
 def submit_answer(
+    request: Request,
     assessment_id: int,
     payload: SubmitAnswerRequest,
     current_user: User = Depends(get_current_user),
