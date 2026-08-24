@@ -10,7 +10,7 @@ greenlet==3.0.3  # pinned: newer greenlet has no prebuilt wheel for this Python,
 alembic==1.14.0
 psycopg2-binary==2.9.10  # production Postgres driver; SQLite (stdlib) stays the dev default
 bcrypt==4.0.1  # pinned: 4.2.1 fails to import its native extension on this Windows/Python build
-pyjwt==2.10.1
+pyjwt==2.13.0
 PyMuPDF==1.24.14
 python-multipart==0.0.20
 
