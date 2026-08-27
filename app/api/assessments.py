@@ -8,6 +8,7 @@ from app.models.user import User
 from app.schemas.assessment import (
     AnswerResult,
     AssessmentBlueprintRead,
+    AssessmentHistoryItem,
     AssessmentRead,
     AssessmentResultRead,
     NextQuestionResponse,
@@ -16,7 +17,11 @@ from app.schemas.assessment import (
     SubmitAnswerRequest,
 )
 from app.services import assessment_run_service as run_service
-from app.services.assessment_service import InvalidPrepareMeRequestError, generate_blueprint
+from app.services.assessment_service import (
+    InvalidPrepareMeRequestError,
+    generate_blueprint,
+    get_assessment_history,
+)
 from app.services.profile_service import get_or_create_profile
 
 router = APIRouter(prefix="/assessments", tags=["assessments"])
@@ -30,9 +35,17 @@ def create_blueprint(
 ) -> AssessmentBlueprintRead:
     profile = get_or_create_profile(db, current_user)
     try:
-        return generate_blueprint(db, profile.id, payload.role_id, payload.jd_id)
+        return generate_blueprint(db, profile.id, payload.role_id, payload.jd_id, payload.category)
     except InvalidPrepareMeRequestError as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+
+
+@router.get("/history", response_model=list[AssessmentHistoryItem])
+def get_history(
+    current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
+) -> list[AssessmentHistoryItem]:
+    profile = get_or_create_profile(db, current_user)
+    return get_assessment_history(db, profile.id)
 
 
 @router.post("", response_model=AssessmentRead, status_code=status.HTTP_201_CREATED)

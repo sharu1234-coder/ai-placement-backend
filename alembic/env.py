@@ -12,6 +12,10 @@ from app.database.base import Base
 from app.models.assessment import Assessment  # noqa: F401
 from app.models.assessment_blueprint import AssessmentBlueprint  # noqa: F401
 from app.models.assessment_result import AssessmentResult  # noqa: F401
+from app.models.career_path import CareerPath  # noqa: F401
+from app.models.career_path_phase import CareerPathPhase  # noqa: F401
+from app.models.career_path_project import CareerPathProject  # noqa: F401
+from app.models.career_path_skill_item import CareerPathSkillItem  # noqa: F401
 from app.models.certification import Certification  # noqa: F401
 from app.models.education import Education  # noqa: F401
 from app.models.experience import Experience  # noqa: F401
@@ -21,7 +25,12 @@ from app.models.interview_evaluation import InterviewEvaluation  # noqa: F401
 from app.models.interview_question import InterviewQuestion  # noqa: F401
 from app.models.job_description import JobDescription  # noqa: F401
 from app.models.job_match import JobMatch  # noqa: F401
+from app.models.job_preparation_plan import JobPreparationPlan  # noqa: F401
 from app.models.password_reset_token import PasswordResetToken  # noqa: F401
+from app.models.placement_alarm_challenge import PlacementAlarmChallenge  # noqa: F401
+from app.models.placement_alarm_question_attempt import PlacementAlarmQuestionAttempt  # noqa: F401
+from app.models.placement_path import PlacementPath  # noqa: F401
+from app.models.placement_path_topic import PlacementPathTopic  # noqa: F401
 from app.models.profile import StudentProfile  # noqa: F401
 from app.models.project import Project  # noqa: F401
 from app.models.question import Question  # noqa: F401
@@ -29,6 +38,7 @@ from app.models.question_attempt import QuestionAttempt  # noqa: F401
 from app.models.requirement import Requirement  # noqa: F401
 from app.models.resume import Resume  # noqa: F401
 from app.models.resume_analysis import ResumeAnalysis  # noqa: F401
+from app.models.resume_ats_check import ResumeAtsCheck  # noqa: F401
 from app.models.roadmap import Roadmap  # noqa: F401
 from app.models.roadmap_task import RoadmapTask  # noqa: F401
 from app.models.role import Role  # noqa: F401

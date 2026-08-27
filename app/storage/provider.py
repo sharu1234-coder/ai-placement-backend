@@ -18,6 +18,12 @@ class StorageProvider(ABC):
     def delete(self, key: str) -> None:
         """Remove the object at key. Must not raise if the key is already gone."""
 
+    @abstractmethod
+    def load(self, key: str) -> bytes:
+        """Read back the bytes stored under key. Raises StorageError if key doesn't exist
+        or the read fails -- callers must treat this as a possible-failure path (e.g. the
+        ATS scoring engine falls back to text-only checks rather than crashing)."""
+
 
 def get_storage_provider() -> StorageProvider:
     from app.core.config import settings

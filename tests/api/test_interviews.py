@@ -101,6 +101,50 @@ def test_start_interview_unknown_jd_rejected(client, auth_headers, role_selected
     assert resp.status_code == 422
 
 
+@pytest.mark.parametrize("interview_type", ["technical", "hr", "project", "behavioral", "role_specific"])
+def test_start_interview_accepts_all_category_types(client, auth_headers, role_selected, interview_type):
+    resp = client.post("/interviews", json={"type": interview_type}, headers=auth_headers)
+    assert resp.status_code == 201
+    assert resp.json()["type"] == interview_type
+
+
+def test_start_interview_rejects_unknown_type(client, auth_headers, role_selected):
+    resp = client.post("/interviews", json={"type": "made_up"}, headers=auth_headers)
+    assert resp.status_code == 422
+
+
+def test_list_interviews_empty(client, auth_headers):
+    resp = client.get("/interviews", headers=auth_headers)
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+def test_list_interviews_returns_most_recent_first_with_no_score_before_evaluation(
+    client, auth_headers, role_selected
+):
+    first_id = client.post("/interviews", json={"type": "technical"}, headers=auth_headers).json()["id"]
+    second_id = client.post("/interviews", json={"type": "hr"}, headers=auth_headers).json()["id"]
+
+    resp = client.get("/interviews", headers=auth_headers)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert [item["id"] for item in body] == [second_id, first_id]
+    assert all(item["overall_score"] is None for item in body)
+
+
+def test_list_interviews_isolated_per_user(client, auth_headers, role_selected):
+    client.post("/interviews", json={"type": "technical"}, headers=auth_headers)
+
+    client.post("/auth/signup", json={"email": "other-interviews@example.com", "password": "supersecret123"})
+    other_token = client.post(
+        "/auth/login", json={"email": "other-interviews@example.com", "password": "supersecret123"}
+    ).json()["access_token"]
+
+    resp = client.get("/interviews", headers={"Authorization": f"Bearer {other_token}"})
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
 def test_next_question_generates_first_question(client, auth_headers, role_selected, use_fake_ai):
     interview_id = client.post("/interviews", json={"type": "technical"}, headers=auth_headers).json()["id"]
 

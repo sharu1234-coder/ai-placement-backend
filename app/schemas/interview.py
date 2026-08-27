@@ -1,10 +1,11 @@
+import datetime
 from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
 
 class StartInterviewRequest(BaseModel):
-    type: Literal["technical", "hr", "project"] = "technical"
+    type: Literal["technical", "hr", "project", "behavioral", "role_specific"] = "technical"
     mode: Literal["text", "voice"] = "text"
     jd_id: Optional[int] = None
 
@@ -15,6 +16,19 @@ class InterviewRead(BaseModel):
     mode: str
     jd_id: Optional[int]
     status: str
+
+
+class InterviewHistoryItem(BaseModel):
+    """One past interview, for the Mock Interviews 'Previous Interviews' list.
+    overall_score is None until InterviewEvaluation exists (get_evaluation computes and
+    caches it, same lazy-eval pattern as AssessmentResult)."""
+
+    id: int
+    type: str
+    mode: str
+    status: str
+    overall_score: Optional[float]
+    created_at: datetime.datetime
 
 
 class InterviewQuestionRead(BaseModel):

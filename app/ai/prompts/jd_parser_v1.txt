@@ -13,6 +13,9 @@ strictly:
 - responsibilities and tools_technologies should only include what's explicitly stated.
 - role_title is your best single-line guess at the job title/role this JD describes.
 - experience_expectation and education_eligibility should be null if not mentioned.
+- location is the job's work location (city/region, or "Remote") if stated, else null.
+- employment_type is one of "Full-time", "Part-time", "Internship", "Contract" if stated
+  or clearly implied, else null. Never guess if the text gives no signal either way.
 - parsing_confidence (0.0-1.0) reflects how clear and complete the JD text was.
 - Never invent a requirement, responsibility, or tool that isn't stated or clearly implied.
 

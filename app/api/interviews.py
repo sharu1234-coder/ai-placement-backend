@@ -11,6 +11,7 @@ from app.models.user import User
 from app.schemas.interview import (
     InterviewAnswerRead,
     InterviewEvaluationRead,
+    InterviewHistoryItem,
     InterviewRead,
     NextInterviewQuestionResponse,
     StartInterviewRequest,
@@ -20,6 +21,14 @@ from app.services import interview_service
 from app.services.profile_service import get_or_create_profile
 
 router = APIRouter(prefix="/interviews", tags=["interviews"])
+
+
+@router.get("", response_model=list[InterviewHistoryItem])
+def list_interviews(
+    current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
+) -> list[InterviewHistoryItem]:
+    profile = get_or_create_profile(db, current_user)
+    return interview_service.list_interviews(db, profile.id)
 
 _MAX_AUDIO_UPLOAD_BYTES = 10 * 1024 * 1024  # 10MB
 # Matches what the Android client actually records and sends (MediaRecorder with

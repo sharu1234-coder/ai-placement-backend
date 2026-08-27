@@ -14,13 +14,17 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from app.api.assessments import router as assessments_router
 from app.api.auth import router as auth_router
+from app.api.career_path import router as career_path_router
 from app.api.deps import get_db
 from app.api.interviews import router as interviews_router
 from app.api.jobs import router as jobs_router
 from app.api.legal import router as legal_router
+from app.api.placement_alarm import router as placement_alarm_router
+from app.api.placement_path import router as placement_path_router
 from app.api.progress import router as progress_router
 from app.api.resumes import router as resumes_router
 from app.api.roadmap import router as roadmap_router
+from app.api.subscriptions import router as subscriptions_router
 from app.api.users import router as users_router
 from app.core.body_size_limit import MaxBodySizeMiddleware
 from app.core.config import settings, validate_for_production
@@ -70,6 +74,10 @@ app.include_router(interviews_router)
 app.include_router(roadmap_router)
 app.include_router(progress_router)
 app.include_router(legal_router)
+app.include_router(placement_alarm_router)
+app.include_router(placement_path_router)
+app.include_router(career_path_router)
+app.include_router(subscriptions_router)
 
 
 @app.get("/health")
@@ -104,9 +112,7 @@ def readiness_check(db: Session = Depends(get_db)) -> JSONResponse:
 
     expected_revision = get_expected_head_revision()
     if not is_schema_current(current_revision, expected_revision):
-        logger.error(
-            "Readiness check failed: schema at %s, expected %s", current_revision, expected_revision
-        )
+        logger.error("Readiness check failed: schema at %s, expected %s", current_revision, expected_revision)
         return JSONResponse(
             status_code=503,
             content={

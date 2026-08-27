@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from app.core.config import settings
-from app.storage.provider import StorageProvider
+from app.storage.provider import StorageError, StorageProvider
 
 
 class LocalStorageProvider(StorageProvider):
@@ -18,3 +18,10 @@ class LocalStorageProvider(StorageProvider):
     def delete(self, key: str) -> None:
         path = Path(settings.upload_dir) / key
         path.unlink(missing_ok=True)
+
+    def load(self, key: str) -> bytes:
+        path = Path(settings.upload_dir) / key
+        try:
+            return path.read_bytes()
+        except OSError as exc:
+            raise StorageError(f"Failed to read '{key}' from local storage: {exc}") from exc

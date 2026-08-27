@@ -4,9 +4,25 @@ import pytest
 
 from app.ai.provider import AIProvider, get_ai_provider
 from app.ai.schemas.jd import AIParsedJD, JDRequirementItem
+from app.ai.schemas.job_preparation_plan import (
+    GeneratedCategoryReason,
+    GeneratedInterviewQuestion,
+    GeneratedJobPreparationContent,
+)
 from app.ai.schemas.resume import ParsedResume
 from app.core.config import settings
 from app.main import app
+
+SAMPLE_PREP_CONTENT = GeneratedJobPreparationContent(
+    category_reasons=[
+        GeneratedCategoryReason(category="DSA", reason="Strong DSA fundamentals are expected for this role."),
+        GeneratedCategoryReason(category="SQL", reason="SQL is explicitly required by this role."),
+    ],
+    interview_questions=[
+        GeneratedInterviewQuestion(bucket="technical", question="How would you optimize a slow SQL query?"),
+        GeneratedInterviewQuestion(bucket="sql", question="Explain the difference between INNER and LEFT JOIN."),
+    ],
+)
 
 SAMPLE_PARSED_JD = AIParsedJD(
     role_title="Data Analyst Intern",
@@ -36,15 +52,23 @@ SAMPLE_PARSED_RESUME = ParsedResume(
 
 
 class FakeAIProvider(AIProvider):
-    def __init__(self, jd: Optional[AIParsedJD] = None, resume: Optional[ParsedResume] = None):
+    def __init__(
+        self,
+        jd: Optional[AIParsedJD] = None,
+        resume: Optional[ParsedResume] = None,
+        prep_content: Optional[GeneratedJobPreparationContent] = None,
+    ):
         self._jd = jd
         self._resume = resume
+        self._prep_content = prep_content or SAMPLE_PREP_CONTENT
 
     def generate_structured(self, prompt, schema):
         if schema is AIParsedJD:
             return self._jd
         if schema is ParsedResume:
             return self._resume
+        if schema is GeneratedJobPreparationContent:
+            return self._prep_content
         raise AssertionError(f"Unexpected schema requested in test: {schema}")
 
     def generate_text(self, prompt):
@@ -217,3 +241,146 @@ def test_match_with_resume_success(client, auth_headers, use_fake_ai):
         "gap_severity": "medium",
         "source": "jd_match",
     }
+
+
+def test_list_jobs_empty(client, auth_headers):
+    resp = client.get("/jobs", headers=auth_headers)
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+def test_list_jobs_most_recent_first_and_plan_flag(client, auth_headers, use_fake_ai):
+    use_fake_ai(FakeAIProvider(jd=SAMPLE_PARSED_JD, resume=SAMPLE_PARSED_RESUME))
+
+    from tests.fixtures.pdf_helpers import make_pdf_with_text
+
+    client.post(
+        "/resumes",
+        files={"file": ("resume.pdf", make_pdf_with_text("some resume text"), "application/pdf")},
+        headers=auth_headers,
+    )
+
+    first_id = client.post("/jobs", json={"raw_text": "first jd"}, headers=auth_headers).json()["id"]
+    second_id = client.post("/jobs", json={"raw_text": "second jd"}, headers=auth_headers).json()["id"]
+    client.post(f"/jobs/{second_id}/preparation-plan", json={}, headers=auth_headers)
+
+    resp = client.get("/jobs", headers=auth_headers)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert [item["id"] for item in body] == [second_id, first_id]
+    assert body[0]["has_preparation_plan"] is True
+    assert body[1]["has_preparation_plan"] is False
+
+
+def test_list_jobs_isolated_per_user(client, auth_headers, use_fake_ai):
+    use_fake_ai(FakeAIProvider(jd=SAMPLE_PARSED_JD))
+    client.post("/jobs", json={"raw_text": "some jd text"}, headers=auth_headers)
+
+    client.post("/auth/signup", json={"email": "other-list-jobs@example.com", "password": "supersecret123"})
+    other_token = client.post(
+        "/auth/login", json={"email": "other-list-jobs@example.com", "password": "supersecret123"}
+    ).json()["access_token"]
+
+    resp = client.get("/jobs", headers={"Authorization": f"Bearer {other_token}"})
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+def test_generate_preparation_plan_requires_resume(client, auth_headers, use_fake_ai):
+    use_fake_ai(FakeAIProvider(jd=SAMPLE_PARSED_JD))
+    jd_id = client.post("/jobs", json={"raw_text": "some jd text"}, headers=auth_headers).json()["id"]
+
+    resp = client.post(f"/jobs/{jd_id}/preparation-plan", json={}, headers=auth_headers)
+    assert resp.status_code == 422
+
+
+def test_generate_preparation_plan_not_found(client, auth_headers):
+    resp = client.post("/jobs/999999/preparation-plan", json={}, headers=auth_headers)
+    assert resp.status_code == 404
+
+
+def test_generate_preparation_plan_success(client, auth_headers, use_fake_ai):
+    use_fake_ai(FakeAIProvider(jd=SAMPLE_PARSED_JD, resume=SAMPLE_PARSED_RESUME))
+
+    from tests.fixtures.pdf_helpers import make_pdf_with_text
+
+    client.post(
+        "/resumes",
+        files={"file": ("resume.pdf", make_pdf_with_text("some resume text"), "application/pdf")},
+        headers=auth_headers,
+    )
+    jd_id = client.post("/jobs", json={"raw_text": "some jd text"}, headers=auth_headers).json()["id"]
+
+    resp = client.post(
+        f"/jobs/{jd_id}/preparation-plan",
+        json={"company_name": "Acme Corp", "job_title": "Data Analyst"},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["jd_id"] == jd_id
+    assert body["company_name"] == "Acme Corp"
+    assert body["job_summary"]["company_name"] == "Acme Corp"
+    assert body["job_summary"]["job_title"] == "Data Analyst"
+
+    gaps = {g["skill"]: g["status"] for g in body["preparation_gaps"]}
+    assert gaps["SQL"] == "strong"
+    assert gaps["Excel"] == "strong"
+    assert gaps["Python"] == "missing"
+
+    categories = {c["category"] for c in body["preparation_plan"]}
+    # Always-relevant baseline categories.
+    assert {"DSA", "Aptitude", "Programming", "Core CS", "Technical", "HR", "Resume"} <= categories
+    # SQL is one of the JD's own required skills -> should be included as relevant.
+    assert "SQL" in categories
+
+    assert len(body["interview_prep"]) == 2
+    assert body["required_skills"]  # skill/tool requirements, categorized
+
+
+def test_get_preparation_plan_404_before_generation(client, auth_headers, use_fake_ai):
+    use_fake_ai(FakeAIProvider(jd=SAMPLE_PARSED_JD))
+    jd_id = client.post("/jobs", json={"raw_text": "some jd text"}, headers=auth_headers).json()["id"]
+
+    resp = client.get(f"/jobs/{jd_id}/preparation-plan", headers=auth_headers)
+    assert resp.status_code == 404
+
+
+def test_get_preparation_plan_after_generation(client, auth_headers, use_fake_ai):
+    use_fake_ai(FakeAIProvider(jd=SAMPLE_PARSED_JD, resume=SAMPLE_PARSED_RESUME))
+
+    from tests.fixtures.pdf_helpers import make_pdf_with_text
+
+    client.post(
+        "/resumes",
+        files={"file": ("resume.pdf", make_pdf_with_text("some resume text"), "application/pdf")},
+        headers=auth_headers,
+    )
+    jd_id = client.post("/jobs", json={"raw_text": "some jd text"}, headers=auth_headers).json()["id"]
+    generated = client.post(f"/jobs/{jd_id}/preparation-plan", json={}, headers=auth_headers).json()
+
+    resp = client.get(f"/jobs/{jd_id}/preparation-plan", headers=auth_headers)
+    assert resp.status_code == 200
+    assert resp.json()["id"] == generated["id"]
+
+
+def test_preparation_plan_isolated_per_user(client, auth_headers, use_fake_ai):
+    use_fake_ai(FakeAIProvider(jd=SAMPLE_PARSED_JD, resume=SAMPLE_PARSED_RESUME))
+
+    from tests.fixtures.pdf_helpers import make_pdf_with_text
+
+    client.post(
+        "/resumes",
+        files={"file": ("resume.pdf", make_pdf_with_text("some resume text"), "application/pdf")},
+        headers=auth_headers,
+    )
+    jd_id = client.post("/jobs", json={"raw_text": "some jd text"}, headers=auth_headers).json()["id"]
+
+    client.post("/auth/signup", json={"email": "other-prep-plan@example.com", "password": "supersecret123"})
+    other_token = client.post(
+        "/auth/login", json={"email": "other-prep-plan@example.com", "password": "supersecret123"}
+    ).json()["access_token"]
+    other_headers = {"Authorization": f"Bearer {other_token}"}
+
+    resp = client.post(f"/jobs/{jd_id}/preparation-plan", json={}, headers=other_headers)
+    assert resp.status_code == 404

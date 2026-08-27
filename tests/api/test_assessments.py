@@ -158,6 +158,27 @@ def test_blueprint_role_not_found(client, auth_headers):
     assert resp.status_code == 422
 
 
+def test_blueprint_category_filter_narrows_to_one_assessment_type(client, auth_headers, sde_role_id):
+    resp = client.post(
+        "/assessments/blueprint",
+        json={"role_id": sde_role_id, "category": "aptitude"},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["sections"]
+    assert all(s["assessment_type"] == "aptitude" for s in body["sections"])
+
+
+def test_blueprint_category_filter_no_matching_skills_returns_422(client, auth_headers, sde_role_id):
+    resp = client.post(
+        "/assessments/blueprint",
+        json={"role_id": sde_role_id, "category": "statistics"},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 422
+
+
 def test_blueprint_from_jd_with_role_detected(client, auth_headers, use_fake_ai, sde_role_id):
     jd_id = client.post("/jobs", json={"raw_text": "some jd text"}, headers=auth_headers).json()["id"]
 
@@ -384,3 +405,73 @@ def test_full_assessment_lifecycle_reaches_result(client, auth_headers, blueprin
     # Result is persisted -- a second call returns the same computed values, not a re-derive.
     result_again = client.get(f"/assessments/{assessment_id}/result", headers=auth_headers)
     assert result_again.json() == body
+
+
+def test_assessment_history_empty(client, auth_headers):
+    resp = client.get("/assessments/history", headers=auth_headers)
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+def test_assessment_history_in_progress_assessment_excluded(client, auth_headers, blueprint_id, use_fake_ai):
+    # No AssessmentResult row exists until the assessment actually completes -- history must
+    # only ever surface finished tests, not ones still in progress.
+    assessment_id = client.post(
+        "/assessments", json={"blueprint_id": blueprint_id}, headers=auth_headers
+    ).json()["id"]
+    client.get(f"/assessments/{assessment_id}/next-question", headers=auth_headers)
+
+    resp = client.get("/assessments/history", headers=auth_headers)
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+def test_assessment_history_after_completion(client, auth_headers, blueprint_id, use_fake_ai):
+    assessment_id = client.post(
+        "/assessments", json={"blueprint_id": blueprint_id}, headers=auth_headers
+    ).json()["id"]
+
+    for _ in range(100):
+        next_q = client.get(f"/assessments/{assessment_id}/next-question", headers=auth_headers).json()
+        if next_q["completed"]:
+            break
+        question = next_q["question"]
+        client.post(
+            f"/assessments/{assessment_id}/answer",
+            json={"question_id": question["id"], "student_answer": "Structured Query Language"},
+            headers=auth_headers,
+        )
+    else:
+        pytest.fail("Assessment did not complete within 100 questions")
+
+    # Completing the assessment also computes/caches the result (via GET .../result) --
+    # history reads AssessmentResult, so trigger that the same way a real client would.
+    client.get(f"/assessments/{assessment_id}/result", headers=auth_headers)
+
+    resp = client.get("/assessments/history", headers=auth_headers)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body) == 1
+    item = body[0]
+    assert item["assessment_id"] == assessment_id
+    assert item["blueprint_id"] == blueprint_id
+    assert item["category"] == "coding"  # DSA is the SDE taxonomy's highest-weight section
+    assert item["overall_score"] == 1.0
+    assert item["accuracy"] == 1.0
+    assert item["question_count"] > 0
+
+
+def test_assessment_history_isolated_per_user(client, auth_headers, blueprint_id, use_fake_ai):
+    assessment_id = client.post(
+        "/assessments", json={"blueprint_id": blueprint_id}, headers=auth_headers
+    ).json()["id"]
+    client.get(f"/assessments/{assessment_id}/next-question", headers=auth_headers)
+
+    client.post("/auth/signup", json={"email": "other-history@example.com", "password": "supersecret123"})
+    other_token = client.post(
+        "/auth/login", json={"email": "other-history@example.com", "password": "supersecret123"}
+    ).json()["access_token"]
+
+    resp = client.get("/assessments/history", headers={"Authorization": f"Bearer {other_token}"})
+    assert resp.status_code == 200
+    assert resp.json() == []

@@ -20,5 +20,7 @@ class AIParsedJD(BaseModel):
     tools_technologies: List[str]
     experience_expectation: Optional[str] = None
     education_eligibility: Optional[str] = None
+    location: Optional[str] = None
+    employment_type: Optional[str] = None
     other_signals: List[str]
     parsing_confidence: float

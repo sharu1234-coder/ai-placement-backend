@@ -1,3 +1,4 @@
+import datetime
 from typing import List, Optional
 
 from pydantic import BaseModel, Field, model_validator
@@ -6,6 +7,9 @@ from pydantic import BaseModel, Field, model_validator
 class PrepareMeRequest(BaseModel):
     role_id: Optional[int] = None
     jd_id: Optional[int] = None
+    # Narrows the blueprint to one assessment_type (e.g. "sql", "coding") -- powers the
+    # Test Center's category browse. None keeps today's mixed, multi-section behavior.
+    category: Optional[str] = None
 
     @model_validator(mode="after")
     def require_role_or_jd(self) -> "PrepareMeRequest":
@@ -80,3 +84,18 @@ class AssessmentResultRead(BaseModel):
     overall_score: float
     skill_scores: List[SkillScore]
     priority_weaknesses: List[str]
+
+
+class AssessmentHistoryItem(BaseModel):
+    """One completed test, for the Test Center's stats + recent-results list. category is
+    the blueprint's dominant (highest-weight) section's assessment_type -- a mixed blueprint
+    still gets one representative label. accuracy is correct/answered from QuestionAttempt,
+    distinct from overall_score (the AI-graded average, which can be partial credit)."""
+
+    assessment_id: int
+    blueprint_id: int
+    category: str
+    overall_score: float
+    accuracy: float
+    question_count: int
+    completed_at: datetime.datetime

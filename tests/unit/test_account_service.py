@@ -46,6 +46,9 @@ class RecordingStorage(StorageProvider):
     def delete(self, key):
         self.deleted_keys.append(key)
 
+    def load(self, key):
+        raise NotImplementedError("RecordingStorage does not back real file content")
+
 
 @pytest.fixture()
 def db_session():

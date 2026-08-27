@@ -17,13 +17,14 @@ from app.models.role import Role
 from app.schemas.interview import (
     InterviewAnswerRead,
     InterviewEvaluationRead,
+    InterviewHistoryItem,
     InterviewQuestionRead,
     InterviewRead,
     NextInterviewQuestionResponse,
 )
 from app.services.skill_matching import NoResumeAnalysisError, latest_resume_skills
 
-_QUESTION_PROMPT_PATH = Path(__file__).resolve().parent.parent / "ai" / "prompts" / "interview_question_v1.txt"
+_QUESTION_PROMPT_PATH = Path(__file__).resolve().parent.parent / "ai" / "prompts" / "interview_question_v2.txt"
 _EVALUATION_PROMPT_PATH = Path(__file__).resolve().parent.parent / "ai" / "prompts" / "interview_evaluation_v1.txt"
 
 _QUESTIONS_PER_INTERVIEW = 5
@@ -92,6 +93,34 @@ def start_interview(
     db.commit()
     db.refresh(interview)
     return _interview_read(interview)
+
+
+def list_interviews(db: Session, profile_id: int) -> List[InterviewHistoryItem]:
+    """Past interviews, most recent first -- there was previously no way to revisit one
+    after finishing its live flow. overall_score stays None until get_evaluation has been
+    called at least once for that interview (it computes InterviewEvaluation lazily)."""
+    interviews = (
+        db.query(Interview)
+        .filter(Interview.profile_id == profile_id)
+        .order_by(Interview.created_at.desc())
+        .all()
+    )
+    items: List[InterviewHistoryItem] = []
+    for interview in interviews:
+        evaluation = (
+            db.query(InterviewEvaluation).filter(InterviewEvaluation.interview_id == interview.id).first()
+        )
+        items.append(
+            InterviewHistoryItem(
+                id=interview.id,
+                type=interview.type,
+                mode=interview.mode,
+                status=interview.status,
+                overall_score=evaluation.overall_score if evaluation else None,
+                created_at=interview.created_at,
+            )
+        )
+    return items
 
 
 def _role_name(db: Session, role_id: Optional[int]) -> Optional[str]:

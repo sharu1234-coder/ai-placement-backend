@@ -19,6 +19,43 @@ def test_get_my_profile_auto_creates(client, auth_headers):
     assert body["target_role_id"] is None
 
 
+def test_get_my_profile_includes_email(client, auth_headers):
+    # email lives on User, not StudentProfile -- regression test for profile_read()
+    # sourcing it explicitly rather than relying on bare from_attributes=True.
+    resp = client.get("/users/me", headers=auth_headers)
+    assert resp.status_code == 200
+    assert resp.json()["email"] == "profile@example.com"
+
+
+def test_update_my_profile_all_real_fields_round_trip(client, auth_headers):
+    # Regression test for the "profile save doesn't persist" bug: every field the PUT
+    # schema actually declares must both save and be readable back via a fresh GET.
+    payload = {
+        "full_name": "Asha Rao",
+        "mobile_number": "+91 98765 43210",
+        "college": "IIT Bombay",
+        "graduation_year": 2027,
+        "degree": "B.Tech",
+        "branch": "Computer Science",
+        "experience_level": "beginner",
+        "preparation_goals": ["dsa", "sql"],
+    }
+    put_resp = client.put("/users/me", json=payload, headers=auth_headers)
+    assert put_resp.status_code == 200
+    for key, value in payload.items():
+        assert put_resp.json()[key] == value
+
+    get_resp = client.get("/users/me", headers=auth_headers)
+    assert get_resp.status_code == 200
+    for key, value in payload.items():
+        assert get_resp.json()[key] == value
+
+
+def test_update_my_profile_rejects_overlong_mobile_number(client, auth_headers):
+    resp = client.put("/users/me", json={"mobile_number": "1" * 21}, headers=auth_headers)
+    assert resp.status_code == 422
+
+
 def test_get_my_profile_requires_auth(client):
     resp = client.get("/users/me")
     assert resp.status_code == 403  # no Authorization header at all
@@ -35,6 +72,43 @@ def test_update_my_profile(client, auth_headers):
     assert body["full_name"] == "Asha Rao"
     assert body["college"] == "IIT Bombay"
     assert body["graduation_year"] == 2027
+
+
+def test_update_my_profile_onboarding_fields(client, auth_headers):
+    resp = client.put(
+        "/users/me",
+        json={
+            "degree": "B.Tech",
+            "branch": "Computer Science",
+            "experience_level": "beginner",
+            "preparation_goals": ["dsa", "sql", "mock_interviews"],
+        },
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["degree"] == "B.Tech"
+    assert body["branch"] == "Computer Science"
+    assert body["experience_level"] == "beginner"
+    assert body["preparation_goals"] == ["dsa", "sql", "mock_interviews"]
+    assert body["onboarding_completed"] is False
+
+
+def test_update_my_profile_rejects_invalid_experience_level(client, auth_headers):
+    resp = client.put("/users/me", json={"experience_level": "expert"}, headers=auth_headers)
+    assert resp.status_code == 422
+
+
+def test_update_my_profile_rejects_overlong_full_name(client, auth_headers):
+    # StudentProfile.full_name is String(255) -- an overlong value must 422 here, not hit an
+    # unhandled DB error on Postgres.
+    resp = client.put("/users/me", json={"full_name": "x" * 256}, headers=auth_headers)
+    assert resp.status_code == 422
+
+
+def test_update_my_profile_accepts_full_name_at_the_length_limit(client, auth_headers):
+    resp = client.put("/users/me", json={"full_name": "x" * 255}, headers=auth_headers)
+    assert resp.status_code == 200
 
 
 def test_list_roles(client):
@@ -57,6 +131,100 @@ def test_select_role(client, auth_headers):
 def test_select_unknown_role_404s(client, auth_headers):
     resp = client.post("/users/me/role", json={"role_id": 999999}, headers=auth_headers)
     assert resp.status_code == 404
+
+
+def test_select_custom_role_rejects_overlong_value(client, auth_headers):
+    # StudentProfile.custom_target_role is String(150) -- an overlong value must 422 here,
+    # not hit an unhandled DB error on Postgres.
+    resp = client.post("/users/me/role", json={"custom_role": "x" * 151}, headers=auth_headers)
+    assert resp.status_code == 422
+
+
+def test_select_custom_role_clears_catalog_role(client, auth_headers):
+    roles = client.get("/roles").json()
+    sde_id = next(role["id"] for role in roles if role["name"] == "SDE")
+    client.post("/users/me/role", json={"role_id": sde_id}, headers=auth_headers)
+
+    resp = client.post(
+        "/users/me/role", json={"custom_role": "Bioinformatics Engineer"}, headers=auth_headers
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["custom_target_role"] == "Bioinformatics Engineer"
+    assert body["target_role_id"] is None
+
+
+def test_select_catalog_role_clears_custom_role(client, auth_headers):
+    client.post("/users/me/role", json={"custom_role": "Bioinformatics Engineer"}, headers=auth_headers)
+
+    roles = client.get("/roles").json()
+    sde_id = next(role["id"] for role in roles if role["name"] == "SDE")
+    resp = client.post("/users/me/role", json={"role_id": sde_id}, headers=auth_headers)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["target_role_id"] == sde_id
+    assert body["custom_target_role"] is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"role_id": None, "custom_role": None},
+    ],
+)
+def test_select_role_rejects_neither_set(client, auth_headers, payload):
+    resp = client.post("/users/me/role", json=payload, headers=auth_headers)
+    assert resp.status_code == 422
+
+
+def test_select_role_rejects_both_set(client, auth_headers):
+    roles = client.get("/roles").json()
+    sde_id = next(role["id"] for role in roles if role["name"] == "SDE")
+    resp = client.post(
+        "/users/me/role",
+        json={"role_id": sde_id, "custom_role": "Bioinformatics Engineer"},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 422
+
+
+def test_select_secondary_role(client, auth_headers):
+    roles = client.get("/roles").json()
+    sde_id = next(role["id"] for role in roles if role["name"] == "SDE")
+    data_analyst_id = next(role["id"] for role in roles if role["name"] == "Data Analyst")
+
+    client.post("/users/me/role", json={"role_id": sde_id}, headers=auth_headers)
+    resp = client.post(
+        "/users/me/role/secondary", json={"role_id": data_analyst_id}, headers=auth_headers
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["target_role_id"] == sde_id
+    assert body["secondary_target_role_id"] == data_analyst_id
+
+
+def test_select_unknown_secondary_role_404s(client, auth_headers):
+    resp = client.post("/users/me/role/secondary", json={"role_id": 999999}, headers=auth_headers)
+    assert resp.status_code == 404
+
+
+def test_onboarding_complete_is_idempotent_and_reflected_on_get(client, auth_headers):
+    initial = client.get("/users/me", headers=auth_headers).json()
+    assert initial["onboarding_completed"] is False
+
+    first = client.post("/users/me/onboarding/complete", headers=auth_headers)
+    assert first.status_code == 200
+    assert first.json()["onboarding_completed"] is True
+
+    second = client.post("/users/me/onboarding/complete", headers=auth_headers)
+    assert second.status_code == 200
+    assert second.json()["onboarding_completed"] is True
+
+    after = client.get("/users/me", headers=auth_headers).json()
+    assert after["onboarding_completed"] is True
 
 
 @pytest.mark.parametrize(

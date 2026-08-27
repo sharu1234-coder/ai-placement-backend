@@ -1,13 +1,16 @@
-from typing import Optional
+from typing import List, Optional
 
 from sqlalchemy.orm import Session
 
+from app.models.assessment import Assessment
 from app.models.assessment_blueprint import AssessmentBlueprint
+from app.models.assessment_result import AssessmentResult
 from app.models.job_description import JobDescription
+from app.models.question_attempt import QuestionAttempt
 from app.models.requirement import Requirement
 from app.models.role import Role
 from app.models.role_skill_weight import RoleSkillWeight
-from app.schemas.assessment import AssessmentBlueprintRead, BlueprintSection
+from app.schemas.assessment import AssessmentBlueprintRead, AssessmentHistoryItem, BlueprintSection
 from app.services.skill_matching import NoResumeAnalysisError, latest_resume_skills, skill_present
 
 _JD_REQUIRED_WEIGHT = 0.9
@@ -64,7 +67,11 @@ def _build_skill_matrix(
 
 
 def generate_blueprint(
-    db: Session, profile_id: int, role_id: Optional[int], jd_id: Optional[int]
+    db: Session,
+    profile_id: int,
+    role_id: Optional[int],
+    jd_id: Optional[int],
+    category: Optional[str] = None,
 ) -> AssessmentBlueprintRead:
     effective_role_id = role_id
 
@@ -79,6 +86,10 @@ def generate_blueprint(
         raise InvalidPrepareMeRequestError("Role not found")
 
     matrix, source = _build_skill_matrix(db, effective_role_id, jd_id)
+    if category is not None:
+        matrix = {k: v for k, v in matrix.items() if v["assessment_type"] == category}
+        if not matrix:
+            raise InvalidPrepareMeRequestError(f"No {category} skills found for this role/JD")
     if not matrix:
         raise InvalidPrepareMeRequestError(
             "Not enough information to build a blueprint -- select a role or provide a JD "
@@ -123,3 +134,42 @@ def generate_blueprint(
         source=blueprint.source,
         sections=sections,
     )
+
+
+def get_assessment_history(db: Session, profile_id: int) -> List[AssessmentHistoryItem]:
+    """Completed tests only (an AssessmentResult row exists only once a test is finished --
+    see assessment_run_service.get_result), most recent first. Powers the Test Center's
+    stats (client-side averages over this list) and recent-results display."""
+    rows = (
+        db.query(Assessment, AssessmentBlueprint, AssessmentResult)
+        .join(AssessmentBlueprint, AssessmentBlueprint.id == Assessment.blueprint_id)
+        .join(AssessmentResult, AssessmentResult.assessment_id == Assessment.id)
+        .filter(Assessment.profile_id == profile_id)
+        .order_by(AssessmentResult.created_at.desc())
+        .all()
+    )
+
+    items: List[AssessmentHistoryItem] = []
+    for assessment, blueprint, result in rows:
+        sections = blueprint.sections or []
+        dominant_category = (
+            max(sections, key=lambda s: s.get("weight", 0.0))["assessment_type"] if sections else "technical"
+        )
+        attempts = (
+            db.query(QuestionAttempt)
+            .filter(QuestionAttempt.assessment_id == assessment.id, QuestionAttempt.is_correct.isnot(None))
+            .all()
+        )
+        accuracy = (sum(1 for a in attempts if a.is_correct) / len(attempts)) if attempts else 0.0
+        items.append(
+            AssessmentHistoryItem(
+                assessment_id=assessment.id,
+                blueprint_id=blueprint.id,
+                category=dominant_category,
+                overall_score=result.overall_score,
+                accuracy=round(accuracy, 3),
+                question_count=len(attempts),
+                completed_at=result.created_at,
+            )
+        )
+    return items

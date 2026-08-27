@@ -30,6 +30,22 @@ def test_local_storage_delete_missing_key_does_not_raise(tmp_path, monkeypatch):
     storage.delete("resumes/does-not-exist.pdf")
 
 
+def test_local_storage_load_returns_saved_bytes(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "upload_dir", str(tmp_path))
+    storage = LocalStorageProvider()
+    storage.save("resumes/test.pdf", b"hello world")
+
+    assert storage.load("resumes/test.pdf") == b"hello world"
+
+
+def test_local_storage_load_missing_key_raises_storage_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "upload_dir", str(tmp_path))
+    storage = LocalStorageProvider()
+
+    with pytest.raises(StorageError):
+        storage.load("resumes/does-not-exist.pdf")
+
+
 def test_s3_storage_requires_bucket(monkeypatch):
     monkeypatch.setattr(settings, "storage_s3_bucket", None)
 
@@ -76,3 +92,21 @@ def test_s3_storage_delete_does_not_raise_on_failure(s3_provider):
     s3_provider._client.delete_object.side_effect = _client_error("DeleteObject")
 
     s3_provider.delete("resumes/test.pdf")
+
+
+def test_s3_storage_load_returns_body_bytes(s3_provider):
+    body = MagicMock()
+    body.read.return_value = b"hello"
+    s3_provider._client.get_object.return_value = {"Body": body}
+
+    result = s3_provider.load("resumes/test.pdf")
+
+    assert result == b"hello"
+    s3_provider._client.get_object.assert_called_once_with(Bucket="test-bucket", Key="resumes/test.pdf")
+
+
+def test_s3_storage_load_raises_storage_error_on_failure(s3_provider):
+    s3_provider._client.get_object.side_effect = _client_error("GetObject")
+
+    with pytest.raises(StorageError):
+        s3_provider.load("resumes/test.pdf")

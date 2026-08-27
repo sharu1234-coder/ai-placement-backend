@@ -11,6 +11,7 @@ import pytest
 from app.ai.provider import AIProvider, get_ai_provider
 from app.ai.schemas.jd import AIParsedJD
 from app.ai.schemas.resume import ParsedResume
+from app.ai.schemas.resume_ats_check import GeneratedAtsCheckContent
 from app.core.config import settings
 from app.main import app
 
@@ -38,12 +39,17 @@ SAMPLE_PARSED_RESUME = ParsedResume(
 )
 
 
+SAMPLE_ATS_CONTENT = GeneratedAtsCheckContent(summary="A fake AI summary.", finding_rephrases=[])
+
+
 class FakeAIProvider(AIProvider):
     def generate_structured(self, prompt, schema):
         if schema is AIParsedJD:
             return SAMPLE_PARSED_JD
         if schema is ParsedResume:
             return SAMPLE_PARSED_RESUME
+        if schema is GeneratedAtsCheckContent:
+            return SAMPLE_ATS_CONTENT
         raise AssertionError(f"Unexpected schema requested in test: {schema}")
 
     def generate_text(self, prompt):
@@ -87,6 +93,23 @@ def test_resume_upload_rate_limited(client, auth_headers):
         files={"file": ("resume.pdf", make_pdf_with_text("some resume text"), "application/pdf")},
         headers=auth_headers,
     )
+    assert blocked.status_code == 429
+
+
+def test_create_ats_check_rate_limited(client, auth_headers):
+    from tests.fixtures.pdf_helpers import make_pdf_with_text
+
+    resume_id = client.post(
+        "/resumes",
+        files={"file": ("resume.pdf", make_pdf_with_text("some resume text"), "application/pdf")},
+        headers=auth_headers,
+    ).json()["id"]
+
+    for _ in range(20):
+        resp = client.post(f"/resumes/{resume_id}/ats-check", json={}, headers=auth_headers)
+        assert resp.status_code == 201
+
+    blocked = client.post(f"/resumes/{resume_id}/ats-check", json={}, headers=auth_headers)
     assert blocked.status_code == 429
 
 

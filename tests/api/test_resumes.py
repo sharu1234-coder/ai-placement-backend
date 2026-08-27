@@ -74,6 +74,60 @@ def test_upload_resume_success(client, auth_headers, use_fake_ai):
     assert body["analysis"]["ats_score"] == 72.0
 
 
+def test_get_my_latest_resume_reflects_uploaded_file_size(client, auth_headers, use_fake_ai):
+    use_fake_ai(FakeAIProvider(parsed=SAMPLE_PARSED_RESUME))
+    pdf_bytes = make_pdf_with_text("Jane Doe resume text for size check.")
+
+    client.post(
+        "/resumes",
+        files={"file": ("resume.pdf", pdf_bytes, "application/pdf")},
+        headers=auth_headers,
+    )
+
+    resp = client.get("/resumes/me/latest", headers=auth_headers)
+    assert resp.json()["file_size_bytes"] == len(pdf_bytes)
+
+
+def test_get_my_latest_resume_none_before_upload(client, auth_headers):
+    resp = client.get("/resumes/me/latest", headers=auth_headers)
+    assert resp.status_code == 200
+    assert resp.json() is None
+
+
+def test_get_my_latest_resume_after_upload(client, auth_headers, use_fake_ai):
+    use_fake_ai(FakeAIProvider(parsed=SAMPLE_PARSED_RESUME))
+    upload_id = client.post(
+        "/resumes",
+        files={"file": ("Jane_Resume.pdf", make_pdf_with_text("resume text"), "application/pdf")},
+        headers=auth_headers,
+    ).json()["id"]
+
+    resp = client.get("/resumes/me/latest", headers=auth_headers)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["id"] == upload_id
+    assert body["filename"] == "Jane_Resume.pdf"
+    assert body["parse_status"] == "completed"
+
+
+def test_get_my_latest_resume_returns_the_most_recent(client, auth_headers, use_fake_ai):
+    use_fake_ai(FakeAIProvider(parsed=SAMPLE_PARSED_RESUME))
+    client.post(
+        "/resumes",
+        files={"file": ("first.pdf", make_pdf_with_text("resume text 1"), "application/pdf")},
+        headers=auth_headers,
+    )
+    second_id = client.post(
+        "/resumes",
+        files={"file": ("second.pdf", make_pdf_with_text("resume text 2"), "application/pdf")},
+        headers=auth_headers,
+    ).json()["id"]
+
+    resp = client.get("/resumes/me/latest", headers=auth_headers)
+    assert resp.json()["id"] == second_id
+    assert resp.json()["filename"] == "second.pdf"
+
+
 def test_upload_rejects_non_pdf(client, auth_headers, use_fake_ai):
     use_fake_ai(FakeAIProvider(parsed=SAMPLE_PARSED_RESUME))
 

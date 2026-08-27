@@ -40,3 +40,10 @@ class S3StorageProvider(StorageProvider):
             self._client.delete_object(Bucket=self.bucket, Key=key)
         except (BotoCoreError, ClientError) as exc:
             logger.warning("Could not delete '%s' from S3-compatible storage: %s", key, exc)
+
+    def load(self, key: str) -> bytes:
+        try:
+            response = self._client.get_object(Bucket=self.bucket, Key=key)
+            return response["Body"].read()
+        except (BotoCoreError, ClientError) as exc:
+            raise StorageError(f"Failed to read '{key}' from S3-compatible storage: {exc}") from exc

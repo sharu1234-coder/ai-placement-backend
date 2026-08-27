@@ -1,3 +1,5 @@
+from typing import Optional
+
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
@@ -7,11 +9,14 @@ from app.api.deps import get_current_user, get_db
 from app.api.upload_utils import read_upload_limited
 from app.core.rate_limit import limiter
 from app.models.user import User
-from app.schemas.resume import ResumeAnalysisRead, ResumeUploadResponse
+from app.schemas.resume import ResumeAnalysisRead, ResumeSummaryRead, ResumeUploadResponse
+from app.schemas.resume_ats_check import AtsCheckListItemRead, AtsCheckReportRead, CreateAtsCheckRequest
+from app.services.ats_check_service import generate_ats_check, get_ats_check, list_ats_checks
 from app.services.profile_service import get_or_create_profile
 from app.services.resume_service import (
     ResumeProcessingError,
     delete_resume,
+    get_latest_resume,
     get_resume_analysis,
     process_resume_upload,
 )
@@ -73,6 +78,33 @@ async def upload_resume(
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
 
 
+@router.get("/me/latest", response_model=Optional[ResumeSummaryRead])
+def get_my_latest_resume(
+    current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
+) -> Optional[ResumeSummaryRead]:
+    profile = get_or_create_profile(db, current_user)
+    return get_latest_resume(db, profile.id)
+
+
+@router.get("/ats-checks", response_model=list[AtsCheckListItemRead])
+def list_ats_checks_endpoint(
+    current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
+) -> list[AtsCheckListItemRead]:
+    profile = get_or_create_profile(db, current_user)
+    return list_ats_checks(db, profile.id)
+
+
+@router.get("/ats-checks/{check_id}", response_model=AtsCheckReportRead)
+def get_ats_check_endpoint(
+    check_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
+) -> AtsCheckReportRead:
+    profile = get_or_create_profile(db, current_user)
+    report = get_ats_check(db, check_id, profile.id)
+    if report is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="ATS check not found")
+    return report
+
+
 @router.get("/{resume_id}/analysis", response_model=ResumeAnalysisRead)
 def get_resume_analysis_endpoint(
     resume_id: int,
@@ -84,6 +116,24 @@ def get_resume_analysis_endpoint(
     if analysis is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Resume analysis not found")
     return analysis
+
+
+@router.post("/{resume_id}/ats-check", response_model=AtsCheckReportRead, status_code=status.HTTP_201_CREATED)
+@limiter.limit("20/hour")
+def create_ats_check_endpoint(
+    request: Request,
+    resume_id: int,
+    payload: CreateAtsCheckRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    ai_provider: AIProvider = Depends(get_ai_provider),
+    storage: StorageProvider = Depends(get_storage_provider),
+) -> AtsCheckReportRead:
+    profile = get_or_create_profile(db, current_user)
+    report = generate_ats_check(db, profile.id, resume_id, payload.target_role, ai_provider, storage)
+    if report is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Resume not found")
+    return report
 
 
 @router.delete("/{resume_id}", status_code=status.HTTP_204_NO_CONTENT)

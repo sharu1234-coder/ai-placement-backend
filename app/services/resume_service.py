@@ -10,7 +10,7 @@ from app.ai.provider import AIGenerationError, AIProvider
 from app.ai.schemas.resume import ParsedResume
 from app.models.resume import Resume
 from app.models.resume_analysis import ResumeAnalysis
-from app.schemas.resume import ResumeAnalysisRead, ResumeUploadResponse
+from app.schemas.resume import ResumeAnalysisRead, ResumeSummaryRead, ResumeUploadResponse
 from app.storage.provider import StorageProvider
 
 logger = logging.getLogger(__name__)
@@ -75,7 +75,12 @@ def process_resume_upload(
     file_path = _save_upload(storage, profile_id, filename, file_bytes)
 
     resume = Resume(
-        profile_id=profile_id, file_path=file_path, raw_text=raw_text, parse_status="processing"
+        profile_id=profile_id,
+        file_path=file_path,
+        original_filename=filename,
+        file_size_bytes=len(file_bytes),
+        raw_text=raw_text,
+        parse_status="processing",
     )
     db.add(resume)
     db.commit()
@@ -107,6 +112,24 @@ def process_resume_upload(
 
     return ResumeUploadResponse(
         id=resume.id, parse_status=resume.parse_status, analysis=to_analysis_read(analysis)
+    )
+
+
+def get_latest_resume(db: Session, profile_id: int) -> Optional[ResumeSummaryRead]:
+    resume = (
+        db.query(Resume)
+        .filter(Resume.profile_id == profile_id)
+        .order_by(Resume.id.desc())
+        .first()
+    )
+    if resume is None:
+        return None
+    return ResumeSummaryRead(
+        id=resume.id,
+        filename=resume.original_filename,
+        file_size_bytes=resume.file_size_bytes,
+        parse_status=resume.parse_status,
+        created_at=resume.created_at,
     )
 
 

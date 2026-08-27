@@ -1,3 +1,5 @@
+import datetime
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
@@ -10,7 +12,13 @@ from app.models.project import Project
 from app.models.role import Role
 from app.models.skill import Skill
 from app.models.user import User
-from app.schemas.profile import RoleRead, RoleSelectRequest, StudentProfileRead, StudentProfileUpsert
+from app.schemas.profile import (
+    RoleRead,
+    RoleSelectRequest,
+    SecondaryRoleSelectRequest,
+    StudentProfileRead,
+    StudentProfileUpsert,
+)
 from app.schemas.profile_items import (
     CertificationCreate,
     CertificationRead,
@@ -25,7 +33,7 @@ from app.schemas.profile_items import (
 )
 from app.schemas.user import AccountDeleteRequest
 from app.services.account_service import delete_account
-from app.services.profile_service import get_or_create_profile
+from app.services.profile_service import get_or_create_profile, profile_read
 from app.storage.provider import StorageProvider, get_storage_provider
 
 router = APIRouter(tags=["users"])
@@ -51,7 +59,7 @@ def list_roles(db: Session = Depends(get_db)) -> list[Role]:
 def get_my_profile(
     current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ) -> StudentProfileRead:
-    return get_or_create_profile(db, current_user)
+    return profile_read(get_or_create_profile(db, current_user), current_user)
 
 
 @router.put("/users/me", response_model=StudentProfileRead)
@@ -65,7 +73,7 @@ def update_my_profile(
         setattr(profile, field, value)
     db.commit()
     db.refresh(profile)
-    return profile
+    return profile_read(profile, current_user)
 
 
 @router.delete("/users/me", status_code=status.HTTP_204_NO_CONTENT)
@@ -91,15 +99,58 @@ def select_role(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> StudentProfileRead:
+    """Primary target role -- either a catalog pick (role_id) or a free-text role the
+    student typed in (custom_role), mutually exclusive (RoleSelectRequest enforces
+    exactly one is set). Picking one clears the other."""
+    profile = get_or_create_profile(db, current_user)
+
+    if payload.role_id is not None:
+        role = db.get(Role, payload.role_id)
+        if role is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Role not found")
+        profile.target_role_id = role.id
+        profile.custom_target_role = None
+    else:
+        profile.target_role_id = None
+        profile.custom_target_role = payload.custom_role
+
+    db.commit()
+    db.refresh(profile)
+    return profile_read(profile, current_user)
+
+
+@router.post("/users/me/role/secondary", response_model=StudentProfileRead)
+def select_secondary_role(
+    payload: SecondaryRoleSelectRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> StudentProfileRead:
     role = db.get(Role, payload.role_id)
     if role is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Role not found")
 
     profile = get_or_create_profile(db, current_user)
-    profile.target_role_id = role.id
+    profile.secondary_target_role_id = role.id
     db.commit()
     db.refresh(profile)
-    return profile
+    return profile_read(profile, current_user)
+
+
+@router.post("/users/me/onboarding/complete", response_model=StudentProfileRead)
+def complete_onboarding(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> StudentProfileRead:
+    """Idempotent -- marks onboarding done on first call, a no-op (same timestamp) on
+    any repeat call. A dedicated endpoint rather than a field on the general PUT
+    /users/me upsert so there's no ambiguity about ever "uncompleting" onboarding via
+    an omitted field."""
+    profile = get_or_create_profile(db, current_user)
+    if profile.onboarding_completed_at is None:
+        profile.onboarding_completed_at = datetime.datetime.now(datetime.timezone.utc)
+        db.commit()
+        db.refresh(profile)
+    return profile_read(profile, current_user)
 
 
 @router.post(

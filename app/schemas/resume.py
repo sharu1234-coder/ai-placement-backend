@@ -1,3 +1,4 @@
+import datetime
 from typing import List, Optional
 
 from pydantic import BaseModel
@@ -27,3 +28,14 @@ class ResumeUploadResponse(BaseModel):
     id: int
     parse_status: str
     analysis: Optional[ResumeAnalysisRead] = None
+
+
+class ResumeSummaryRead(BaseModel):
+    """GET /resumes/me/latest -- lets Profile discover 'do I already have a resume'
+    without the client having to remember a resume_id across sessions."""
+
+    id: int
+    filename: Optional[str]
+    file_size_bytes: Optional[int]
+    parse_status: str
+    created_at: datetime.datetime
