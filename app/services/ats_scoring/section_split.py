@@ -1,5 +1,5 @@
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 # Canonical section key -> heading synonyms an ATS-style plain-text scan would recognize.
 # Deliberately regex/heading-based, not dependent on the upload-time AI parse, since this
@@ -63,14 +63,3 @@ def heading_lines(raw_text: str) -> List[str]:
     """The actual raw text of every detected heading line (not just its canonical key) --
     used by readability checks to judge capitalization consistency across headings."""
     return [line.strip() for line in raw_text.splitlines() if _HEADING_PATTERN.match(line)]
-
-
-def first_heading_line(raw_text: str) -> Optional[int]:
-    """Line index of the first detected section heading, or None if no heading was found
-    at all. Used to bound the "contact block" -- everything before the first real section
-    heading, where contact info conventionally lives."""
-    lines = raw_text.splitlines()
-    for i, line in enumerate(lines):
-        if _HEADING_PATTERN.match(line):
-            return i
-    return None

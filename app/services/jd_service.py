@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
@@ -179,14 +179,24 @@ def list_job_descriptions(db: Session, profile_id: int) -> List[JobDescriptionLi
         .order_by(JobDescription.created_at.desc())
         .all()
     )
+    jd_ids = [jd.id for jd in jds]
+    latest_plan_by_jd: Dict[int, JobPreparationPlan] = {}
+    if jd_ids:
+        # Ordered (jd_id, id desc) so the first row seen per jd_id in this single pass is
+        # each JD's latest plan -- avoids one query per JD for what's otherwise a "latest
+        # row per group" lookup.
+        plans = (
+            db.query(JobPreparationPlan)
+            .filter(JobPreparationPlan.jd_id.in_(jd_ids), JobPreparationPlan.profile_id == profile_id)
+            .order_by(JobPreparationPlan.jd_id, JobPreparationPlan.id.desc())
+            .all()
+        )
+        for plan in plans:
+            latest_plan_by_jd.setdefault(plan.jd_id, plan)
+
     items: List[JobDescriptionListItem] = []
     for jd in jds:
-        plan = (
-            db.query(JobPreparationPlan)
-            .filter(JobPreparationPlan.jd_id == jd.id, JobPreparationPlan.profile_id == profile_id)
-            .order_by(JobPreparationPlan.id.desc())
-            .first()
-        )
+        plan = latest_plan_by_jd.get(jd.id)
         items.append(
             JobDescriptionListItem(
                 id=jd.id,

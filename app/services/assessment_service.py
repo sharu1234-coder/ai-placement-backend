@@ -1,4 +1,5 @@
-from typing import List, Optional
+from collections import defaultdict
+from typing import Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
@@ -149,17 +150,24 @@ def get_assessment_history(db: Session, profile_id: int) -> List[AssessmentHisto
         .all()
     )
 
+    assessment_ids = [assessment.id for assessment, _, _ in rows]
+    attempts_by_assessment: Dict[int, List[QuestionAttempt]] = defaultdict(list)
+    if assessment_ids:
+        all_attempts = (
+            db.query(QuestionAttempt)
+            .filter(QuestionAttempt.assessment_id.in_(assessment_ids), QuestionAttempt.is_correct.isnot(None))
+            .all()
+        )
+        for attempt in all_attempts:
+            attempts_by_assessment[attempt.assessment_id].append(attempt)
+
     items: List[AssessmentHistoryItem] = []
     for assessment, blueprint, result in rows:
         sections = blueprint.sections or []
         dominant_category = (
             max(sections, key=lambda s: s.get("weight", 0.0))["assessment_type"] if sections else "technical"
         )
-        attempts = (
-            db.query(QuestionAttempt)
-            .filter(QuestionAttempt.assessment_id == assessment.id, QuestionAttempt.is_correct.isnot(None))
-            .all()
-        )
+        attempts = attempts_by_assessment[assessment.id]
         accuracy = (sum(1 for a in attempts if a.is_correct) / len(attempts)) if attempts else 0.0
         items.append(
             AssessmentHistoryItem(

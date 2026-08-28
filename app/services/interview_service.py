@@ -1,6 +1,6 @@
 import re
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
@@ -105,11 +105,17 @@ def list_interviews(db: Session, profile_id: int) -> List[InterviewHistoryItem]:
         .order_by(Interview.created_at.desc())
         .all()
     )
+    interview_ids = [i.id for i in interviews]
+    evaluations_by_interview: Dict[int, InterviewEvaluation] = {}
+    if interview_ids:
+        evaluations = (
+            db.query(InterviewEvaluation).filter(InterviewEvaluation.interview_id.in_(interview_ids)).all()
+        )
+        evaluations_by_interview = {e.interview_id: e for e in evaluations}
+
     items: List[InterviewHistoryItem] = []
     for interview in interviews:
-        evaluation = (
-            db.query(InterviewEvaluation).filter(InterviewEvaluation.interview_id == interview.id).first()
-        )
+        evaluation = evaluations_by_interview.get(interview.id)
         items.append(
             InterviewHistoryItem(
                 id=interview.id,

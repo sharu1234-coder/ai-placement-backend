@@ -35,6 +35,11 @@ class Settings(BaseSettings):
     # extraction) -- see README "Production AI provider" for the full tradeoff.
     anthropic_api_key: Optional[str] = None
     anthropic_model: str = "claude-sonnet-5"
+    # The Anthropic SDK's own default (10 minutes) has no app-level knob and is far longer
+    # than this app's sync routes should ever tie up a threadpool worker for one AI call --
+    # matches the explicit-timeout pattern OllamaProvider already uses. Override via
+    # ANTHROPIC_TIMEOUT_SECONDS in .env if a given deployment needs more.
+    anthropic_timeout_seconds: int = 120
 
     # Dev-only local STT for OllamaProvider.transcribe -- swap for a cloud STT provider
     # before real user testing (see CloudProvider note in README).

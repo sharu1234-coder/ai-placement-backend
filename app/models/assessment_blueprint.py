@@ -11,7 +11,7 @@ class AssessmentBlueprint(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     role_id: Mapped[Optional[int]] = mapped_column(ForeignKey("roles.id"), nullable=True)
-    jd_id: Mapped[Optional[int]] = mapped_column(ForeignKey("job_descriptions.id"), nullable=True)
+    jd_id: Mapped[Optional[int]] = mapped_column(ForeignKey("job_descriptions.id"), nullable=True, index=True)
     profile_id: Mapped[int] = mapped_column(ForeignKey("student_profiles.id"), nullable=False, index=True)
     source: Mapped[str] = mapped_column(String(20), nullable=False, default="default_taxonomy")
     sections: Mapped[list] = mapped_column(JSON, nullable=False)

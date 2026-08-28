@@ -314,14 +314,18 @@ def _reconcile_completions(db: Session, profile_id: int, path: PlacementPath) ->
     if not pending:
         return
 
+    blueprint_ids = [t.practice_blueprint_id for t in pending]
+    best_score_by_blueprint: Dict[int, float] = dict(
+        db.query(Assessment.blueprint_id, func.max(AssessmentResult.overall_score))
+        .join(AssessmentResult, AssessmentResult.assessment_id == Assessment.id)
+        .filter(Assessment.blueprint_id.in_(blueprint_ids), Assessment.profile_id == profile_id)
+        .group_by(Assessment.blueprint_id)
+        .all()
+    )
+
     changed = False
     for topic in pending:
-        best_score = (
-            db.query(func.max(AssessmentResult.overall_score))
-            .join(Assessment, Assessment.id == AssessmentResult.assessment_id)
-            .filter(Assessment.blueprint_id == topic.practice_blueprint_id, Assessment.profile_id == profile_id)
-            .scalar()
-        )
+        best_score = best_score_by_blueprint.get(topic.practice_blueprint_id)
         if best_score is not None and best_score >= TOPIC_PASS_THRESHOLD:
             topic.status = "completed"
             topic.completed_via = "assessment"

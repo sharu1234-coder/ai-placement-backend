@@ -39,7 +39,7 @@ class AnthropicProvider(AIProvider):
             raise AIGenerationError(
                 "ANTHROPIC_API_KEY is not set -- required when AI_PROVIDER=anthropic."
             )
-        self._client = anthropic.Anthropic(api_key=key)
+        self._client = anthropic.Anthropic(api_key=key, timeout=settings.anthropic_timeout_seconds)
         self.model = model or settings.anthropic_model
 
     def generate_structured(self, prompt: str, schema: type[T]) -> T:

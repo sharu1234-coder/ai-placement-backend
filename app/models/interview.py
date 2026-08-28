@@ -15,7 +15,7 @@ class Interview(Base):
     # technical/hr/project/behavioral/role_specific
     type: Mapped[str] = mapped_column(String(20), nullable=False)
     mode: Mapped[str] = mapped_column(String(10), nullable=False, default="text")
-    jd_id: Mapped[Optional[int]] = mapped_column(ForeignKey("job_descriptions.id"), nullable=True)
+    jd_id: Mapped[Optional[int]] = mapped_column(ForeignKey("job_descriptions.id"), nullable=True, index=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="in_progress")
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime, nullable=False, default=lambda: datetime.datetime.now(datetime.timezone.utc)
