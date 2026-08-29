@@ -45,6 +45,7 @@ from app.models.role import Role  # noqa: F401
 from app.models.role_skill_weight import RoleSkillWeight  # noqa: F401
 from app.models.skill import Skill  # noqa: F401
 from app.models.skill_gap import SkillGap  # noqa: F401
+from app.models.subscription import Subscription  # noqa: F401
 from app.models.user import User  # noqa: F401
 
 # this is the Alembic Config object, which provides

@@ -71,6 +71,16 @@ class Settings(BaseSettings):
     smtp_from_address: Optional[str] = None
     password_reset_token_expire_minutes: int = 15
 
+    # TEST MODE Razorpay credentials (rzp_test_... key id, its matching secret). None means
+    # subscriptions are unconfigured -- create_order fails loudly with a clear error rather
+    # than silently trying an empty auth header, same "fail loudly on first use" pattern as
+    # anthropic_api_key/STORAGE_S3_*/SMTP_* above. Never hardcode a real value here, and
+    # never send razorpay_key_secret to the Android client -- only razorpay_key_id (the
+    # publishable half Razorpay's own Checkout SDK requires client-side) is ever returned
+    # from an API response (see /subscriptions/checkout).
+    razorpay_key_id: Optional[str] = None
+    razorpay_key_secret: Optional[str] = None
+
     # Comma-separated Host header allowlist (TrustedHostMiddleware, app/main.py). "*" (dev
     # default) accepts any Host -- fine locally, but a production deployment should set
     # this to its real domain(s) (e.g. "api.aiplacementos.com") to reject Host-header

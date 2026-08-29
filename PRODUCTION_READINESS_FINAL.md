@@ -7,7 +7,17 @@ builds/CI, not just read from documentation. **No deployment or publishing was p
 
 **Architecture reaffirmed (unchanged by this audit):** Android → FastAPI → PostgreSQL is the
 primary system. Firebase is auxiliary only (FCM, Crashlytics, Analytics, App Check) — no
-Firestore, no Firebase Auth, no Firebase Storage. No subscriptions/payments implemented.
+Firestore, no Firebase Auth, no Firebase Storage.
+
+**RESOLVED (2026-08-29, post-audit):** Subscriptions/payments are now implemented via
+Razorpay TEST MODE (Orders API + server-side HMAC signature verification) — see
+`app/services/subscription_service.py`, `app/api/subscriptions.py`, and the Android
+`payment/RazorpayCheckoutBridge.kt`. Server-authoritative pricing, ownership-scoped
+verification, idempotent duplicate-callback handling, and renewal-stacking are all covered by
+`tests/unit/test_subscription_service.py` and `tests/api/test_subscriptions.py`. Live/
+production Razorpay keys and a real end-to-end TEST MODE transaction against Razorpay's own
+servers still need to be exercised manually before this is called production-verified — see
+this session's Production Readiness Report for the exact remaining checklist.
 
 ## Overall status
 
