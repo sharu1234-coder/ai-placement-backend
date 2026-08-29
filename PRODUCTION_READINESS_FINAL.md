@@ -324,21 +324,24 @@ feature: `INTERNET` (all API calls), `RECORD_AUDIO` (voice interviews), `POST_NO
 (FCM, API 33+ only, requested at runtime in `MainActivity`). No excessive/unused permissions.
 **Fixed in this audit**: `android:allowBackup="true"` was set with no
 `dataExtractionRules`/`fullBackupContent` restricting what Android's Auto Backup includes —
-meaning `TokenStore`'s DataStore file (which holds the access/refresh JWTs **unencrypted**,
-already a known, self-documented gap in that file) could have been swept into a cloud backup
-or a device-to-device transfer, extending the token's exposure beyond the original device.
-Added `app/src/main/res/xml/data_extraction_rules.xml` (API 31+) and `backup_rules.xml`
-(API < 31, minSdk is 26) excluding that specific file from both cloud backup and
-device-transfer; wired into the manifest; **re-verified by inspecting the actual merged/
-packaged manifest output**, not just the source, that both attributes survive merging.
-**NEEDS MANUAL ACTION / FUTURE ENHANCEMENT (real, still open)**: the token store itself
-remains unencrypted at rest on-device (readable by an attacker with root or physical device
-access, independent of the backup fix above). Migrating to
-`androidx.security.crypto` (`EncryptedSharedPreferences`) or DataStore+manual crypto is a
-real, moderately-sized change (new dependency, a migration path for already-installed users)
-that was judged out of scope for this audit item — flagged clearly rather than silently
-deferred, since the code's own existing comment already called it out as needed "before any
-real user testing."
+meaning `TokenStore`'s DataStore file (which holds the access/refresh JWTs) could have been
+swept into a cloud backup or a device-to-device transfer, extending the token's exposure
+beyond the original device. Added `app/src/main/res/xml/data_extraction_rules.xml` (API 31+)
+and `backup_rules.xml` (API < 31, minSdk is 26) excluding that specific file from both cloud
+backup and device-transfer; wired into the manifest; **re-verified by inspecting the actual
+merged/packaged manifest output**, not just the source, that both attributes survive merging.
+**RESOLVED (2026-08-28, superseding the paragraph below)**: `TokenStore` now encrypts the
+access/refresh JWTs at rest with Google Tink AEAD (AES-256-GCM), keyset wrapped by an
+Android Keystore-backed master key — not `androidx.security.crypto`/`EncryptedSharedPreferences`,
+which Google deprecated in April 2025 (see `TokenStore.kt`'s header comment). The paragraph
+below is kept for history only and no longer describes the current state:
+> ~~NEEDS MANUAL ACTION / FUTURE ENHANCEMENT (real, still open): the token store itself
+> remains unencrypted at rest on-device (readable by an attacker with root or physical device
+> access, independent of the backup fix above). Migrating to `androidx.security.crypto`
+> (`EncryptedSharedPreferences`) or DataStore+manual crypto is a real, moderately-sized change
+> (new dependency, a migration path for already-installed users) that was judged out of scope
+> for this audit item — flagged clearly rather than silently deferred, since the code's own
+> existing comment already called it out as needed "before any real user testing."~~
 
 ### 19. Test coverage and final test execution — READY
 Both suites re-run in full during this audit (not assumed from a prior item):

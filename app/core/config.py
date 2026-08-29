@@ -123,3 +123,12 @@ def validate_for_production() -> None:
         # direct secrets leak by itself, but combined with any future debug-only logging
         # it's a control worth enforcing explicitly rather than trusting it was remembered.
         raise RuntimeError("DEBUG is still true -- set DEBUG=false before running in production.")
+    if settings.allowed_hosts == "*":
+        # TrustedHostMiddleware (app/main.py) accepts any Host header when this is "*" --
+        # fine locally, but in production it allows Host-header spoofing / cache-poisoning
+        # attempts. Same fail-closed treatment as the three checks above rather than relying
+        # on a deployment remembering to set it.
+        raise RuntimeError(
+            "ALLOWED_HOSTS is still '*' -- set it to your real production domain(s) "
+            '(comma-separated, e.g. "api.aiplacementos.com") before running in production.'
+        )

@@ -23,6 +23,7 @@ def test_validate_for_production_passes_with_a_real_secret(monkeypatch) -> None:
     monkeypatch.setattr(settings, "jwt_secret_key", "a-real-random-64-char-secret-not-the-dev-default")
     monkeypatch.setattr(settings, "email_provider", "smtp")
     monkeypatch.setattr(settings, "debug", False)
+    monkeypatch.setattr(settings, "allowed_hosts", "api.aiplacementos.com")
 
     validate_for_production()  # must not raise
 
@@ -44,6 +45,17 @@ def test_validate_for_production_raises_with_debug_true(monkeypatch) -> None:
     monkeypatch.setattr(settings, "debug", True)
 
     with pytest.raises(RuntimeError, match="DEBUG"):
+        validate_for_production()
+
+
+def test_validate_for_production_raises_with_wildcard_allowed_hosts(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "environment", "production")
+    monkeypatch.setattr(settings, "jwt_secret_key", "a-real-random-64-char-secret-not-the-dev-default")
+    monkeypatch.setattr(settings, "email_provider", "smtp")
+    monkeypatch.setattr(settings, "debug", False)
+    monkeypatch.setattr(settings, "allowed_hosts", "*")
+
+    with pytest.raises(RuntimeError, match="ALLOWED_HOSTS"):
         validate_for_production()
 
 
