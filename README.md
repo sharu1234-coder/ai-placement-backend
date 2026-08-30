@@ -76,6 +76,29 @@ as-is.
 
 ## Status
 
+**Real bug found via reproduction: malformed Ollama response crashed instead of failing
+cleanly (2026-08-30).** `OllamaProvider._call_ollama` read `response.json()["response"]`
+outside the try/except that wraps the HTTP call -- a 200 response with an unexpected body
+shape (e.g. Ollama itself returning `{"error": "model not found"}` instead of
+`{"response": "..."}`, or a non-JSON body) raised a bare `KeyError`/`JSONDecodeError`
+instead of `AIGenerationError`, bypassing every `except AIGenerationError` handler across
+the API layer and surfacing as an unhandled 500. Reproduced live with a real repro script
+before fixing (not assumed from reading the code alone), then fixed by moving the response
+parsing inside the try block and catching `(KeyError, ValueError)` alongside
+`httpx.HTTPError`. 2 new regression tests. 518 tests passing (was 516), ruff clean.
+`alembic check` confirms no model/migration drift; downgrade/upgrade cycle re-verified.
+
+Also swept the whole Android nav graph for duplicate/dead routes (none found across 74
+defined routes) and re-checked the DB connection pool sizing (already correctly reasoned
+against Starlette's threadpool size from an earlier pass -- no change needed). Documented,
+not changed: Material3's `FilterChip` (used for the day-of-week alarm picker, career-path
+role chips, skill picker, onboarding goals) auto-expands its invisible touch target to 48dp
+per Compose's own accessibility contract, but Compose's own documentation warns this can
+overlap between closely-packed chips -- this app's chip rows use 8dp visible spacing
+(`Spacing.sm`), which is plausibly tight enough for adjacent touch zones to meet or overlap
+given typical FilterChip metrics. Not changed without a device to visually verify the
+result of widening it; flagged for a real-device check rather than silently left unmentioned.
+
 **Real adversarial prompt-injection sweep across every AI call that scores/grades user
 text, fixed and verified live (2026-08-30).** Started from one finding and searched the
 other 12 prompt templates for the same shape rather than stopping at the first fix.

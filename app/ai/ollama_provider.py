@@ -112,7 +112,14 @@ class OllamaProvider(AIProvider):
                 f"{self.base_url}/api/generate", json=payload, timeout=settings.ollama_timeout_seconds
             )
             response.raise_for_status()
+            return response.json()["response"]
         except httpx.HTTPError as exc:
             raise AIGenerationError(f"Could not reach Ollama at {self.base_url}: {exc}") from exc
-
-        return response.json()["response"]
+        except (KeyError, ValueError) as exc:
+            # A 200 with an unexpected body shape -- e.g. Ollama returning {"error": "..."}
+            # instead of {"response": "..."} (a model-not-found/config problem), or a body
+            # that isn't valid JSON at all (response.json() raises a ValueError subclass).
+            # Found via a real repro, not assumed: this previously raised a bare KeyError/
+            # JSONDecodeError here, bypassing every `except AIGenerationError` handler in the
+            # API layer and surfacing as an unhandled 500 instead of the intended error path.
+            raise AIGenerationError(f"Ollama returned an unexpected response shape: {exc}") from exc

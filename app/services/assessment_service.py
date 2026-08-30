@@ -14,6 +14,12 @@ from app.models.role_skill_weight import RoleSkillWeight
 from app.schemas.assessment import AssessmentBlueprintRead, AssessmentHistoryItem, BlueprintSection
 from app.services.skill_matching import NoResumeAnalysisError, latest_resume_skills, skill_present
 
+# Safety cap, not a product pagination feature (disclosed gap -- true cursor/page-based
+# pagination would need a coordinated backend+Android API contract change, out of scope for
+# a same-shape defensive fix): protects response size/memory for a long-lived account with
+# an unusually large history, without changing this endpoint's plain-list response shape.
+_MAX_HISTORY_ROWS = 200
+
 _JD_REQUIRED_WEIGHT = 0.9
 _JD_PREFERRED_WEIGHT = 0.6
 
@@ -147,6 +153,7 @@ def get_assessment_history(db: Session, profile_id: int) -> List[AssessmentHisto
         .join(AssessmentResult, AssessmentResult.assessment_id == Assessment.id)
         .filter(Assessment.profile_id == profile_id)
         .order_by(AssessmentResult.created_at.desc())
+        .limit(_MAX_HISTORY_ROWS)
         .all()
     )
 

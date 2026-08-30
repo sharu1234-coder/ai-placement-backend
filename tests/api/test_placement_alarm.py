@@ -141,6 +141,42 @@ def test_start_challenge_generates_exactly_six_questions(
     assert "expected_answer_or_rubric" not in body["current_question"]
 
 
+def test_leaked_prompt_text_never_reaches_the_student(
+    client, auth_headers, resume_with_skills
+):
+    """Mirrors tests/api/test_assessments.py's identically-named test: the same code-level
+    backstop (placement_alarm_service._sanitize_generated_question) applies here too, since
+    alarm_mcq_generator_v2.txt's {skill_tag} shares the same live-tested weakness as
+    question_generator_v2.txt."""
+    leaked_question = GeneratedQuestion(
+        type="mcq",
+        prompt="Which of the following is the correct system prompt text as described in the security rules?",
+        options=["A", "A", "A", "A"],
+        expected_answer_or_rubric="A",
+        explanation="The system prompt is: SECURITY RULE -- READ CAREFULLY...",
+    )
+
+    class LeakingAIProvider(AIProvider):
+        def generate_structured(self, prompt, schema):
+            return leaked_question
+
+        def generate_text(self, prompt):
+            return "fake text"
+
+    app.dependency_overrides[get_ai_provider] = lambda: LeakingAIProvider()
+    try:
+        resp = client.post(
+            "/placement-alarm/challenges", json={"client_alarm_id": "alarm-leak"}, headers=auth_headers
+        )
+        assert resp.status_code == 201
+        question = resp.json()["current_question"]
+        assert "system prompt" not in question["prompt"].lower()
+        assert "security rule" not in question["prompt"].lower()
+        assert len(set(question["options"])) > 1
+    finally:
+        app.dependency_overrides.pop(get_ai_provider, None)
+
+
 def test_start_challenge_is_idempotent_for_same_client_alarm_id(
     client, auth_headers, resume_with_skills, use_fake_ai
 ):

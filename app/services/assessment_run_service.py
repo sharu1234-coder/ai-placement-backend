@@ -1,8 +1,10 @@
+import logging
 from pathlib import Path
 from typing import List, Optional
 
 from sqlalchemy.orm import Session
 
+from app.ai.output_guard import looks_like_prompt_leak
 from app.ai.provider import AIProvider
 from app.ai.schemas.assessment import AnswerGrade, GeneratedQuestion
 from app.models.assessment import Assessment
@@ -20,11 +22,48 @@ from app.schemas.assessment import (
     SkillScore,
 )
 
-_QUESTION_PROMPT_PATH = Path(__file__).resolve().parent.parent / "ai" / "prompts" / "question_generator_v1.txt"
+_QUESTION_PROMPT_PATH = Path(__file__).resolve().parent.parent / "ai" / "prompts" / "question_generator_v2.txt"
 _GRADER_PROMPT_PATH = Path(__file__).resolve().parent.parent / "ai" / "prompts" / "answer_grader_v2.txt"
 
 _DIFFICULTIES = ["easy", "medium", "hard"]
 _WEAKNESS_THRESHOLD = 0.6
+
+logger = logging.getLogger(__name__)
+
+
+def _sanitize_generated_question(generated: GeneratedQuestion, skill: str) -> GeneratedQuestion:
+    """Code-level backstop, independent of the prompt's own hardening (see
+    app/ai/output_guard.py's module docstring for why prompt wording alone was not reliable
+    enough here): if skill_tag was ever attacker-influenced instruction-shaped text, this
+    catches a model that echoed prompt scaffolding into `prompt`/`explanation` instead of
+    generating a genuine question, and swaps in a safe generic question rather than ever
+    surfacing the leak to a student."""
+    if looks_like_prompt_leak(generated.prompt) or looks_like_prompt_leak(generated.explanation):
+        logger.warning(
+            "Discarding a generated question for skill=%r: output contained prompt-leak markers.",
+            skill,
+        )
+        if generated.type == "mcq":
+            return GeneratedQuestion(
+                type="mcq",
+                prompt=f"Which of the following best relates to {skill!r}?",
+                options=[
+                    "A relevant concept",
+                    "An unrelated concept",
+                    "A different unrelated concept",
+                    "None of these",
+                ],
+                expected_answer_or_rubric="A relevant concept",
+                explanation="This question checks general understanding of the topic.",
+            )
+        return GeneratedQuestion(
+            type="short_answer",
+            prompt=f"Explain a key concept related to {skill!r} and why it matters in practice.",
+            options=None,
+            expected_answer_or_rubric="A correct, relevant explanation of the concept.",
+            explanation="This question checks general understanding of the topic.",
+        )
+    return generated
 
 
 class AssessmentNotFoundError(Exception):
@@ -160,6 +199,7 @@ def get_next_question(
     difficulty = _next_difficulty(db, assessment_id, current_section.skill)
     prompt = _build_question_prompt(current_section.skill, current_section.assessment_type, difficulty)
     generated: GeneratedQuestion = ai_provider.generate_structured(prompt, GeneratedQuestion)
+    generated = _sanitize_generated_question(generated, current_section.skill)
 
     question = Question(
         skill_tag=current_section.skill,

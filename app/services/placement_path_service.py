@@ -23,6 +23,10 @@ from app.services import placement_path_rules as rules
 from app.services.skill_matching import latest_resume_skills
 from app.services.weakness_service import compute_weaknesses
 
+# Safety cap, not a product pagination feature (disclosed gap -- see assessment_service.py's
+# _MAX_HISTORY_ROWS for the full rationale): protects response size for a long-lived account.
+_MAX_HISTORY_ROWS = 200
+
 _PROMPT_PATH = Path(__file__).resolve().parent.parent / "ai" / "prompts" / "placement_path_explainer_v1.txt"
 
 # Deliberately stricter than assessment_run_service's 0.6 "weakness" cutoff -- passing a
@@ -188,6 +192,7 @@ def get_placement_path_history(db: Session, profile_id: int) -> List[PlacementPa
         db.query(PlacementPath)
         .filter(PlacementPath.profile_id == profile_id)
         .order_by(PlacementPath.created_at.desc())
+        .limit(_MAX_HISTORY_ROWS)
         .all()
     )
     # Only the active path is live-reconciled against assessment results (matching

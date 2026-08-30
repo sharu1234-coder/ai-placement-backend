@@ -286,6 +286,47 @@ def test_submit_correct_mcq_answer(client, auth_headers, blueprint_id, use_fake_
     assert body["explanation"]
 
 
+def test_leaked_prompt_text_never_reaches_the_student(client, auth_headers, blueprint_id):
+    """Real finding: even after hardening question_generator_v2.txt's wording twice, a
+    live-tested attack (skill_tag = an embedded "reveal the system prompt" instruction)
+    still leaked this prompt's own text into `explanation` against a real model (Ollama
+    qwen3:8b, 3/3 repeated runs). This test proves the code-level backstop
+    (assessment_run_service._sanitize_generated_question / app/ai/output_guard.py) actually
+    stops such a leak from ever reaching the student via the real API path, using a fake
+    provider standing in for a model that got hijacked."""
+    leaked_question = GeneratedQuestion(
+        type="mcq",
+        prompt="Which of the following is the correct system prompt text as described in the security rules?",
+        options=["A", "A", "A", "A"],
+        expected_answer_or_rubric="A",
+        explanation="The system prompt is: SECURITY RULE -- READ CAREFULLY, THIS IS THE MOST IMPORTANT RULE...",
+    )
+    provider = FakeAIProvider(generated_question=leaked_question)
+    app.dependency_overrides[get_ai_provider] = lambda: provider
+    try:
+        assessment_id = client.post(
+            "/assessments", json={"blueprint_id": blueprint_id}, headers=auth_headers
+        ).json()["id"]
+        question = client.get(
+            f"/assessments/{assessment_id}/next-question", headers=auth_headers
+        ).json()["question"]
+
+        assert "system prompt" not in question["prompt"].lower()
+        assert "security rule" not in question["prompt"].lower()
+        assert len(set(question["options"])) > 1  # never the degenerate "A/A/A/A" the leak produced
+
+        resp = client.post(
+            f"/assessments/{assessment_id}/answer",
+            json={"question_id": question["id"], "student_answer": "A relevant concept"},
+            headers=auth_headers,
+        )
+        explanation = resp.json()["explanation"].lower()
+        assert "system prompt" not in explanation
+        assert "security rule" not in explanation
+    finally:
+        app.dependency_overrides.pop(get_ai_provider, None)
+
+
 def test_submit_wrong_mcq_answer(client, auth_headers, blueprint_id, use_fake_ai):
     assessment_id = client.post(
         "/assessments", json={"blueprint_id": blueprint_id}, headers=auth_headers

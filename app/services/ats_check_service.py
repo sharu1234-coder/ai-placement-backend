@@ -23,6 +23,10 @@ from app.storage.provider import StorageError, StorageProvider
 
 logger = logging.getLogger(__name__)
 
+# Safety cap, not a product pagination feature (disclosed gap -- see assessment_service.py's
+# _MAX_HISTORY_ROWS for the full rationale): protects response size for a long-lived account.
+_MAX_HISTORY_ROWS = 200
+
 _PROMPT_PATH = Path(__file__).resolve().parent.parent / "ai" / "prompts" / "resume_ats_check_v1.txt"
 
 
@@ -179,6 +183,7 @@ def list_ats_checks(db: Session, profile_id: int) -> List[AtsCheckListItemRead]:
         .join(Resume, Resume.id == ResumeAtsCheck.resume_id)
         .filter(ResumeAtsCheck.profile_id == profile_id)
         .order_by(ResumeAtsCheck.id.desc())
+        .limit(_MAX_HISTORY_ROWS)
         .all()
     )
     return [

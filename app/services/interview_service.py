@@ -24,10 +24,14 @@ from app.schemas.interview import (
 )
 from app.services.skill_matching import NoResumeAnalysisError, latest_resume_skills
 
-_QUESTION_PROMPT_PATH = Path(__file__).resolve().parent.parent / "ai" / "prompts" / "interview_question_v2.txt"
-_EVALUATION_PROMPT_PATH = Path(__file__).resolve().parent.parent / "ai" / "prompts" / "interview_evaluation_v2.txt"
+_QUESTION_PROMPT_PATH = Path(__file__).resolve().parent.parent / "ai" / "prompts" / "interview_question_v3.txt"
+_EVALUATION_PROMPT_PATH = Path(__file__).resolve().parent.parent / "ai" / "prompts" / "interview_evaluation_v3.txt"
 
 _QUESTIONS_PER_INTERVIEW = 5
+
+# Safety cap, not a product pagination feature (disclosed gap -- see assessment_service.py's
+# _MAX_HISTORY_ROWS for the full rationale): protects response size for a long-lived account.
+_MAX_HISTORY_ROWS = 200
 
 # Deterministic, non-AI (matches the codebase's "our own gap engine" philosophy). Computed
 # from the transcript text alone -- speaking_pace would need audio duration, which isn't
@@ -103,6 +107,7 @@ def list_interviews(db: Session, profile_id: int) -> List[InterviewHistoryItem]:
         db.query(Interview)
         .filter(Interview.profile_id == profile_id)
         .order_by(Interview.created_at.desc())
+        .limit(_MAX_HISTORY_ROWS)
         .all()
     )
     interview_ids = [i.id for i in interviews]

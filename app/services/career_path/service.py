@@ -49,6 +49,10 @@ PRACTICE_QUESTION_COUNT = 3
 _BLUEPRINT_SOURCE = "career_path"
 _GENERIC_ASSESSMENT_TYPE = "technical"
 
+# Safety cap, not a product pagination feature (disclosed gap -- see assessment_service.py's
+# _MAX_HISTORY_ROWS for the full rationale): protects response size for a long-lived account.
+_MAX_SAVED_PATHS = 200
+
 _INTERVIEW_CATEGORIES = ["technical", "hr", "project", "behavioral", "role_specific"]
 _INTERVIEW_DIMENSION_FIELDS = [
     "technical_correctness",
@@ -688,7 +692,13 @@ def get_current(db: Session, profile_id: int) -> Optional[CareerPathRead]:
 
 
 def list_all(db: Session, profile_id: int) -> List[CareerPathSummaryRead]:
-    paths = db.query(CareerPath).filter(CareerPath.profile_id == profile_id).order_by(CareerPath.updated_at.desc()).all()
+    paths = (
+        db.query(CareerPath)
+        .filter(CareerPath.profile_id == profile_id)
+        .order_by(CareerPath.updated_at.desc())
+        .limit(_MAX_SAVED_PATHS)
+        .all()
+    )
     return [_to_summary_read(db, p) for p in paths]
 
 

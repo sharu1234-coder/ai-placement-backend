@@ -52,3 +52,29 @@ def test_network_error_raises_ai_generation_error(monkeypatch):
     provider = OllamaProvider(base_url="http://fake", model="fake-model")
     with pytest.raises(AIGenerationError):
         provider.generate_text("hello")
+
+
+def test_unexpected_response_shape_raises_ai_generation_error_not_key_error(monkeypatch):
+    """Real bug, found via reproduction: a 200 response missing the expected "response" key
+    (e.g. Ollama returning {"error": "model not found"} instead) previously raised a bare
+    KeyError, bypassing every `except AIGenerationError` handler in the API layer and
+    surfacing as an unhandled 500 instead of the intended, caught error path."""
+    monkeypatch.setattr(
+        httpx, "post",
+        lambda *a, **k: httpx.Response(
+            status_code=200, json={"error": "model not found"}, request=httpx.Request("POST", "http://x")
+        ),
+    )
+    provider = OllamaProvider(base_url="http://fake", model="fake-model")
+    with pytest.raises(AIGenerationError):
+        provider.generate_text("hello")
+
+
+def test_non_json_response_body_raises_ai_generation_error_not_json_decode_error(monkeypatch):
+    monkeypatch.setattr(
+        httpx, "post",
+        lambda *a, **k: httpx.Response(status_code=200, content=b"not json at all", request=httpx.Request("POST", "http://x")),
+    )
+    provider = OllamaProvider(base_url="http://fake", model="fake-model")
+    with pytest.raises(AIGenerationError):
+        provider.generate_text("hello")

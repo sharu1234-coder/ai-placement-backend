@@ -1,9 +1,11 @@
+import logging
 import random
 from pathlib import Path
 from typing import List, Optional
 
 from sqlalchemy.orm import Session
 
+from app.ai.output_guard import looks_like_prompt_leak
 from app.ai.provider import AIGenerationError, AIProvider
 from app.ai.schemas.assessment import GeneratedQuestion
 from app.models.placement_alarm_challenge import PlacementAlarmChallenge
@@ -12,11 +14,33 @@ from app.models.question import Question
 from app.schemas.placement_alarm import ChallengeAnswerResult, ChallengeQuestionRead, ChallengeStateRead
 from app.services.skill_matching import NoResumeAnalysisError, is_placement_topic, latest_resume_skills
 
-_PROMPT_PATH = Path(__file__).resolve().parent.parent / "ai" / "prompts" / "alarm_mcq_generator_v1.txt"
+_PROMPT_PATH = Path(__file__).resolve().parent.parent / "ai" / "prompts" / "alarm_mcq_generator_v2.txt"
 
 # Fixed product rule -- never a user setting, never overridden. The alarm always presents
 # exactly this many questions regardless of how many distinct skills the student has.
 REQUIRED_QUESTIONS = 6
+
+logger = logging.getLogger(__name__)
+
+
+def _sanitize_generated_question(generated: GeneratedQuestion, skill: str) -> GeneratedQuestion:
+    """Code-level backstop -- see app/ai/output_guard.py's module docstring. Mirrors
+    assessment_run_service._sanitize_generated_question (kept as separate, independent code
+    per this feature's own module, not a shared call, matching this codebase's existing
+    per-feature duplication pattern for this class of prompt/service pairing)."""
+    if looks_like_prompt_leak(generated.prompt) or looks_like_prompt_leak(generated.explanation):
+        logger.warning(
+            "Discarding a generated alarm question for skill=%r: output contained prompt-leak markers.",
+            skill,
+        )
+        return GeneratedQuestion(
+            type="mcq",
+            prompt=f"Which of the following best relates to {skill!r}?",
+            options=["A relevant concept", "An unrelated concept", "A different unrelated concept", "None of these"],
+            expected_answer_or_rubric="A relevant concept",
+            explanation="This question checks general understanding of the topic.",
+        )
+    return generated
 
 
 class ChallengeNotFoundError(Exception):
@@ -174,6 +198,7 @@ def start_challenge(
         for index, skill_tag in enumerate(skills):
             prompt = _build_question_prompt(skill_tag)
             generated: GeneratedQuestion = ai_provider.generate_structured(prompt, GeneratedQuestion)
+            generated = _sanitize_generated_question(generated, skill_tag)
             question = Question(
                 skill_tag=skill_tag,
                 type="mcq",  # forced regardless of what the AI returned -- MCQ-only, by design
