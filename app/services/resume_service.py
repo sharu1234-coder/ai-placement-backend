@@ -15,7 +15,7 @@ from app.storage.provider import StorageProvider
 
 logger = logging.getLogger(__name__)
 
-_PROMPT_PATH = Path(__file__).resolve().parent.parent / "ai" / "prompts" / "resume_parser_v1.txt"
+_PROMPT_PATH = Path(__file__).resolve().parent.parent / "ai" / "prompts" / "resume_parser_v2.txt"
 
 
 class ResumeProcessingError(Exception):

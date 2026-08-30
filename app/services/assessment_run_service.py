@@ -21,7 +21,7 @@ from app.schemas.assessment import (
 )
 
 _QUESTION_PROMPT_PATH = Path(__file__).resolve().parent.parent / "ai" / "prompts" / "question_generator_v1.txt"
-_GRADER_PROMPT_PATH = Path(__file__).resolve().parent.parent / "ai" / "prompts" / "answer_grader_v1.txt"
+_GRADER_PROMPT_PATH = Path(__file__).resolve().parent.parent / "ai" / "prompts" / "answer_grader_v2.txt"
 
 _DIFFICULTIES = ["easy", "medium", "hard"]
 _WEAKNESS_THRESHOLD = 0.6

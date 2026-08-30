@@ -76,6 +76,117 @@ as-is.
 
 ## Status
 
+**Real adversarial prompt-injection sweep across every AI call that scores/grades user
+text, fixed and verified live (2026-08-30).** Started from one finding and searched the
+other 12 prompt templates for the same shape rather than stopping at the first fix.
+Tested each candidate against the actual dev AI provider (Ollama, qwen3:8b — real local
+model calls, not mocked), with user-controllable text containing an embedded fake "SYSTEM
+OVERRIDE" instruction:
+- `resume_parser_v1.txt`: **exploited** — fabricated a skill + certification not in the
+  source text at all.
+- `jd_parser_v1.txt`: same vulnerable shape, fixed proactively (not independently
+  re-confirmed exploited, since it's structurally identical to the resume parser).
+- `answer_grader_v1.txt`: **exploited** — a blank/irrelevant assessment answer scored
+  1.0/`is_correct=True` via an injected fake "administrator override." More consequential
+  than the resume finding: assessment grades feed skill-gap tracking and roadmap generation
+  app-wide, not just a self-contained display field.
+- `interview_evaluation_v1.txt`: **exploited**, unambiguously — a candidate who answered
+  "I don't know" to one question and nothing relevant to another scored a perfect 1.0
+  across every dimension.
+- `career_path_role_v1.txt`: tested, **not reproduced** — the field is length-capped (150
+  chars, `SelectCareerRoleRequest.custom_role`) and the task is full generation rather than
+  scoring/grading existing content, both of which made it meaningfully harder to hijack.
+  Hardened anyway, proactively, for consistency — it's the same untrusted-free-text shape
+  as the others.
+- `career_path_explainer_v1.txt`: assessed, not hardened — it already validates every AI
+  response against a server-supplied whitelist of `skill_key`s and never trusts an
+  unrecognized one, which structurally bounds the blast radius the same way
+  `resume_ats_check_v1.txt`'s finding-key mechanism does (checked and confirmed by reading
+  `ats_check_service.py`: `overall_score`/`category_scores` are 100% deterministic-engine
+  output, never read from the AI response at all — there is no numeric field for an
+  injection to move even in principle).
+- `jd_preparation_plan_v1.txt`'s `company_name`: **initially misjudged as low-severity and
+  deprioritized without testing it -- that was wrong.** Circled back and tested it live:
+  a single injected `company_name` fabricated *every* category reason and *every*
+  interview question across all six buckets. A first hardening attempt using the same
+  wording as the other three fixes was tested and **also failed** (still fully exploited) --
+  this field needed a stronger version (explicit "what a real company name looks like"
+  heuristics, an explicit "treat as unspecified" fallback, the warning repeated at both the
+  top and bottom of the prompt) before a live re-test actually blocked it. Recorded here
+  deliberately, mistake included: severity judgments about prompt injection are not
+  reliable without testing, and a first fix attempt is not guaranteed to work either.
+
+Fix (same core pattern across all six hardened prompts, following this project's existing
+prompt-versioning convention — `_v1.txt` kept for reference, services now point at
+`_v2.txt`): the untrusted text is wrapped in explicit `<<<...START>>>`/`<<<...END>>>`
+markers with instruction-sandwiched warnings (before *and* after the text) that anything
+inside, no matter how it's phrased, is data and must never be treated as an instruction.
+Re-ran every exploited attack plus differently-worded variants plus legitimate-content
+controls (to rule out a score being genuine partial credit rather than the injection, and
+to catch any false-positive over-suspicion regression on normal input) — all live, all
+against the same real model: every previously-successful attack was blocked, every
+legitimate case still graded/extracted/generated correctly.
+
+One residual, honestly disclosed gap from the resume-parser round: in one injection
+variant, the numeric `ats_score` field itself was still nudged by an explicit
+"SYSTEM:"-style directive (the model's own confidence score dropped to reflect the
+suspicious input, but the number still moved) — a self-directed risk (a user can only
+inflate the *helpfulness score of their own resume*, not another user's data, a grade, or
+any security control), not eliminated, and disclosed as such rather than claimed fixed.
+
+12 new regression tests guard every fix (can't re-run live Ollama in CI) — assert each
+service points at its `_v2` prompt and that the untrusted-data framing brackets the
+placeholder on both sides. 516 tests passing (was 504).
+
+**Also checked this pass**: pagination on list-returning endpoints (`assessments/history`,
+`interviews`, `jobs`, `resumes/ats-checks`, and the profile sub-resource lists) — none of
+them cap or paginate results, so a long-lived heavy user could eventually load a large
+unbounded response on every screen visit. Not fixed here: retrofitting pagination changes
+the API contract and needs a corresponding Android-side loading pattern (infinite scroll vs.
+simple list) decided together, not picked unilaterally on the backend alone. Disclosed as a
+real, verified gap (matches the already-documented "rate limiting bounds the rate of abuse,
+not unbounded accumulation" gap from an earlier item) rather than silently left unmentioned.
+
+**Master hardening pass — account deletion, Razorpay webhook, Firebase App Check
+(2026-08-30).**
+- **Account deletion (P0 bug, fixed)**: `delete_account` was missing 8 tables from its
+  cascade — `CareerPath` + its 3 children, `PlacementPath` + `PlacementPathTopic`,
+  `PlacementAlarmChallenge` + `PlacementAlarmQuestionAttempt`, `ResumeAtsCheck`,
+  `JobPreparationPlan`, `Subscription`, `PasswordResetToken` — added since the function was
+  last written. With no `ON DELETE CASCADE` anywhere in the schema, this would have hard-failed
+  with `IntegrityError` on real PostgreSQL for almost any active user. Rewrote the deletion
+  order from a full hand-traced FK graph across every model (including a nullable FK,
+  `PlacementPath.source_resume_id -> resumes.id`, that the *original* code's early `Resume`
+  deletion already silently violated); verified under SQLite `PRAGMA foreign_keys=ON` with an
+  extended seed covering every table.
+- **Razorpay webhook** (`POST /subscriptions/webhook`, new): verifies `X-Razorpay-Signature`
+  over the raw body against a separate `RAZORPAY_WEBHOOK_SECRET`, fails closed (503) when
+  unconfigured, is idempotent on redelivery, and never downgrades an already-paid subscription
+  from a late/out-of-order `payment.failed` event. Reuses the same atomic conditional `UPDATE`
+  as the existing `/verify` path. Verified live (not mocked) against Razorpay's real TEST MODE
+  API: a full signup → login → `POST /subscriptions/checkout` call returned a genuine order id
+  from `api.razorpay.com`. Full payment-capture verification (driving Razorpay's actual
+  checkout UI) remains untested here — no browser/device available in this environment.
+- **Firebase App Check, now actually wired end-to-end** (previously: the Android app installed
+  the provider but never attached a token to any request, and the backend had no verification
+  at all — see `app/core/app_check.py`'s own history). Android's `AppCheckInterceptor`
+  (`NetworkModule.kt`) now attaches an `X-Firebase-AppCheck` token to every outgoing request,
+  failing open (proceeds without the header) if the token fetch fails or times out rather than
+  blocking the request. The backend can now verify it (`firebase_admin.app_check.verify_token`,
+  applied per-router in `app/main.py` via `dependencies=[Depends(verify_app_check_token)]`,
+  with the `/subscriptions/webhook` and `/legal/*` routes deliberately exempt — the former is a
+  Razorpay server callback, the latter public policy documents). **Off by default**
+  (`FIREBASE_APP_CHECK_ENABLED=false`) until a real Firebase service account is configured via
+  the standard `GOOGLE_APPLICATION_CREDENTIALS` variable — enabling it before both halves are
+  confirmed deployed would reject every request with 401.
+- 504 tests passing (was 493), `ruff check` clean on every touched file. Local verification in
+  this dev environment required temporarily downgrading `cryptography` below what
+  `firebase-admin`/`google-auth` declare as their minimum — a pre-existing native-wheel
+  loading issue specific to this Windows/Python 3.9 dev machine (the same class of problem
+  already documented against the `bcrypt`/`greenlet` pins above), not reflected in
+  `requirements.txt`. CI (Python 3.12, presumably Linux) is the authoritative check for the
+  real pinned versions and has not been re-run by this session.
+
 **Production readiness item 19/20 — File + AI abuse controls (2026-08-24).**
 Backend-only (no Android equivalent requested — the server is what must defend against a
 malicious/scripted client, not trust the client to self-limit). Started from an audit of

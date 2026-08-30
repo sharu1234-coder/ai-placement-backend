@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_db
+from app.core.app_check import verify_app_check_token
 from app.core.config import settings
 from app.core.rate_limit import limiter
 from app.models.user import User
@@ -23,8 +24,13 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/subscriptions", tags=["subscriptions"])
 
+# Every route below except /webhook (a Razorpay server-to-server callback -- see its own
+# docstring) gets this -- applied per-route rather than at include_router() in app/main.py
+# specifically so the webhook is never accidentally covered by a future router-level change.
+_app_check_dep = [Depends(verify_app_check_token)]
 
-@router.get("/plans", response_model=List[PlanRead])
+
+@router.get("/plans", response_model=List[PlanRead], dependencies=_app_check_dep)
 def get_plans() -> List[PlanRead]:
     """The server-authoritative plan catalog -- the ONLY place prices are defined. The
     Subscriptions screen renders this response directly rather than a hardcoded price list."""
@@ -34,7 +40,7 @@ def get_plans() -> List[PlanRead]:
     ]
 
 
-@router.get("/status", response_model=SubscriptionStatusRead)
+@router.get("/status", response_model=SubscriptionStatusRead, dependencies=_app_check_dep)
 def get_status(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -43,7 +49,7 @@ def get_status(
     return SubscriptionStatusRead(**subscription_service.get_status(db, profile.id))
 
 
-@router.post("/checkout", response_model=CheckoutResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/checkout", response_model=CheckoutResponse, status_code=status.HTTP_201_CREATED, dependencies=_app_check_dep)
 @limiter.limit("10/hour")
 def create_checkout(
     request: Request,
@@ -73,7 +79,7 @@ def create_checkout(
     )
 
 
-@router.post("/verify", response_model=SubscriptionStatusRead)
+@router.post("/verify", response_model=SubscriptionStatusRead, dependencies=_app_check_dep)
 @limiter.limit("20/hour")
 def verify_payment(
     request: Request,

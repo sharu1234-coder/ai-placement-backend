@@ -37,9 +37,9 @@ class JobDescriptionInUseError(Exception):
     """Raised when trying to delete a JD that an AssessmentBlueprint or Interview still
     references -- deleting it would leave those with a dangling jd_id."""
 
-_PROMPT_PATH = Path(__file__).resolve().parent.parent / "ai" / "prompts" / "jd_parser_v1.txt"
+_PROMPT_PATH = Path(__file__).resolve().parent.parent / "ai" / "prompts" / "jd_parser_v2.txt"
 _PREP_PLAN_PROMPT_PATH = (
-    Path(__file__).resolve().parent.parent / "ai" / "prompts" / "jd_preparation_plan_v1.txt"
+    Path(__file__).resolve().parent.parent / "ai" / "prompts" / "jd_preparation_plan_v2.txt"
 )
 
 # Always-relevant preparation categories for this app's campus-placement domain -- matches

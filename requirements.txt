@@ -2,7 +2,9 @@ fastapi==0.115.6
 uvicorn[standard]==0.34.0
 pydantic==2.10.5
 pydantic-settings==2.7.1
-python-dotenv==1.0.1
+# 1.2.1: bumped from 1.0.1 (PYSEC-2026-2270). The advisory's suggested fix (1.2.2) isn't a
+# published release yet -- 1.2.1 is the latest available.
+python-dotenv==1.2.1
 email-validator==2.2.0
 
 sqlalchemy==2.0.36
@@ -10,8 +12,13 @@ greenlet==3.0.3  # pinned: newer greenlet has no prebuilt wheel for this Python,
 alembic==1.14.0
 psycopg2-binary==2.9.10  # production Postgres driver; SQLite (stdlib) stays the dev default
 bcrypt==4.0.1  # pinned: 4.2.1 fails to import its native extension on this Windows/Python build
-pyjwt==2.10.1
+pyjwt==2.13.0  # bumped from 2.10.1 (PYSEC-2026-120/175/176/177/178/179, PYSEC-2025-183) --
+# verified via the full suite (jwt.encode/decode exercised heavily by app/core/security.py,
+# app/api/deps.py, and every auth/password-reset test), no behavior change observed.
 PyMuPDF==1.24.14
+# 0.0.20 is the latest python-multipart release on PyPI as of this pin -- pip-audit flags
+# several PYSEC-2026-* advisories against it with suggested fixes (0.0.22/0.0.26/.../0.0.31)
+# that don't exist as real releases yet. Nothing to bump to; re-check when a fix ships.
 python-multipart==0.0.20
 
 # Voice (Stage 10) -- dev-only local STT/TTS for OllamaProvider. Swap for a cloud provider
@@ -34,3 +41,8 @@ httpx==0.28.1
 # Rate limiting / brute-force protection (auth endpoints) -- in-memory storage by default, no
 # Redis/other paid infra needed. See app/core/rate_limit.py.
 slowapi==0.1.10
+
+# Firebase App Check backend verification (see app/core/app_check.py) -- off by default
+# (FIREBASE_APP_CHECK_ENABLED=false) until a real service account is configured, so this
+# dependency existing does not by itself change any request's behavior.
+firebase-admin==6.9.0

@@ -10,7 +10,7 @@ from app.database.base import Base
 class ResumeAtsCheck(Base):
     """A saved, point-in-time ATS readiness check -- JSON-blob-per-row like
     JobPreparationPlan, never mutated after creation. Deliberately NOT merged into
-    ResumeAnalysis: ResumeAnalysis.ats_score is AI-derived (from resume_parser_v1.txt) and
+    ResumeAnalysis: ResumeAnalysis.ats_score is AI-derived (from resume_parser_v2.txt) and
     1:1 with a Resume, so it can neither hold a deterministic score nor a history of
     multiple re-checks of the same resume. This table is 1:many with Resume by design."""
 

@@ -25,7 +25,7 @@ from app.schemas.interview import (
 from app.services.skill_matching import NoResumeAnalysisError, latest_resume_skills
 
 _QUESTION_PROMPT_PATH = Path(__file__).resolve().parent.parent / "ai" / "prompts" / "interview_question_v2.txt"
-_EVALUATION_PROMPT_PATH = Path(__file__).resolve().parent.parent / "ai" / "prompts" / "interview_evaluation_v1.txt"
+_EVALUATION_PROMPT_PATH = Path(__file__).resolve().parent.parent / "ai" / "prompts" / "interview_evaluation_v2.txt"
 
 _QUESTIONS_PER_INTERVIEW = 5
 

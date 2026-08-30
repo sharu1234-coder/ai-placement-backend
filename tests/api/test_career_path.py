@@ -13,7 +13,7 @@ from app.main import app
 
 class FakeAIProvider(AIProvider):
     """Branches on schema, mirroring test_placement_path.py's precedent: skill explanations
-    are requested for every generation, and a role-definition call (career_path_role_v1) is
+    are requested for every generation, and a role-definition call (career_path_role_v2) is
     additionally triggered whenever the selected role isn't in the curated catalog."""
 
     def __init__(self, fail: bool = False):

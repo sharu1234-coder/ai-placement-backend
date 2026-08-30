@@ -26,6 +26,7 @@ from app.api.resumes import router as resumes_router
 from app.api.roadmap import router as roadmap_router
 from app.api.subscriptions import router as subscriptions_router
 from app.api.users import router as users_router
+from app.core.app_check import verify_app_check_token
 from app.core.body_size_limit import MaxBodySizeMiddleware
 from app.core.config import settings, validate_for_production
 from app.core.logging import configure_logging
@@ -65,18 +66,29 @@ app.add_middleware(HSTSMiddleware)
 app.add_middleware(RequestObservabilityMiddleware)
 
 
-app.include_router(auth_router)
-app.include_router(users_router)
-app.include_router(resumes_router)
-app.include_router(jobs_router)
-app.include_router(assessments_router)
-app.include_router(interviews_router)
-app.include_router(roadmap_router)
-app.include_router(progress_router)
+# App Check is verified once here for every route on these routers (rather than repeated
+# per-route) so a new endpoint added to an already-covered router is protected automatically.
+# legal_router is deliberately excluded -- its two GET routes are public policy documents
+# (no get_current_user either), meant to be readable from a plain browser link, not just the
+# real Android app. See app/core/app_check.py: a no-op today (FIREBASE_APP_CHECK_ENABLED
+# defaults to false) until a real Firebase service account is configured.
+_app_check_dep = [Depends(verify_app_check_token)]
+app.include_router(auth_router, dependencies=_app_check_dep)
+app.include_router(users_router, dependencies=_app_check_dep)
+app.include_router(resumes_router, dependencies=_app_check_dep)
+app.include_router(jobs_router, dependencies=_app_check_dep)
+app.include_router(assessments_router, dependencies=_app_check_dep)
+app.include_router(interviews_router, dependencies=_app_check_dep)
+app.include_router(roadmap_router, dependencies=_app_check_dep)
+app.include_router(progress_router, dependencies=_app_check_dep)
 app.include_router(legal_router)
-app.include_router(placement_alarm_router)
-app.include_router(placement_path_router)
-app.include_router(career_path_router)
+app.include_router(placement_alarm_router, dependencies=_app_check_dep)
+app.include_router(placement_path_router, dependencies=_app_check_dep)
+app.include_router(career_path_router, dependencies=_app_check_dep)
+# NOT router-level here: subscriptions_router also owns POST /subscriptions/webhook, called
+# by Razorpay's own servers (never the Android app), which will never carry an
+# X-Firebase-AppCheck header -- see the per-route dependency on every other route in
+# app/api/subscriptions.py instead.
 app.include_router(subscriptions_router)
 
 

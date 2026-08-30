@@ -95,6 +95,17 @@ class Settings(BaseSettings):
     # needs --proxy-headers when run behind one of those.
     allowed_hosts: str = "*"
 
+    # Off by default so enabling Firebase Admin never breaks an existing deployment that
+    # hasn't set up a service account yet -- see app/core/app_check.py. When true, every
+    # request (except the public /health*, /legal/* routes) must carry a valid
+    # X-Firebase-AppCheck token (see NetworkModule.kt's AppCheckInterceptor on the Android
+    # side) or is rejected with 401. Verification itself uses Google Application Default
+    # Credentials (the standard GOOGLE_APPLICATION_CREDENTIALS env var pointing at a Firebase
+    # service account JSON) -- there is no separate settings field for it, since that's
+    # already how every other Google/Firebase client library in this ecosystem picks up
+    # credentials, and duplicating it here would just be another place it could drift.
+    firebase_app_check_enabled: bool = False
+
 
 settings = Settings()
 
