@@ -8,6 +8,10 @@ from app.database.base import Base
 from app.models.assessment import Assessment
 from app.models.assessment_blueprint import AssessmentBlueprint
 from app.models.assessment_result import AssessmentResult
+from app.models.career_path import CareerPath
+from app.models.career_path_phase import CareerPathPhase
+from app.models.career_path_project import CareerPathProject
+from app.models.career_path_skill_item import CareerPathSkillItem
 from app.models.certification import Certification
 from app.models.education import Education
 from app.models.experience import Experience
@@ -17,6 +21,12 @@ from app.models.interview_evaluation import InterviewEvaluation
 from app.models.interview_question import InterviewQuestion
 from app.models.job_description import JobDescription
 from app.models.job_match import JobMatch
+from app.models.job_preparation_plan import JobPreparationPlan
+from app.models.password_reset_token import PasswordResetToken
+from app.models.placement_alarm_challenge import PlacementAlarmChallenge
+from app.models.placement_alarm_question_attempt import PlacementAlarmQuestionAttempt
+from app.models.placement_path import PlacementPath
+from app.models.placement_path_topic import PlacementPathTopic
 from app.models.profile import StudentProfile
 from app.models.project import Project
 from app.models.question import Question
@@ -24,10 +34,12 @@ from app.models.question_attempt import QuestionAttempt
 from app.models.requirement import Requirement
 from app.models.resume import Resume
 from app.models.resume_analysis import ResumeAnalysis
+from app.models.resume_ats_check import ResumeAtsCheck
 from app.models.roadmap import Roadmap
 from app.models.roadmap_task import RoadmapTask
 from app.models.skill import Skill
 from app.models.skill_gap import SkillGap
+from app.models.subscription import Subscription
 from app.models.user import User
 from app.services.account_service import delete_account
 from app.storage.provider import StorageProvider
@@ -192,6 +204,67 @@ def _seed_full_account(db, email: str):
         )
     )
 
+    db.add(JobPreparationPlan(
+        jd_id=jd.id, profile_id=profile.id, job_summary={}, required_skills=[],
+        preparation_gaps=[], preparation_plan=[], interview_prep=[],
+    ))
+
+    db.add(ResumeAtsCheck(
+        resume_id=resume.id, profile_id=profile.id, overall_score=80, score_category="good",
+        parsing_score=80, structure_score=80, content_score=80, skills_score=80,
+        experience_score=80, projects_score=80, contact_score=80, readability_score=80,
+        category_breakdown=[], section_analysis=[], issues=[], recommendations=[],
+        ai_summary="Looks solid.",
+    ))
+
+    # Career Path family -- phase/skill-item/project each reference career_path_id;
+    # skill_item additionally references the SAME blueprint created above (nullable), so this
+    # exercises the exact ordering the account-deletion fix depends on.
+    career_path = CareerPath(
+        profile_id=profile.id, role_family_key="data_analyst", display_role_name="Data Analyst",
+        role_overview={},
+    )
+    db.add(career_path)
+    db.commit()
+    db.refresh(career_path)
+    db.add(CareerPathPhase(career_path_id=career_path.id, phase_key="foundations", order_index=0, title="Foundations"))
+    db.add(CareerPathSkillItem(
+        career_path_id=career_path.id, phase_key="foundations", skill_key="sql", title="SQL",
+        order_index=0, practice_blueprint_id=blueprint.id,
+    ))
+    db.add(CareerPathProject(
+        career_path_id=career_path.id, project_key="dashboard", title="Sales Dashboard",
+        skills_demonstrated=["SQL"], technologies=["Power BI"], order_index=0,
+    ))
+
+    # Placement Path (Roadmap's topic-tree sibling, NOT the Roadmap seeded above) -- its
+    # nullable source_resume_id points at the SAME resume created earlier, which is exactly
+    # the ordering the account-deletion fix depends on (placement_paths before resumes).
+    placement_path = PlacementPath(profile_id=profile.id, source_resume_id=resume.id)
+    db.add(placement_path)
+    db.commit()
+    db.refresh(placement_path)
+    db.add(PlacementPathTopic(
+        path_id=placement_path.id, stage="foundation", track_key="sql", topic_key="sql_joins",
+        order_in_track=0, title="SQL Joins", skill_tag="SQL", practice_blueprint_id=blueprint.id,
+    ))
+
+    challenge = PlacementAlarmChallenge(profile_id=profile.id, client_alarm_id="alarm-1")
+    db.add(challenge)
+    db.commit()
+    db.refresh(challenge)
+    db.add(PlacementAlarmQuestionAttempt(challenge_id=challenge.id, question_id=question.id, question_index=0))
+
+    db.add(Subscription(
+        profile_id=profile.id, plan="1_month", amount_paise=19_900, currency="INR",
+        razorpay_order_id=f"order_{profile.id}",
+    ))
+
+    db.add(PasswordResetToken(
+        user_id=user.id, token_hash="deadbeef",
+        expires_at=datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=15),
+    ))
+
     db.commit()
     return user, profile, resume, question
 
@@ -226,6 +299,18 @@ def test_delete_account_removes_every_owned_row(db_session):
     assert db_session.query(InterviewEvaluation).count() == 0
     assert db_session.query(Roadmap).count() == 0
     assert db_session.query(RoadmapTask).count() == 0
+    assert db_session.query(JobPreparationPlan).count() == 0
+    assert db_session.query(ResumeAtsCheck).count() == 0
+    assert db_session.query(CareerPath).count() == 0
+    assert db_session.query(CareerPathPhase).count() == 0
+    assert db_session.query(CareerPathSkillItem).count() == 0
+    assert db_session.query(CareerPathProject).count() == 0
+    assert db_session.query(PlacementPath).count() == 0
+    assert db_session.query(PlacementPathTopic).count() == 0
+    assert db_session.query(PlacementAlarmChallenge).count() == 0
+    assert db_session.query(PlacementAlarmQuestionAttempt).count() == 0
+    assert db_session.query(Subscription).count() == 0
+    assert db_session.query(PasswordResetToken).count() == 0
 
     # The global question bank is shared across all users -- must never be touched.
     assert db_session.get(Question, question.id) is not None

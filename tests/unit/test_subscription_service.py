@@ -228,3 +228,61 @@ class TestGetStatus:
 
         status = svc.get_status(db, PROFILE_ID)
         assert status == {"tier": "free", "status": "expired", "plan": None, "expires_at": None}
+
+
+class TestWebhook:
+    def test_verify_webhook_signature_matches_the_documented_hmac_formula(self):
+        body = b'{"event":"payment.captured"}'
+        expected = hmac.new(b"whsecret", body, hashlib.sha256).hexdigest()
+
+        assert svc.verify_webhook_signature(body, expected, "whsecret") is True
+        assert svc.verify_webhook_signature(body, "0" * 64, "whsecret") is False
+        assert svc.verify_webhook_signature(body, expected, "wrong-secret") is False
+
+    def test_activate_from_webhook_activates_premium(self, db, monkeypatch):
+        monkeypatch.setattr(httpx, "post", lambda *a, **k: _fake_order_response("order_wh_1"))
+        subscription = svc.create_order(db, PROFILE_ID, "1_month")
+
+        result = svc.activate_from_webhook(db, subscription.razorpay_order_id, "pay_wh_1")
+
+        assert result is not None
+        assert result.status == "paid"
+        assert result.razorpay_payment_id == "pay_wh_1"
+        assert svc.get_status(db, PROFILE_ID)["tier"] == "premium"
+
+    def test_activate_from_webhook_for_unknown_order_returns_none_without_raising(self, db):
+        result = svc.activate_from_webhook(db, "order_does_not_exist", "pay_x")
+        assert result is None
+
+    def test_activate_from_webhook_redelivery_is_idempotent(self, db, monkeypatch):
+        monkeypatch.setattr(httpx, "post", lambda *a, **k: _fake_order_response("order_wh_dup"))
+        subscription = svc.create_order(db, PROFILE_ID, "1_month")
+
+        first = svc.activate_from_webhook(db, subscription.razorpay_order_id, "pay_wh_dup")
+        second = svc.activate_from_webhook(db, subscription.razorpay_order_id, "pay_wh_dup")
+
+        assert first.expires_at == second.expires_at
+
+    def test_mark_failed_from_webhook_marks_a_pending_order_failed(self, db, monkeypatch):
+        monkeypatch.setattr(httpx, "post", lambda *a, **k: _fake_order_response("order_wh_fail"))
+        subscription = svc.create_order(db, PROFILE_ID, "1_month")
+
+        svc.mark_failed_from_webhook(db, subscription.razorpay_order_id)
+
+        db.refresh(subscription)
+        assert subscription.status == "failed"
+
+    def test_mark_failed_from_webhook_never_downgrades_an_already_paid_subscription(self, db, monkeypatch):
+        monkeypatch.setattr(httpx, "post", lambda *a, **k: _fake_order_response("order_wh_late"))
+        subscription = svc.create_order(db, PROFILE_ID, "1_month")
+        svc.activate_from_webhook(db, subscription.razorpay_order_id, "pay_wh_late")
+
+        # A late/out-of-order payment.failed for the same order, arriving after capture.
+        svc.mark_failed_from_webhook(db, subscription.razorpay_order_id)
+
+        db.refresh(subscription)
+        assert subscription.status == "paid"
+        assert svc.get_status(db, PROFILE_ID)["tier"] == "premium"
+
+    def test_mark_failed_from_webhook_for_unknown_order_does_nothing(self, db):
+        svc.mark_failed_from_webhook(db, "order_does_not_exist")  # must not raise

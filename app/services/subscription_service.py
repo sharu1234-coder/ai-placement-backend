@@ -180,21 +180,28 @@ def verify_payment(
         db.commit()
         raise SignatureVerificationError("Payment signature could not be verified.")
 
+    return _activate_paid(db, subscription, razorpay_payment_id)
+
+
+def _activate_paid(db: Session, subscription: Subscription, razorpay_payment_id: str) -> Subscription:
+    """Shared by verify_payment (checkout-callback path) and activate_from_webhook (webhook
+    path) -- both reach here only after establishing, by their own separate means, that this
+    exact payment is authentically Razorpay's. Renewing before the current subscription
+    lapses stacks the new duration on top of the remaining time rather than discarding it.
+
+    Atomic conditional UPDATE (not "load, mutate, commit"): closes the race where two
+    concurrent activations for the same order (a genuine duplicate callback/webhook redelivery
+    arriving twice at once, not just sequentially) both pass the "not yet paid" check above
+    before either commits. Only the request whose UPDATE actually flips a "created"/"failed"
+    row to "paid" proceeds to treat this as a fresh activation; the loser re-fetches and
+    returns the winner's already-committed row, exactly like the sequential idempotent-return
+    path above."""
     now = datetime.datetime.utcnow()
     plan_def = PLAN_CATALOG[subscription.plan]
-    # Renewing before the current subscription lapses stacks the new duration on top of the
-    # remaining time rather than discarding it -- base off whichever is later, the current
-    # active expiry or now.
-    current_active = _get_active_subscription(db, profile_id, now)
+    current_active = _get_active_subscription(db, subscription.profile_id, now)
     base = current_active.expires_at if current_active else now
     new_expires_at = base + datetime.timedelta(days=plan_def["duration_days"])
 
-    # Atomic conditional UPDATE (not "load, mutate, commit") -- closes the race where two
-    # concurrent requests for the same order (a genuine duplicate callback arriving twice at
-    # once, not just sequentially) both pass the "not yet paid" check above before either
-    # commits. Only the request whose UPDATE actually flips a "created"/"failed" row to "paid"
-    # proceeds to treat this as a fresh verification; the loser re-fetches and returns the
-    # winner's already-committed row, exactly like the sequential idempotent-return path above.
     try:
         db.execute(
             update(Subscription)
@@ -221,6 +228,53 @@ def verify_payment(
     # have computed near-identically.
     db.refresh(subscription)
     return subscription
+
+
+def verify_webhook_signature(raw_body: bytes, signature: str, webhook_secret: str) -> bool:
+    """X-Razorpay-Signature is HMAC-SHA256(raw request body, webhook secret), hex digest --
+    see https://razorpay.com/docs/webhooks/validate-test/. This is a SEPARATE secret from
+    RAZORPAY_KEY_SECRET, configured independently in the Razorpay dashboard's Webhooks
+    section. The signature MUST be computed over the exact raw bytes Razorpay sent -- a
+    re-serialized/re-parsed JSON body will not produce a matching signature even with
+    identical field values (key ordering/whitespace differ), which is why the caller must
+    pass `await request.body()` untouched, never a re-dumped dict."""
+    expected = hmac.new(webhook_secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, signature)
+
+
+def activate_from_webhook(db: Session, razorpay_order_id: str, razorpay_payment_id: str) -> Optional[Subscription]:
+    """Called only after the caller (the /webhook route) has already verified
+    X-Razorpay-Signature over the raw body -- this function does no signature checking of its
+    own; it trusts that the request's authenticity was already established. Unlike
+    verify_payment (scoped to one profile via the caller's JWT), a webhook carries no user
+    identity at all -- razorpay_order_id is the only lookup key, which is safe ONLY because
+    the signature check already proves this payload really came from Razorpay, not an
+    attacker guessing order ids. Returns None (not an error) for an order id this backend
+    has no record of -- a webhook for a stale/foreign/test-mode-mismatched order should never
+    5xx and trigger Razorpay's retry storm; it's simply logged and ignored."""
+    subscription = (
+        db.query(Subscription).populate_existing().filter(Subscription.razorpay_order_id == razorpay_order_id).first()
+    )
+    if subscription is None:
+        logger.warning("Razorpay webhook for unknown order_id=%s -- no matching subscription.", razorpay_order_id)
+        return None
+    if subscription.status == "paid":
+        return subscription
+    return _activate_paid(db, subscription, razorpay_payment_id)
+
+
+def mark_failed_from_webhook(db: Session, razorpay_order_id: str) -> None:
+    """A payment.failed webhook. Never downgrades a subscription that's already "paid" --
+    webhook delivery order isn't guaranteed, so a late/out-of-order failure event for a
+    payment that a subsequent capture already activated must not revoke real, already-granted
+    premium access."""
+    subscription = (
+        db.query(Subscription).populate_existing().filter(Subscription.razorpay_order_id == razorpay_order_id).first()
+    )
+    if subscription is None or subscription.status == "paid":
+        return
+    subscription.status = "failed"
+    db.commit()
 
 
 def get_status(db: Session, profile_id: int) -> dict:

@@ -80,6 +80,11 @@ class Settings(BaseSettings):
     # from an API response (see /subscriptions/checkout).
     razorpay_key_id: Optional[str] = None
     razorpay_key_secret: Optional[str] = None
+    # Separate from razorpay_key_secret above -- configured independently in the Razorpay
+    # dashboard's Webhooks section, used only to verify X-Razorpay-Signature on inbound
+    # webhook calls (see app/api/subscriptions.py's /webhook route). None means the webhook
+    # route fails closed (503) rather than processing unauthenticated payloads.
+    razorpay_webhook_secret: Optional[str] = None
 
     # Comma-separated Host header allowlist (TrustedHostMiddleware, app/main.py). "*" (dev
     # default) accepts any Host -- fine locally, but a production deployment should set

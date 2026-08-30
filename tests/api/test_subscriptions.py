@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import json
 
 import httpx
 import pytest
@@ -26,6 +27,17 @@ def other_auth_headers(client):
 def razorpay_keys(monkeypatch):
     monkeypatch.setattr(settings, "razorpay_key_id", "rzp_test_fake_key_id")
     monkeypatch.setattr(settings, "razorpay_key_secret", "fake_test_secret")
+    monkeypatch.setattr(settings, "razorpay_webhook_secret", "fake_webhook_secret")
+
+
+def _webhook_body(event: str, order_id: str, payment_id: str) -> bytes:
+    return json.dumps(
+        {"event": event, "payload": {"payment": {"entity": {"id": payment_id, "order_id": order_id}}}}
+    ).encode("utf-8")
+
+
+def _webhook_signature(raw_body: bytes) -> str:
+    return hmac.new(settings.razorpay_webhook_secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
 
 
 def _fake_order(monkeypatch, order_id: str):
@@ -159,3 +171,102 @@ def test_another_users_order_cannot_be_verified_by_a_different_account(client, a
 
     victim_status = client.get("/subscriptions/status", headers=auth_headers)
     assert victim_status.json()["tier"] == "free"
+
+
+def test_webhook_with_valid_signature_activates_premium(client, auth_headers, monkeypatch):
+    _fake_order(monkeypatch, "order_hook_1")
+    checkout = client.post("/subscriptions/checkout", json={"plan": "1_month"}, headers=auth_headers).json()
+
+    body = _webhook_body("payment.captured", checkout["razorpay_order_id"], "pay_hook_1")
+    response = client.post(
+        "/subscriptions/webhook",
+        content=body,
+        headers={"X-Razorpay-Signature": _webhook_signature(body), "Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 200
+    status = client.get("/subscriptions/status", headers=auth_headers)
+    assert status.json()["tier"] == "premium"
+
+
+def test_webhook_with_tampered_signature_is_rejected_and_does_not_activate(client, auth_headers, monkeypatch):
+    _fake_order(monkeypatch, "order_hook_tamper")
+    checkout = client.post("/subscriptions/checkout", json={"plan": "1_month"}, headers=auth_headers).json()
+
+    body = _webhook_body("payment.captured", checkout["razorpay_order_id"], "pay_hook_tamper")
+    response = client.post(
+        "/subscriptions/webhook",
+        content=body,
+        headers={"X-Razorpay-Signature": "0" * 64, "Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 400
+    status = client.get("/subscriptions/status", headers=auth_headers)
+    assert status.json()["tier"] == "free"
+
+
+def test_webhook_fails_closed_when_not_configured(client, auth_headers, monkeypatch):
+    monkeypatch.setattr(settings, "razorpay_webhook_secret", None)
+    body = _webhook_body("payment.captured", "order_x", "pay_x")
+
+    response = client.post(
+        "/subscriptions/webhook",
+        content=body,
+        headers={"X-Razorpay-Signature": "irrelevant", "Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 503
+
+
+def test_webhook_for_unknown_order_is_acknowledged_not_errored(client):
+    """A webhook for an order this backend has no record of (a different environment, a
+    replay of stale test data, ...) must be a safe 200 no-op, never a 5xx that would make
+    Razorpay retry indefinitely."""
+    body = _webhook_body("payment.captured", "order_never_created", "pay_x")
+
+    response = client.post(
+        "/subscriptions/webhook",
+        content=body,
+        headers={"X-Razorpay-Signature": _webhook_signature(body), "Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 200
+
+
+def test_webhook_redelivery_is_idempotent(client, auth_headers, monkeypatch):
+    _fake_order(monkeypatch, "order_hook_redeliver")
+    checkout = client.post("/subscriptions/checkout", json={"plan": "1_month"}, headers=auth_headers).json()
+    body = _webhook_body("payment.captured", checkout["razorpay_order_id"], "pay_hook_redeliver")
+    headers = {"X-Razorpay-Signature": _webhook_signature(body), "Content-Type": "application/json"}
+
+    first = client.post("/subscriptions/webhook", content=body, headers=headers)
+    second = client.post("/subscriptions/webhook", content=body, headers=headers)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    first_status = client.get("/subscriptions/status", headers=auth_headers).json()
+    second_status = client.get("/subscriptions/status", headers=auth_headers).json()
+    assert first_status["expires_at"] == second_status["expires_at"]
+
+
+def test_webhook_failed_event_does_not_downgrade_an_already_paid_subscription(client, auth_headers, monkeypatch):
+    """Webhook delivery order isn't guaranteed -- a late payment.failed for a payment that a
+    payment.captured (or the app's own /verify call) already activated must never revoke
+    real, already-granted premium access."""
+    _fake_order(monkeypatch, "order_hook_late_fail")
+    checkout = client.post("/subscriptions/checkout", json={"plan": "1_month"}, headers=auth_headers).json()
+
+    captured_body = _webhook_body("payment.captured", checkout["razorpay_order_id"], "pay_hook_late")
+    client.post(
+        "/subscriptions/webhook", content=captured_body,
+        headers={"X-Razorpay-Signature": _webhook_signature(captured_body), "Content-Type": "application/json"},
+    )
+
+    failed_body = _webhook_body("payment.failed", checkout["razorpay_order_id"], "pay_hook_late")
+    client.post(
+        "/subscriptions/webhook", content=failed_body,
+        headers={"X-Razorpay-Signature": _webhook_signature(failed_body), "Content-Type": "application/json"},
+    )
+
+    status = client.get("/subscriptions/status", headers=auth_headers)
+    assert status.json()["tier"] == "premium"
