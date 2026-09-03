@@ -12,20 +12,30 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
+from app.api.arena import router as arena_router
 from app.api.assessments import router as assessments_router
 from app.api.auth import router as auth_router
+from app.api.career_decisions import router as career_decisions_router
 from app.api.career_path import router as career_path_router
+from app.api.career_twin import router as career_twin_router
 from app.api.deps import get_db
 from app.api.interviews import router as interviews_router
 from app.api.jobs import router as jobs_router
 from app.api.legal import router as legal_router
+from app.api.missions import router as missions_router
+from app.api.next_best_action import router as next_best_action_router
+from app.api.notifications import router as notifications_router
 from app.api.placement_alarm import router as placement_alarm_router
 from app.api.placement_path import router as placement_path_router
 from app.api.progress import router as progress_router
+from app.api.project_builder import router as project_builder_router
+from app.api.recruiter_attack import router as recruiter_attack_router
 from app.api.resumes import router as resumes_router
 from app.api.roadmap import router as roadmap_router
+from app.api.skill_passport import router as skill_passport_router
 from app.api.subscriptions import router as subscriptions_router
 from app.api.users import router as users_router
+from app.api.weaknesses import router as weaknesses_router
 from app.core.app_check import verify_app_check_token
 from app.core.body_size_limit import MaxBodySizeMiddleware
 from app.core.config import settings, validate_for_production
@@ -85,6 +95,16 @@ app.include_router(legal_router)
 app.include_router(placement_alarm_router, dependencies=_app_check_dep)
 app.include_router(placement_path_router, dependencies=_app_check_dep)
 app.include_router(career_path_router, dependencies=_app_check_dep)
+app.include_router(career_twin_router, dependencies=_app_check_dep)
+app.include_router(career_decisions_router, dependencies=_app_check_dep)
+app.include_router(skill_passport_router, dependencies=_app_check_dep)
+app.include_router(next_best_action_router, dependencies=_app_check_dep)
+app.include_router(missions_router, dependencies=_app_check_dep)
+app.include_router(notifications_router, dependencies=_app_check_dep)
+app.include_router(weaknesses_router, dependencies=_app_check_dep)
+app.include_router(project_builder_router, dependencies=_app_check_dep)
+app.include_router(recruiter_attack_router, dependencies=_app_check_dep)
+app.include_router(arena_router, dependencies=_app_check_dep)
 # NOT router-level here: subscriptions_router also owns POST /subscriptions/webhook, called
 # by Razorpay's own servers (never the Android app), which will never carry an
 # X-Firebase-AppCheck header -- see the per-route dependency on every other route in

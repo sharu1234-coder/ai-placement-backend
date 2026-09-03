@@ -1,4 +1,4 @@
-from typing import List
+from typing import Dict, List
 
 from sqlalchemy.orm import Session
 
@@ -17,13 +17,15 @@ from app.services.weakness_service import compute_weaknesses
 _TOP_WEAKNESS_LIMIT = 5
 
 
-def _assessment_label(db: Session, blueprint: AssessmentBlueprint) -> str:
+def _assessment_label(
+    blueprint: AssessmentBlueprint, jd_by_id: Dict[int, JobDescription], role_by_id: Dict[int, Role]
+) -> str:
     if blueprint.jd_id is not None:
-        jd = db.get(JobDescription, blueprint.jd_id)
+        jd = jd_by_id.get(blueprint.jd_id)
         if jd is not None and jd.role_title:
             return f"Test — {jd.role_title}"
     if blueprint.role_id is not None:
-        role = db.get(Role, blueprint.role_id)
+        role = role_by_id.get(blueprint.role_id)
         if role is not None:
             return f"Test — {role.name}"
     return "Test"
@@ -53,11 +55,20 @@ def get_dashboard(db: Session, profile_id: int) -> ProgressDashboardRead:
         .all()
     )
 
+    jd_ids = {b.jd_id for _, b in assessment_rows if b.jd_id is not None}
+    role_ids = {b.role_id for _, b in assessment_rows if b.role_id is not None}
+    jd_by_id = (
+        {jd.id: jd for jd in db.query(JobDescription).filter(JobDescription.id.in_(jd_ids)).all()}
+        if jd_ids
+        else {}
+    )
+    role_by_id = {role.id: role for role in db.query(Role).filter(Role.id.in_(role_ids)).all()} if role_ids else {}
+
     trend: List[ProgressTrendPoint] = [
         ProgressTrendPoint(
             created_at=result.created_at,
             kind="assessment",
-            label=_assessment_label(db, blueprint),
+            label=_assessment_label(blueprint, jd_by_id, role_by_id),
             score=result.overall_score,
         )
         for result, blueprint in assessment_rows

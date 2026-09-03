@@ -121,13 +121,20 @@ OVERRIDE" instruction:
   scoring/grading existing content, both of which made it meaningfully harder to hijack.
   Hardened anyway, proactively, for consistency — it's the same untrusted-free-text shape
   as the others.
-- `career_path_explainer_v1.txt`: assessed, not hardened — it already validates every AI
-  response against a server-supplied whitelist of `skill_key`s and never trusts an
+- `career_path_explainer_v1.txt`: assessed, initially not hardened — it already validates
+  every AI response against a server-supplied whitelist of `skill_key`s and never trusts an
   unrecognized one, which structurally bounds the blast radius the same way
   `resume_ats_check_v1.txt`'s finding-key mechanism does (checked and confirmed by reading
   `ats_check_service.py`: `overall_score`/`category_scores` are 100% deterministic-engine
   output, never read from the AI response at all — there is no numeric field for an
-  injection to move even in principle).
+  injection to move even in principle). A later wider audit (2026-09-03) noted the
+  whitelist bounds *which* skill_key an explanation attaches to, not *what* the
+  why_it_matters text itself says — a `CareerPathSkillItem.title` sourced from a JD
+  requirement (`career_path/service.py`'s `apply_jd`) reaches `{skill_lines}` unguarded.
+  No live exploit was reproduced (impact is self-contained to the student's own explanation
+  text, same low-severity profile as `career_path_role_v1.txt`'s finding above), but v2
+  hardens it anyway for the same "same untrusted-free-text shape, don't leave it as the odd
+  one out" reason `career_path_role_v2.txt` was.
 - `jd_preparation_plan_v1.txt`'s `company_name`: **initially misjudged as low-severity and
   deprioritized without testing it -- that was wrong.** Circled back and tested it live:
   a single injected `company_name` fabricated *every* category reason and *every*

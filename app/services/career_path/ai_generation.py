@@ -33,7 +33,7 @@ class ExplainerSkillInput:
 
 
 _ROLE_PROMPT_PATH = Path(__file__).resolve().parent.parent.parent / "ai" / "prompts" / "career_path_role_v2.txt"
-_EXPLAINER_PROMPT_PATH = Path(__file__).resolve().parent.parent.parent / "ai" / "prompts" / "career_path_explainer_v1.txt"
+_EXPLAINER_PROMPT_PATH = Path(__file__).resolve().parent.parent.parent / "ai" / "prompts" / "career_path_explainer_v2.txt"
 
 _SLUG_PATTERN = re.compile(r"[^a-z0-9]+")
 

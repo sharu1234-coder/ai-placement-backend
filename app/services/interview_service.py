@@ -22,9 +22,11 @@ from app.schemas.interview import (
     InterviewRead,
     NextInterviewQuestionResponse,
 )
+from app.services import weakness_record_service
 from app.services.skill_matching import NoResumeAnalysisError, latest_resume_skills
+from app.services.weakness_service import INTERVIEW_DIMENSIONS
 
-_QUESTION_PROMPT_PATH = Path(__file__).resolve().parent.parent / "ai" / "prompts" / "interview_question_v3.txt"
+_QUESTION_PROMPT_PATH = Path(__file__).resolve().parent.parent / "ai" / "prompts" / "interview_question_v4.txt"
 _EVALUATION_PROMPT_PATH = Path(__file__).resolve().parent.parent / "ai" / "prompts" / "interview_evaluation_v3.txt"
 
 _QUESTIONS_PER_INTERVIEW = 5
@@ -411,5 +413,14 @@ def get_evaluation(
     )
     db.add(evaluation)
     db.commit()
+
+    # Interview Memory: every dimension of every completed evaluation updates its persisted
+    # cross-interview record (see weakness_record_service's status machine). Deliberately
+    # after the evaluation's own commit above -- a failure here must never roll back or block
+    # the evaluation the student is waiting on.
+    for dimension in INTERVIEW_DIMENSIONS:
+        weakness_record_service.record_or_update(
+            db, profile_id, f"interview:{dimension}", getattr(evaluation, dimension)
+        )
 
     return _evaluation_read(evaluation)

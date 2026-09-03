@@ -9,6 +9,7 @@ from app.core.config import settings
 from app.database.base import Base
 
 # Imported for their side effect of registering tables with Base.metadata.
+from app.models.arena_attempt import ArenaAttempt  # noqa: F401
 from app.models.assessment import Assessment  # noqa: F401
 from app.models.assessment_blueprint import AssessmentBlueprint  # noqa: F401
 from app.models.assessment_result import AssessmentResult  # noqa: F401
@@ -18,6 +19,7 @@ from app.models.career_path_project import CareerPathProject  # noqa: F401
 from app.models.career_path_skill_item import CareerPathSkillItem  # noqa: F401
 from app.models.certification import Certification  # noqa: F401
 from app.models.education import Education  # noqa: F401
+from app.models.evidence_state_snapshot import EvidenceStateSnapshot  # noqa: F401
 from app.models.experience import Experience  # noqa: F401
 from app.models.interview import Interview  # noqa: F401
 from app.models.interview_answer import InterviewAnswer  # noqa: F401
@@ -26,6 +28,8 @@ from app.models.interview_question import InterviewQuestion  # noqa: F401
 from app.models.job_description import JobDescription  # noqa: F401
 from app.models.job_match import JobMatch  # noqa: F401
 from app.models.job_preparation_plan import JobPreparationPlan  # noqa: F401
+from app.models.mission import Mission  # noqa: F401
+from app.models.notification_event import NotificationEvent  # noqa: F401
 from app.models.password_reset_token import PasswordResetToken  # noqa: F401
 from app.models.placement_alarm_challenge import PlacementAlarmChallenge  # noqa: F401
 from app.models.placement_alarm_question_attempt import PlacementAlarmQuestionAttempt  # noqa: F401
@@ -33,8 +37,13 @@ from app.models.placement_path import PlacementPath  # noqa: F401
 from app.models.placement_path_topic import PlacementPathTopic  # noqa: F401
 from app.models.profile import StudentProfile  # noqa: F401
 from app.models.project import Project  # noqa: F401
+from app.models.project_build import ProjectBuild  # noqa: F401
+from app.models.project_build_stage import ProjectBuildStage  # noqa: F401
 from app.models.question import Question  # noqa: F401
 from app.models.question_attempt import QuestionAttempt  # noqa: F401
+from app.models.readiness_snapshot import ReadinessSnapshot  # noqa: F401
+from app.models.recruiter_attack_session import RecruiterAttackSession  # noqa: F401
+from app.models.recruiter_attack_turn import RecruiterAttackTurn  # noqa: F401
 from app.models.requirement import Requirement  # noqa: F401
 from app.models.resume import Resume  # noqa: F401
 from app.models.resume_analysis import ResumeAnalysis  # noqa: F401
@@ -47,6 +56,7 @@ from app.models.skill import Skill  # noqa: F401
 from app.models.skill_gap import SkillGap  # noqa: F401
 from app.models.subscription import Subscription  # noqa: F401
 from app.models.user import User  # noqa: F401
+from app.models.weakness_record import WeaknessRecord  # noqa: F401
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.

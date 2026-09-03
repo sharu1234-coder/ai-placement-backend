@@ -12,11 +12,14 @@ from app.models.job_match import JobMatch
 from app.models.skill_gap import SkillGap
 
 # Below this, an interview evaluation dimension counts as a weakness worth putting on the
-# roadmap (same threshold assessment_run_service uses for priority_weaknesses).
-_INTERVIEW_DIMENSION_THRESHOLD = 0.6
+# roadmap (same threshold assessment_run_service uses for priority_weaknesses). Public (no
+# leading underscore) because weakness_record_service also needs these to decide, per
+# dimension, whether a just-completed interview's score is itself a weak or a good signal --
+# the two modules must never drift onto different thresholds for what counts as "weak".
+INTERVIEW_DIMENSION_THRESHOLD = 0.6
 _INTERVIEW_HIGH_SEVERITY_THRESHOLD = 0.4
 
-_INTERVIEW_DIMENSIONS = [
+INTERVIEW_DIMENSIONS = [
     "technical_correctness",
     "relevance",
     "completeness",
@@ -87,9 +90,9 @@ def _from_interview_evaluations(db: Session, profile_id: int, jd_id: Optional[in
     query = query.filter(Interview.jd_id == jd_id) if jd_id is not None else query.filter(Interview.jd_id.is_(None))
 
     for evaluation in query.all():
-        for dimension in _INTERVIEW_DIMENSIONS:
+        for dimension in INTERVIEW_DIMENSIONS:
             score = getattr(evaluation, dimension)
-            if score >= _INTERVIEW_DIMENSION_THRESHOLD:
+            if score >= INTERVIEW_DIMENSION_THRESHOLD:
                 continue
             severity = "high" if score < _INTERVIEW_HIGH_SEVERITY_THRESHOLD else "medium"
             _upsert(weaknesses, f"interview:{dimension}", severity, "interview_eval")

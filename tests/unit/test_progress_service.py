@@ -1,7 +1,7 @@
 import datetime
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -161,6 +161,37 @@ def test_roadmap_task_counts_only_active_roadmap(db):
     dashboard = get_dashboard(db, profile_id=1)
     assert dashboard.roadmap_tasks_done == 1
     assert dashboard.roadmap_tasks_total == 2
+
+
+def test_get_dashboard_query_count_does_not_scale_with_assessment_count(db):
+    """Locks in the wider-audit N+1 fix: _assessment_label's JD/Role lookups are batched
+    once per get_dashboard call (jd_by_id/role_by_id, a single .in_() query each) instead of
+    once per assessment row (the old db.get() per row) -- so 5 assessments against 5
+    distinct roles must issue the exact same query count as 1, never 5x."""
+    _make_assessment_result(db, profile_id=1, overall_score=0.5, created_at=_at(9), role_name="Role0")
+
+    engine = db.get_bind()
+    queries = []
+
+    def _record(conn, cursor, statement, parameters, context, executemany):
+        queries.append(statement)
+
+    event.listen(engine, "before_cursor_execute", _record)
+    try:
+        get_dashboard(db, profile_id=1)
+        one_assessment_query_count = len(queries)
+
+        for i in range(1, 5):
+            _make_assessment_result(db, profile_id=1, overall_score=0.5, created_at=_at(9 + i), role_name=f"Role{i}")
+
+        queries.clear()
+        get_dashboard(db, profile_id=1)
+        five_assessment_query_count = len(queries)
+    finally:
+        event.remove(engine, "before_cursor_execute", _record)
+
+    assert one_assessment_query_count > 0
+    assert five_assessment_query_count == one_assessment_query_count
 
 
 def test_top_weaknesses_limited_to_five(db):

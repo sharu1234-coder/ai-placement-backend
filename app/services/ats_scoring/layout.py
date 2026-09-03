@@ -1,7 +1,10 @@
+import logging
 from dataclasses import dataclass
 from typing import List, Optional
 
 import fitz
+
+logger = logging.getLogger(__name__)
 
 _SMALL_TEXT_THRESHOLD_PT = 8.0
 _MULTI_COLUMN_MIN_CLUSTER_GAP = 50.0  # points -- gap between x0 clusters to call it multi-column
@@ -30,7 +33,8 @@ def extract_layout_signals(pdf_bytes: bytes) -> Optional[LayoutSignals]:
     text-only heuristic set when this is None), never crash."""
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    except Exception:
+    except Exception as exc:
+        logger.warning("Could not reopen stored PDF for layout analysis: %s", exc)
         return None
 
     try:
@@ -71,8 +75,12 @@ def extract_layout_signals(pdf_bytes: bytes) -> Optional[LayoutSignals]:
                 tables = page.find_tables()
                 if tables.tables:
                     table_found = True
-            except Exception:
-                pass  # find_tables can raise on malformed pages -- not fatal to the rest
+            except Exception as exc:
+                # Not fatal to the rest of this page's signals, but logged (unlike a plain
+                # `pass`) so a systematic regression -- e.g. a PyMuPDF upgrade changing
+                # find_tables' behavior -- is actually visible to an operator instead of
+                # silently degrading every resume's ATS layout score forever.
+                logger.warning("find_tables failed on a page during layout analysis: %s", exc)
 
         return LayoutSignals(
             page_count=doc.page_count,
