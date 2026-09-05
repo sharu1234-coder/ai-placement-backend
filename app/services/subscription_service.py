@@ -28,6 +28,17 @@ logger = logging.getLogger(__name__)
 
 RAZORPAY_ORDERS_URL = "https://api.razorpay.com/v1/orders"
 
+_MAX_LOGGED_ERROR_BODY = 500
+
+
+def _truncated(body: str) -> str:
+    """Caps a third-party error body before it reaches application logs -- Razorpay's error
+    responses are normally small JSON, but nothing guarantees that from an interface we don't
+    control, and an unbounded provider response has no business flooding a log line."""
+    if len(body) <= _MAX_LOGGED_ERROR_BODY:
+        return body
+    return f"{body[:_MAX_LOGGED_ERROR_BODY]}... ({len(body)} chars total, truncated)"
+
 # amount_paise is in the smallest currency subunit Razorpay expects (paise, i.e. INR * 100)
 # -- see the Orders API "amount" field. duration_days is the plan length actually granted on
 # successful verification; deliberately NOT calendar months (28-31 day ambiguity) so renewal
@@ -98,9 +109,9 @@ def create_order(db: Session, profile_id: int, plan: str) -> Subscription:
         raise RazorpayApiError("Could not reach the payment provider. Please try again.") from exc
     if response.status_code != 200:
         # response.text may echo back request details or provider-internal error shapes --
-        # logged in full server-side for debugging, but never handed to the API client, which
-        # could end up rendered in an Android Toast/log.
-        logger.error("Razorpay order creation failed (%s): %s", response.status_code, response.text)
+        # logged server-side for debugging (capped, never unbounded), but never handed to the
+        # API client, which could end up rendered in an Android Toast/log.
+        logger.error("Razorpay order creation failed (%s): %s", response.status_code, _truncated(response.text))
         raise RazorpayApiError("The payment provider rejected the order request. Please try again.")
 
     order = response.json()

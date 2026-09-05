@@ -16,15 +16,20 @@ from app.models.readiness_snapshot import ReadinessSnapshot
 from app.models.role import Role
 from app.models.role_skill_weight import RoleSkillWeight
 from app.services import notification_service
-from app.services.career_twin_service import get_current
+from app.services.career_twin_service import _upsert_snapshot, get_current
 
 _UTC = datetime.timezone.utc
 
 
 @pytest.fixture()
-def db():
+def engine():
     engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     Base.metadata.create_all(bind=engine)
+    return engine
+
+
+@pytest.fixture()
+def db(engine):
     session = sessionmaker(bind=engine)()
     yield session
     session.close()
@@ -250,6 +255,33 @@ def test_snapshot_is_upserted_not_duplicated_within_the_same_day(db):
 
     count = db.query(ReadinessSnapshot).filter(ReadinessSnapshot.profile_id == profile.id).count()
     assert count == 1
+
+
+def test_upsert_snapshot_concurrent_first_read_of_day_no_error(db, engine):
+    """Two near-simultaneous first-reads-of-the-day for the same (profile, role) on separate
+    sessions against the same in-memory DB -- both can attempt the insert branch; the table's
+    own uq_readiness_snapshot_per_day constraint means only one insert lands, and the loser
+    must apply its values on top of the winner's row rather than crashing with an uncaught
+    IntegrityError, mirroring mission_service.get_or_create_today's identical race handling."""
+    profile = _profile(db)
+    today = datetime.date.today()
+
+    session_b = sessionmaker(bind=engine)()
+    try:
+        _upsert_snapshot(session_b, profile.id, "sde", today, readiness_percent=40, per_skill={"Python": 40})
+    finally:
+        session_b.close()
+
+    # session_b's insert is already committed on the shared engine by the time this call's own
+    # SELECT runs, so this call converges via the existing-row branch -- the same outcome a
+    # true interleaved race must also reach via the except-IntegrityError branch, since both
+    # paths end with exactly one row holding whichever call wrote last.
+    baseline = _upsert_snapshot(db, profile.id, "sde", today, readiness_percent=55, per_skill={"Python": 55})
+
+    assert baseline == 40  # session_b's value was on record immediately before this write
+    rows = db.query(ReadinessSnapshot).filter(ReadinessSnapshot.profile_id == profile.id).all()
+    assert len(rows) == 1
+    assert rows[0].readiness_percent == 55  # this call's values are the ones that stuck
 
 
 def test_readiness_trend_uses_a_real_prior_snapshot(db):

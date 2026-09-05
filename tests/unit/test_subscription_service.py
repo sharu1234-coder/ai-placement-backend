@@ -84,6 +84,38 @@ class TestCreateOrder:
         with pytest.raises(svc.RazorpayApiError):
             svc.create_order(db, PROFILE_ID, "1_month")
 
+    def test_oversized_error_body_is_capped_in_logs(self, db, monkeypatch, caplog):
+        """Razorpay's error body is logged server-side for debugging, but nothing about a
+        third-party HTTP response guarantees it stays small -- the log line itself must never
+        grow unbounded just because the provider's response did."""
+        fake_request = httpx.Request("POST", svc.RAZORPAY_ORDERS_URL)
+        oversized_body = "x" * 10_000
+        monkeypatch.setattr(
+            httpx, "post",
+            lambda *a, **k: httpx.Response(500, content=oversized_body.encode(), request=fake_request),
+        )
+        with caplog.at_level("ERROR"):
+            with pytest.raises(svc.RazorpayApiError):
+                svc.create_order(db, PROFILE_ID, "1_month")
+
+        logged = caplog.text
+        assert "xxxx" in logged  # the body is still present, just capped
+        assert oversized_body not in logged  # the full 10,000-char body never lands in one line
+        assert "truncated" in logged
+
+    def test_normal_sized_error_body_is_logged_unmodified(self, db, monkeypatch, caplog):
+        fake_request = httpx.Request("POST", svc.RAZORPAY_ORDERS_URL)
+        monkeypatch.setattr(
+            httpx, "post",
+            lambda *a, **k: httpx.Response(401, json={"error": "bad key"}, request=fake_request),
+        )
+        with caplog.at_level("ERROR"):
+            with pytest.raises(svc.RazorpayApiError):
+                svc.create_order(db, PROFILE_ID, "1_month")
+
+        assert '"bad key"' in caplog.text
+        assert "truncated" not in caplog.text
+
 
 class TestVerifyPayment:
     def _create(self, db, monkeypatch, plan="1_month", order_id="order_abc") -> Subscription:

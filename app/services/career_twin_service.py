@@ -17,6 +17,7 @@ box.
 import datetime
 from typing import Dict, List, Optional
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models.profile import StudentProfile
@@ -65,7 +66,13 @@ def _upsert_snapshot(
     recent earlier day's value, else None on a genuine first-ever read. This is the correct
     baseline for "did readiness just cross a milestone": comparing against it (rather than
     always against yesterday) means a second read later the same day never re-fires a
-    milestone the first read already reported."""
+    milestone the first read already reported.
+
+    Two concurrent first-reads-of-the-day for the same (profile, role) can both see no
+    `existing` row and both attempt the insert branch; the table's own
+    uq_readiness_snapshot_per_day constraint is the real guarantee, and a lost race turns into
+    a clean re-fetch-and-update rather than an uncaught IntegrityError -- the identical shape
+    as mission_service.get_or_create_today's create-race handling."""
     existing = (
         db.query(ReadinessSnapshot)
         .filter(
@@ -79,28 +86,48 @@ def _upsert_snapshot(
         baseline = existing.readiness_percent
         existing.readiness_percent = readiness_percent
         existing.per_skill_confidence_percent = per_skill
-    else:
-        prior = (
+        db.commit()
+        return baseline
+
+    prior = (
+        db.query(ReadinessSnapshot)
+        .filter(
+            ReadinessSnapshot.profile_id == profile_id,
+            ReadinessSnapshot.role_family_key == role_key,
+            ReadinessSnapshot.snapshot_date < today,
+        )
+        .order_by(ReadinessSnapshot.snapshot_date.desc())
+        .first()
+    )
+    baseline = prior.readiness_percent if prior is not None else None
+    db.add(
+        ReadinessSnapshot(
+            profile_id=profile_id,
+            role_family_key=role_key,
+            snapshot_date=today,
+            readiness_percent=readiness_percent,
+            per_skill_confidence_percent=per_skill,
+        )
+    )
+    try:
+        db.commit()
+    except IntegrityError:
+        # Lost the create race to a concurrent request for the same (profile, role, day) --
+        # fetch the winner's row and apply this call's values on top of it, same as the
+        # existing-row branch above.
+        db.rollback()
+        winner = (
             db.query(ReadinessSnapshot)
             .filter(
                 ReadinessSnapshot.profile_id == profile_id,
                 ReadinessSnapshot.role_family_key == role_key,
-                ReadinessSnapshot.snapshot_date < today,
+                ReadinessSnapshot.snapshot_date == today,
             )
-            .order_by(ReadinessSnapshot.snapshot_date.desc())
             .first()
         )
-        baseline = prior.readiness_percent if prior is not None else None
-        db.add(
-            ReadinessSnapshot(
-                profile_id=profile_id,
-                role_family_key=role_key,
-                snapshot_date=today,
-                readiness_percent=readiness_percent,
-                per_skill_confidence_percent=per_skill,
-            )
-        )
-    db.commit()
+        winner.readiness_percent = readiness_percent
+        winner.per_skill_confidence_percent = per_skill
+        db.commit()
     return baseline
 
 
