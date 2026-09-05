@@ -26,7 +26,7 @@ sqlalchemy==2.0.36
 greenlet==3.0.3
 alembic==1.14.0
 psycopg2-binary==2.9.10  # production Postgres driver; SQLite (stdlib) stays the dev default
-bcrypt==4.0.1
+bcrypt==5.0.0
 pyjwt==2.13.0  # bumped from 2.10.1 (PYSEC-2026-120/175/176/177/178/179, PYSEC-2025-183) --
 # verified via the full suite (jwt.encode/decode exercised heavily by app/core/security.py,
 # app/api/deps.py, and every auth/password-reset test), no behavior change observed.
