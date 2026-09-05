@@ -18,7 +18,7 @@ fastapi==0.141.1  # bumped from 0.115.6: needed to allow starlette >=1.x (see th
 starlette==1.6.0
 uvicorn[standard]==0.34.0
 pydantic==2.10.5
-pydantic-settings==2.7.1
+pydantic-settings==2.15.0
 python-dotenv==1.2.3  # bumped from 1.2.1 (PYSEC-2026-2270)
 email-validator==2.2.0
 
@@ -26,7 +26,13 @@ sqlalchemy==2.0.36
 greenlet==3.0.3
 alembic==1.14.0
 psycopg2-binary==2.9.10  # production Postgres driver; SQLite (stdlib) stays the dev default
-bcrypt==4.0.1
+# Bumped from 4.0.1. The old pin's comment blamed "4.2.1 fails to import its native
+# extension on this Windows/Python build" -- that was the Python 3.9 machine, the same
+# constraint that held the CVE'd packages above. On 3.12 the extension imports fine.
+# Verified explicitly that 5.0.0 still validates hashes produced by 4.0.1, so existing
+# users' stored passwords keep working -- a bcrypt bump that got that wrong would lock
+# every account out of the app at once.
+bcrypt==5.0.0
 pyjwt==2.13.0  # bumped from 2.10.1 (PYSEC-2026-120/175/176/177/178/179, PYSEC-2025-183) --
 # verified via the full suite (jwt.encode/decode exercised heavily by app/core/security.py,
 # app/api/deps.py, and every auth/password-reset test), no behavior change observed.
