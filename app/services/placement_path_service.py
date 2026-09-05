@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Tuple
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from app.ai.input_guard import render_prompt
 from app.ai.provider import AIGenerationError, AIProvider
 from app.ai.schemas.placement_path import GeneratedPlacementPathExplanations
 from app.models.assessment import Assessment
@@ -79,7 +80,7 @@ def _build_explanation_prompt(specs: List[rules.TopicSpec]) -> str:
         f"{s.topic_key} | {s.title} | {s.track_key} | {s.stage} | {s.skill_tag}" for s in specs
     ]
     template = _PROMPT_PATH.read_text(encoding="utf-8")
-    return template.format(topic_lines="\n".join(lines))
+    return render_prompt(template, topic_lines="\n".join(lines))
 
 
 def _fallback_explanation(spec: "rules.TopicSpec") -> str:

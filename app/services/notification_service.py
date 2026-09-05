@@ -15,6 +15,7 @@ import datetime
 from typing import Dict, List, Optional
 
 from sqlalchemy import update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models.evidence_state_snapshot import EvidenceStateSnapshot
@@ -110,3 +111,45 @@ def check_evidence_transitions(db: Session, profile_id: int, skill_states: Dict[
         elif prior.state != state:
             prior.state = state
             prior.updated_at = now
+
+
+def commit_career_twin_signals(
+    db: Session,
+    profile_id: int,
+    display_role_name: str,
+    baseline_percent: Optional[int],
+    new_percent: int,
+    skill_states: Dict[str, str],
+) -> None:
+    """Run both notification checks for one Career Twin read and commit them, tolerating a
+    lost insert race on evidence_state_snapshots.
+
+    check_evidence_transitions inserts a row per never-before-seen skill and deliberately does
+    not commit (so its notifications ride in the caller's transaction). That leaves a plain
+    read-then-insert against uq_evidence_state_snapshot: two concurrent first-ever reads of
+    the same Career Twin -- e.g. the Home screen's GET /career-twin/readiness and GET
+    /career-twin firing together on app launch, both of which reach here through
+    career_twin_service.get_current -- both see no prior row, both insert, and the loser's
+    commit raises an uncaught IntegrityError, 500ing an otherwise successful read.
+
+    A prior pass closed exactly this race for ReadinessSnapshot (career_twin_service's
+    _upsert_snapshot) and stopped there, even though this second unique-constrained
+    per-(profile, skill) upsert sits three lines further down the same function. Same fix
+    shape as that one, hoisted here so both checks are inside it: on a lost race, roll back
+    and redo. The redo is safe and self-correcting -- check_evidence_transitions now finds
+    the winner's committed rows and takes its update branch, so it neither re-fires a
+    notification the winner already enqueued nor re-attempts the conflicting insert, and
+    check_readiness_milestone is a pure function of the two percentages passed in, so it
+    re-enqueues the milestone the rolled-back transaction dropped.
+    """
+    def _record() -> None:
+        check_readiness_milestone(db, profile_id, display_role_name, baseline_percent, new_percent)
+        check_evidence_transitions(db, profile_id, skill_states)
+
+    _record()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        _record()
+        db.commit()

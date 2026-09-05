@@ -44,9 +44,18 @@ class SubmitRecruiterAttackAnswerRequest(BaseModel):
 
 
 class RecruiterAttackResultsRead(BaseModel):
-    technical_defense: float
-    project_ownership: float
-    specificity: float
-    communication: float
-    overall_score: float
+    """Every score is Optional because a session whose AI evaluation failed is deliberately
+    left ungraded rather than given a placeholder number -- see recruiter_attack_service's
+    _fallback_evaluation. When used_fallback is true, every score here is null and `feedback`
+    carries the "we couldn't grade this, try again" text; the client must render that as an
+    un-graded state, never as a measured result."""
+
+    technical_defense: Optional[float] = None
+    project_ownership: Optional[float] = None
+    specificity: Optional[float] = None
+    communication: Optional[float] = None
+    overall_score: Optional[float] = None
     feedback: str
+    # True when the AI evaluation could not be produced and this response carries no real
+    # grade. Defaults to false so a genuinely graded session reads exactly as before.
+    used_fallback: bool = False

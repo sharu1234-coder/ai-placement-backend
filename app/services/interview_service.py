@@ -4,6 +4,7 @@ from typing import Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
+from app.ai.input_guard import render_prompt
 from app.ai.provider import AIProvider
 from app.ai.schemas.interview import GeneratedInterviewEvaluation, GeneratedInterviewQuestion
 from app.ai.score_utils import clamp_unit_score
@@ -184,7 +185,8 @@ def _build_question_prompt(
     skills_text = ", ".join(context["resume_skills"]) or "No resume on file."
     asked_text = "\n".join(f"- {q}" for q in asked_questions) or "None yet -- this is the first question."
 
-    return template.format(
+    return render_prompt(
+        template,
         interview_type=interview_type,
         role_name=context["role_name"],
         jd_text=context["jd_text"],
@@ -325,7 +327,8 @@ def synthesize_question_audio(
 
 def _build_evaluation_prompt(interview_type: str, mode: str, context: dict, transcript: str) -> str:
     template = _EVALUATION_PROMPT_PATH.read_text(encoding="utf-8")
-    return template.format(
+    return render_prompt(
+        template,
         interview_type=interview_type, mode=mode, role_name=context["role_name"], jd_text=context["jd_text"],
         transcript=transcript,
     )

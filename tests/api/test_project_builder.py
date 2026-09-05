@@ -53,7 +53,7 @@ def other_auth_headers(client):
 
 
 def test_requires_auth(client):
-    assert client.get("/project-builder").status_code == 403
+    assert client.get("/project-builder").status_code == 401
 
 
 def test_create_returns_all_ten_stages_not_started(client, auth_headers, use_fake_ai):

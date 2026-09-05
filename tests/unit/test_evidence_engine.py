@@ -314,6 +314,78 @@ def test_three_sources_without_a_strong_score_is_strong_not_verified(db):
     assert view.confidence == 0.7
 
 
+def test_two_purely_self_asserted_sources_are_not_strong(db):
+    """A resume keyword plus a Project row the student typed in themselves are two different
+    *sources* but zero actual proof. This combination used to return strong/0.7 and fire a
+    "Python is now Strong!" notification, contradicting both this module's own rule that a
+    claim must never by itself produce supported/strong/verified evidence, and Skill Passport's
+    promise: "Proof that you can actually perform each skill -- not just a claim."
+    """
+    db.add(Project(profile_id=1, title="ETL Pipeline", description=None, tech_stack="Python"))
+    resume = Resume(profile_id=1, file_path="x", raw_text="...", parse_status="completed")
+    db.add(resume)
+    db.commit()
+    db.refresh(resume)
+    db.add(
+        ResumeAnalysis(
+            resume_id=resume.id,
+            extracted_skills=["Python"],
+            extracted_education=[],
+            extracted_experience=[],
+            extracted_projects=[],
+            extracted_certifications=[],
+            ats_score=80.0,
+            weak_sections=[],
+            extraction_confidence=0.9,
+        )
+    )
+    db.commit()
+
+    view = get_skill_evidence(db, profile_id=1, skill="Python")
+    assert len(view.items) == 2  # two sources -- breadth alone is no longer enough
+    assert all(item.self_asserted for item in view.items)
+    assert view.state == "supported"
+    assert view.confidence == 0.45
+
+
+def test_two_sources_are_strong_when_one_is_not_self_asserted(db):
+    """The counterpart to the test above: breadth still yields strong as soon as ONE source is
+    something the student didn't merely assert. Guards against over-correcting the fix into
+    blocking legitimately-earned strong states."""
+    assessment = _blueprint_and_assessment(db)
+    db.add(
+        AssessmentResult(
+            assessment_id=assessment.id,
+            skill_scores={"Python": 0.5},  # real but below the strong-score threshold
+            overall_score=0.5,
+            priority_weaknesses=[],
+        )
+    )
+    resume = Resume(profile_id=1, file_path="x", raw_text="...", parse_status="completed")
+    db.add(resume)
+    db.commit()
+    db.refresh(resume)
+    db.add(
+        ResumeAnalysis(
+            resume_id=resume.id,
+            extracted_skills=["Python"],
+            extracted_education=[],
+            extracted_experience=[],
+            extracted_projects=[],
+            extracted_certifications=[],
+            ats_score=80.0,
+            weak_sections=[],
+            extraction_confidence=0.9,
+        )
+    )
+    db.commit()
+
+    view = get_skill_evidence(db, profile_id=1, skill="Python")
+    assert len(view.items) == 2  # assessment (independent) + resume (self-asserted)
+    assert view.state == "strong"
+    assert view.confidence == 0.7
+
+
 def test_stale_when_every_dated_item_is_older_than_the_window(db):
     old = datetime.datetime.now(_UTC) - datetime.timedelta(days=200)
     assessment = _blueprint_and_assessment(db)
@@ -435,3 +507,104 @@ def test_get_all_skill_evidence_query_count_does_not_scale_with_skill_count(db):
 
     assert one_skill_query_count > 0
     assert five_skill_query_count == one_skill_query_count
+
+
+def test_a_self_asserted_resume_mention_never_sets_last_verified_at(db):
+    """Real audit gap, now fixed: last_verified_at took max() over every dated evidence item,
+    including the purely self-asserted ones. A student who uploaded a resume listing "Python"
+    got a "Last verified" date on their Skill Passport for a skill nothing had ever verified --
+    the resume is the student's own claim, and dating it as a verification is exactly the kind
+    of borrowed credibility the Passport promises not to trade in ("Proof that you can
+    actually perform each skill -- not just a claim")."""
+    resume = Resume(profile_id=1, file_path="x", raw_text="...", parse_status="completed")
+    db.add(resume)
+    db.commit()
+    db.refresh(resume)
+    db.add(
+        ResumeAnalysis(
+            resume_id=resume.id,
+            extracted_skills=["Python"],
+            extracted_education=[],
+            extracted_experience=[],
+            extracted_projects=[],
+            extracted_certifications=[],
+            ats_score=80.0,
+            weak_sections=[],
+            extraction_confidence=0.9,
+        )
+    )
+    db.commit()
+
+    view = get_skill_evidence(db, profile_id=1, skill="Python")
+    # The evidence still counts toward state -- it is real, it is just not a verification.
+    assert view.state == "supported"
+    assert view.items and all(item.self_asserted for item in view.items)
+    assert view.last_verified_at is None
+
+
+def test_last_verified_at_ignores_a_newer_self_asserted_item(db):
+    """The sharper form of the same bug: a resume uploaded *today* used to overwrite a
+    genuine assessment verification from last week, so "Last verified" moved forward in time
+    purely because the student re-uploaded a CV. The date must track the newest thing we
+    actually observed, not the newest thing we were told."""
+    verified_at = datetime.datetime.now(_UTC) - datetime.timedelta(days=7)
+
+    assessment = _blueprint_and_assessment(db)
+    db.add(
+        AssessmentResult(
+            assessment_id=assessment.id,
+            skill_scores={"Python": 0.8},
+            overall_score=0.8,
+            priority_weaknesses=[],
+            created_at=verified_at,
+        )
+    )
+    db.commit()
+
+    resume = Resume(profile_id=1, file_path="x", raw_text="...", parse_status="completed")
+    db.add(resume)
+    db.commit()
+    db.refresh(resume)
+    db.add(
+        ResumeAnalysis(
+            resume_id=resume.id,
+            extracted_skills=["Python"],
+            extracted_education=[],
+            extracted_experience=[],
+            extracted_projects=[],
+            extracted_certifications=[],
+            ats_score=80.0,
+            weak_sections=[],
+            extraction_confidence=0.9,
+        )
+    )
+    db.commit()
+
+    view = get_skill_evidence(db, profile_id=1, skill="Python")
+    assert view.last_verified_at.replace(tzinfo=_UTC) == verified_at
+
+
+@pytest.mark.parametrize(
+    "state, expected_band",
+    [
+        ("claimed", "none"),
+        ("stale", "low"),
+        ("supported", "moderate"),
+        ("strong", "high"),
+        ("verified", "very_high"),
+    ],
+)
+def test_every_state_has_a_confidence_band(state, expected_band):
+    """confidence is not a continuous measurement -- it takes exactly five values, one per
+    state -- so clients that rendered it as "70% confidence" were claiming a resolution this
+    engine does not have. The band is what should be displayed, and it must exist for every
+    state the engine can return, or a UI falls back to showing the raw number again."""
+    from app.services.evidence_engine import _CONFIDENCE_BANDS
+
+    assert _CONFIDENCE_BANDS[state] == expected_band
+
+
+def test_confidence_band_is_carried_on_the_view(db):
+    view = get_skill_evidence(db, profile_id=1, skill="Python")
+    assert view.state == "claimed"
+    assert view.confidence_band == "none"

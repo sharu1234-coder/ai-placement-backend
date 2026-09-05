@@ -6,7 +6,7 @@ def _signup_and_login(client, email: str, password: str = "supersecret123") -> d
 
 def test_delete_account_requires_auth(client):
     resp = client.request("DELETE", "/users/me", json={"password": "supersecret123"})
-    assert resp.status_code == 403
+    assert resp.status_code == 401
 
 
 def test_delete_account_wrong_password_returns_403(client):

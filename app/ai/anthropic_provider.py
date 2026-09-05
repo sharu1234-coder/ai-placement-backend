@@ -112,8 +112,17 @@ class AnthropicProvider(AIProvider):
             raise AIGenerationError(f"Anthropic API call failed ({exc.status_code}): {exc.message}") from exc
         except anthropic.APIConnectionError as exc:
             raise AIGenerationError(f"Could not reach the Anthropic API: {exc}") from exc
+        except anthropic.AnthropicError as exc:
+            # Catch-all for every remaining SDK error, verified against the installed SDK's own
+            # class hierarchy rather than assumed: APIResponseValidationError derives from
+            # APIError, NOT from APIStatusError or APIConnectionError, so the two handlers
+            # above miss it entirely. It is raised precisely on the case this provider's
+            # Ollama counterpart already handles -- an HTTP 200 whose body doesn't have the
+            # shape the SDK expects -- and it previously escaped raw, past every
+            # `except AIGenerationError` handler in the API layer, as an unhandled 500.
+            raise AIGenerationError(f"Anthropic returned an unexpected response: {type(exc).__name__}") from exc
 
-        if response.parsed_output is None:
+        if getattr(response, "parsed_output", None) is None:
             raise AIGenerationError("Anthropic response did not include structured output")
         return response.parsed_output
 
@@ -132,5 +141,18 @@ class AnthropicProvider(AIProvider):
             raise AIGenerationError(f"Anthropic API call failed ({exc.status_code}): {exc.message}") from exc
         except anthropic.APIConnectionError as exc:
             raise AIGenerationError(f"Could not reach the Anthropic API: {exc}") from exc
+        except anthropic.AnthropicError as exc:
+            # Same gap as in _call_parse above -- see its comment.
+            raise AIGenerationError(f"Anthropic returned an unexpected response: {type(exc).__name__}") from exc
 
-        return "".join(block.text for block in response.content if block.type == "text")
+        # A 200 whose `content` is absent or null rather than a list raised a bare TypeError
+        # ("'NoneType' object is not iterable") straight out of the comprehension below,
+        # bypassing every `except AIGenerationError` handler -- the same unexpected-but-200
+        # failure mode fixed on the Ollama side.
+        content = getattr(response, "content", None)
+        if not isinstance(content, list):
+            raise AIGenerationError(
+                "Anthropic response did not include a content list "
+                f"(got {type(content).__name__})"
+            )
+        return "".join(block.text for block in content if getattr(block, "type", None) == "text")

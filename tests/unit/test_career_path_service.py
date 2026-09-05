@@ -293,3 +293,69 @@ def test_generating_same_curated_role_produces_the_same_structure(db, ai, data_a
     keys2 = [(i.skill_key, p.phase_key) for p in other_profile_role.phases for i in p.skill_items]
 
     assert keys1 == keys2
+
+
+# ---------------------------------------------------------------------------
+# Job readiness -- averaging only measured signals
+# ---------------------------------------------------------------------------
+
+
+def test_job_readiness_does_not_dilute_real_scores_with_absent_signals():
+    """The reported harm: a student genuinely scoring 80% on practice, with no resume uploaded
+    and no interviews taken, used to be told they were "16% job ready" -- because the average
+    divided by a constant 5 and counted the two things they simply hadn't done yet as measured
+    zeros. Absence of data must not read as a verdict on the student.
+    """
+    readiness = svc._compute_job_readiness(
+        "Data Analyst",
+        skills_percent=0,
+        projects_percent=0,
+        resume_percent=None,
+        practice_percent=80,
+        interview_percent=None,
+        is_estimate=False,
+    )
+
+    assert readiness.overall_percent == 27  # (0 + 0 + 80) / 3, not (0+0+0+80+0) / 5 == 16
+    assert readiness.contributing_signals == 3
+    assert readiness.total_signals == 5
+    # The untaken signals stay honestly absent rather than being reported as zero.
+    assert readiness.resume_percent is None
+    assert readiness.interview_percent is None
+
+
+def test_job_readiness_with_all_five_signals_is_a_plain_average():
+    """Regression guard on the other side of the fix: once every signal has real data, the
+    number must be exactly what it always was."""
+    readiness = svc._compute_job_readiness(
+        "Data Analyst",
+        skills_percent=50,
+        projects_percent=60,
+        resume_percent=70,
+        practice_percent=80,
+        interview_percent=90,
+        is_estimate=False,
+    )
+
+    assert readiness.overall_percent == 70  # (50+60+70+80+90) / 5
+    assert readiness.contributing_signals == 5
+
+
+def test_job_readiness_focus_areas_never_name_an_unmeasured_signal():
+    """Telling a student to improve a signal we have no reading for would be advice derived
+    from an absence rather than from evidence."""
+    readiness = svc._compute_job_readiness(
+        "Data Analyst",
+        skills_percent=90,
+        projects_percent=95,
+        resume_percent=None,
+        practice_percent=None,
+        interview_percent=None,
+        is_estimate=False,
+    )
+
+    assert readiness.contributing_signals == 2
+    assert len(readiness.top_focus_areas) == 2  # only the two that were actually measured
+    joined = " ".join(readiness.top_focus_areas).lower()
+    assert "resume" not in joined
+    assert "interview" not in joined

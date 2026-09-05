@@ -28,6 +28,12 @@ from app.services.role_context import resolve_role_context
 from app.services.weakness_service import compute_weaknesses
 
 _TREND_LOOKBACK_MIN_DAYS = 6  # "this week" -- see get_current's trend section
+# ...and the other end of that window. Without an upper bound, "+N% this week" was computed
+# against the newest snapshot that was *at least* 6 days old -- which, for a student who used
+# the app in March and came back in September, meant a six-month delta presented as a week's
+# progress. A baseline older than this is not "this week" by any reading, so no trend is
+# reported at all rather than an impressive-looking but false one.
+_TREND_LOOKBACK_MAX_DAYS = 14
 _MAX_WEAK_TAGS = 5
 
 
@@ -132,13 +138,15 @@ def _upsert_snapshot(
 
 
 def _compute_trend(db: Session, profile_id: int, role_key: str, today: datetime.date, current_percent: int) -> Optional[int]:
-    cutoff = today - datetime.timedelta(days=_TREND_LOOKBACK_MIN_DAYS)
+    newest_allowed = today - datetime.timedelta(days=_TREND_LOOKBACK_MIN_DAYS)
+    oldest_allowed = today - datetime.timedelta(days=_TREND_LOOKBACK_MAX_DAYS)
     prior = (
         db.query(ReadinessSnapshot)
         .filter(
             ReadinessSnapshot.profile_id == profile_id,
             ReadinessSnapshot.role_family_key == role_key,
-            ReadinessSnapshot.snapshot_date <= cutoff,
+            ReadinessSnapshot.snapshot_date <= newest_allowed,
+            ReadinessSnapshot.snapshot_date >= oldest_allowed,
         )
         .order_by(ReadinessSnapshot.snapshot_date.desc())
         .first()
@@ -176,6 +184,7 @@ def get_current(db: Session, profile: StudentProfile) -> CareerTwinRead:
             weight=context.weights[view.skill],
             measured_score=_measured_score(view.items),
             confidence_percent=round(view.confidence * 100),
+            confidence_band=view.confidence_band,
             state=view.state,
             last_verified_at=view.last_verified_at,
         )
@@ -194,11 +203,14 @@ def get_current(db: Session, profile: StudentProfile) -> CareerTwinRead:
     baseline_percent = _upsert_snapshot(db, profile.id, context.role_family_key, today, readiness_percent, per_skill_confidence)
     trend = _compute_trend(db, profile.id, context.role_family_key, today, readiness_percent)
 
-    notification_service.check_readiness_milestone(
-        db, profile.id, context.display_role_name, baseline_percent, readiness_percent
+    notification_service.commit_career_twin_signals(
+        db,
+        profile.id,
+        context.display_role_name,
+        baseline_percent,
+        readiness_percent,
+        {s.skill: s.state for s in skill_items},
     )
-    notification_service.check_evidence_transitions(db, profile.id, {s.skill: s.state for s in skill_items})
-    db.commit()
 
     biggest_gap = _pick_biggest_gap(skill_items, context.weights)
     next_action_hint = None

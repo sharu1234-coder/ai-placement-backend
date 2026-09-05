@@ -384,6 +384,15 @@ def _compute_skill_gaps(db: Session, profile_id: int, core_skills: List[str], to
         present = skill_present(skill, resume_skills)
         is_weak = any(skill_present(skill, [tag]) for tag in weak_tags)
         if present and not is_weak:
+            # NOTE: this "strong" is NOT the Evidence Engine's "strong". Here it means only
+            # "the skill appears on the resume and no weakness signal contradicts it" -- a
+            # student's own claim with nothing disproving it. evidence_engine's `strong`
+            # deliberately requires two or more sources including at least one the student did
+            # not self-assert (see _compute_state_and_confidence), precisely so a resume
+            # mention alone cannot reach it. Keep these two meanings apart: the client renders
+            # this one as "On Your Resume" rather than "Strong" for exactly that reason
+            # (ui/careerpath/CareerPathLabels.kt). If you ever make this status evidence-based,
+            # change it here rather than widening what the word means.
             gaps.append(SkillGapItemRead(skill=skill, status="strong", evidence="Present on your resume."))
         elif present and is_weak:
             gaps.append(
@@ -475,7 +484,10 @@ def _compute_interview_prep_summary(db: Session, profile_id: int) -> List[Interv
     return summaries
 
 
-def _compute_practice_percent(db: Session, career_path_id: int) -> int:
+def _compute_practice_percent(db: Session, career_path_id: int) -> Optional[int]:
+    """None -- not 0 -- when this path has no practice blueprints or no attempts yet: "hasn't
+    practiced" and "practiced and scored zero" are different facts, and _compute_job_readiness
+    must not average the former in as if it were the latter."""
     blueprint_ids = [
         bid
         for (bid,) in db.query(CareerPathSkillItem.practice_blueprint_id)
@@ -486,7 +498,7 @@ def _compute_practice_percent(db: Session, career_path_id: int) -> int:
         .all()
     ]
     if not blueprint_ids:
-        return 0
+        return None
     scores = [
         score
         for (score,) in db.query(AssessmentResult.overall_score)
@@ -495,7 +507,7 @@ def _compute_practice_percent(db: Session, career_path_id: int) -> int:
         .all()
     ]
     if not scores:
-        return 0
+        return None
     return round(100 * sum(scores) / len(scores))
 
 
@@ -503,23 +515,45 @@ def _compute_job_readiness(
     role_display_name: str,
     skills_percent: int,
     projects_percent: int,
-    resume_percent: int,
-    practice_percent: int,
-    interview_percent: int,
+    resume_percent: Optional[int],
+    practice_percent: Optional[int],
+    interview_percent: Optional[int],
     is_estimate: bool,
 ) -> JobReadinessRead:
-    overall = round(sum([skills_percent, projects_percent, resume_percent, practice_percent, interview_percent]) / 5)
-    scores = {
+    """Averages only the signals that actually have data behind them.
+
+    This used to be `sum([...five values...]) / 5`, where each component fell back to a literal
+    0 for "the student hasn't done this yet". Dividing by a constant regardless meant absence
+    of data was averaged in as a measured zero: a student genuinely scoring 80% on practice but
+    with no resume uploaded and no interviews taken was told they were "16% job ready", and a
+    freshly-started path reported a flat 0%. That is the same naive-average pattern
+    career_twin_service's docstring says Career Twin was deliberately built to avoid, and it
+    reads as a verdict on the student rather than as what it is -- missing inputs.
+
+    skills/projects are always real: once a path exists it has a known skill and project list,
+    so "0 of 12 completed" is a genuine measured 0, not missing data. The other three are None
+    until the student actually does them, and are simply left out of the average until then.
+    contributing_signals/total_signals are exposed so the UI can disclose the denominator
+    rather than implying all five were measured.
+    """
+    measured = {
         "skills": skills_percent,
         "projects": projects_percent,
         "resume": resume_percent,
         "practice": practice_percent,
         "interview": interview_percent,
     }
-    lowest = sorted(scores.items(), key=lambda kv: kv[1])[:3]
+    contributing = {key: value for key, value in measured.items() if value is not None}
+    overall = round(sum(contributing.values()) / len(contributing)) if contributing else 0
+
+    # Focus areas rank only what was actually measured -- telling a student to improve a
+    # signal we have no reading for would be advice derived from an absence.
+    lowest = sorted(contributing.items(), key=lambda kv: kv[1])[:3]
     top_focus_areas = [_FOCUS_AREA_TEMPLATES[key].format(role=role_display_name) for key, _ in lowest]
     return JobReadinessRead(
         overall_percent=overall,
+        contributing_signals=len(contributing),
+        total_signals=len(measured),
         skills_percent=skills_percent,
         projects_percent=projects_percent,
         resume_percent=resume_percent,
@@ -621,9 +655,11 @@ def _to_read(db: Session, path: CareerPath) -> CareerPathRead:
     interview_prep = _compute_interview_prep_summary(db, path.profile_id)
     practice_percent = _compute_practice_percent(db, path.id)
 
-    resume_percent = resume_connection.role_keyword_coverage_percent if resume_connection else 0
+    # None (not 0) where the student simply hasn't done this yet -- see _compute_job_readiness
+    # for why the distinction matters to the overall number.
+    resume_percent = resume_connection.role_keyword_coverage_percent if resume_connection else None
     interview_scores = [s.accuracy_percent for s in interview_prep if s.accuracy_percent is not None]
-    interview_percent = round(sum(interview_scores) / len(interview_scores)) if interview_scores else 0
+    interview_percent = round(sum(interview_scores) / len(interview_scores)) if interview_scores else None
 
     job_readiness = _compute_job_readiness(
         path.display_role_name,

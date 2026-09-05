@@ -123,11 +123,17 @@ class InterviewPrepCategorySummaryRead(BaseModel):
 
 class JobReadinessRead(BaseModel):
     overall_percent: int
+    # How many of the five signals actually had data behind overall_percent. The average is
+    # taken over exactly these, so a client can disclose the real denominator instead of
+    # implying all five were measured (see career_path/service._compute_job_readiness).
+    contributing_signals: int = 5
+    total_signals: int = 5
     skills_percent: int
     projects_percent: int
-    resume_percent: int
-    practice_percent: int
-    interview_percent: int
+    # None until the student has done the thing at all -- distinct from a measured 0.
+    resume_percent: Optional[int] = None
+    practice_percent: Optional[int] = None
+    interview_percent: Optional[int] = None
     top_focus_areas: List[str]
     is_estimate: bool = False
 

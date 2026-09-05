@@ -96,7 +96,7 @@ def _finish_session(client, headers, session_id: int) -> None:
 
 
 def test_requires_auth(client):
-    assert client.get("/recruiter-attack/sessions").status_code == 403
+    assert client.get("/recruiter-attack/sessions").status_code == 401
 
 
 def test_start_session_rejects_incomplete_project(client, auth_headers, use_fake_ai):

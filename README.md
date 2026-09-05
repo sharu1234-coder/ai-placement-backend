@@ -2,15 +2,22 @@
 
 FastAPI backend for AI Placement OS. See `../PROJECT_HANDOFF.md` for full architecture, schemas, and API contracts.
 
-**Python version**: local development on this project currently uses **Python 3.9**;
-CI and the intended production runtime target **Python 3.12** (`.github/workflows/ci.yml`).
-This split is deliberate, not an oversight: Python 3.9 reached end-of-life on 2025-10-31
-(no more security patches), but the local dev machine hasn't been upgraded yet, so the
-codebase stays 3.9-syntax-compatible (`pyproject.toml`'s `ruff` `target-version` is pinned to
-`py39` for the same reason). A dedicated CI matrix (see `PRODUCTION_READINESS_FINAL.md`'s
-Phase 2 audit) verified the existing pinned `requirements.txt` — unchanged — installs and
-passes the full test suite, Alembic migrations against real PostgreSQL, and a startup/health
-smoke test identically on 3.9, 3.11, and 3.12 before this was adopted.
+**Python version**: **3.12** everywhere — local development, CI (`.github/workflows/ci.yml`),
+and the intended production runtime. Keep it that way.
+
+This used to be a deliberate split: local dev stayed on Python 3.9 (end-of-life 2025-10-31)
+while CI and production ran 3.12, on the reasoning that a CI matrix had proved the app behaves
+identically across all three. That reasoning was true and still missed the point. Behaving
+identically is not the same as being *patchable* identically: `requirements.txt` was resolved
+against the 3.9 machine, and the current fix release for roughly ten packages requires
+Python >= 3.10 (`cryptography`'s marker excludes 3.9.0 specifically). There was genuinely
+nothing to bump to locally, so the pins sat still — and CI faithfully installed those same
+pinned, vulnerable versions onto 3.12. A `pip-audit` run found 31 known advisories across 10
+packages, including the multipart parser every resume upload flows through.
+
+Upgrading the local interpreter to 3.12 cleared all 31 with no code changes. CI now runs
+`pip-audit` as a build gate so this cannot silently accumulate again, and `ruff`'s
+`target-version` is `py312` to match.
 
 ## Setup
 

@@ -7,7 +7,7 @@ def test_build_phase_specs_is_deterministic():
     specs1 = build_phase_specs(family)
     specs2 = build_phase_specs(family)
     assert [s.phase_key for s in specs1] == [s.phase_key for s in specs2]
-    for s1, s2 in zip(specs1, specs2):
+    for s1, s2 in zip(specs1, specs2, strict=True):
         assert [i.skill_key for i in s1.skill_items] == [i.skill_key for i in s2.skill_items]
         assert [p.project_key for p in s1.projects] == [p.project_key for p in s2.projects]
 

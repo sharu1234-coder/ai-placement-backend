@@ -49,7 +49,7 @@ def _repo_response(status_code=200, **overrides):
 
 def test_requires_auth(client):
     resp = client.post("/project-builder/1/github-check", json={"repo_url": "https://github.com/o/r"})
-    assert resp.status_code == 403
+    assert resp.status_code == 401
 
 
 def test_successful_check_returns_evidence_and_is_reflected_on_the_build(client, auth_headers, use_fake_ai, monkeypatch):

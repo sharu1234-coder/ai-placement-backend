@@ -31,9 +31,14 @@ jobs:
       # the full test suite, Alembic migrations against real PostgreSQL, a startup/health
       # smoke test, and validate_for_production()'s fail-fast behavior all passed identically
       # on 3.9, 3.11, and 3.12 with zero dependency changes. 3.12 chosen for the longer
-      # remaining support window (EOL 2028-10 vs 3.11's 2027-10). Local dev on this project's
-      # machine stays on Python 3.9 for now (see README) -- that's fine, this test already
-      # proved the app behaves identically across versions.
+      # remaining support window (EOL 2028-10 vs 3.11's 2027-10).
+      #
+      # Local dev used to stay on Python 3.9 "because the app behaves identically anyway".
+      # That turned out to be costly: requirements.txt was resolved on the 3.9 machine, and
+      # every current fix release for ~10 packages requires >=3.10, so the pins sat on 31
+      # known CVEs that CI then faithfully installed onto 3.12. Behaving identically is not
+      # the same as being patchable identically. Local now matches this version -- keep it
+      # that way, and see requirements.txt's header before touching a pin.
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
@@ -49,6 +54,19 @@ jobs:
 
       - name: Lint (ruff)
         run: ruff check app tests scripts
+
+      # Fails the build on a known-CVE dependency. Dependabot already *detects* these and has
+      # done for a while -- what was missing was anything that forced the issue, so advisories
+      # accumulated to 31 across 10 packages while every build stayed green. Detection without
+      # enforcement is just a mailing list.
+      #
+      # Audits the pinned requirements files rather than the installed environment, so a
+      # vulnerable pin fails here even if the runner happens to resolve something newer.
+      # If this step fails: read the advisory, bump the pin (checking requirements.txt's
+      # header note about Python version first), and re-run -- do not add an ignore flag
+      # without recording why in the pin's comment.
+      - name: Dependency vulnerability scan (pip-audit)
+        run: pip-audit -r requirements.txt -r requirements-dev.txt
 
       # No external services needed: tests/conftest.py spins up an in-memory SQLite database
       # per test, so this doesn't need Postgres, S3, SMTP, or any API key configured.

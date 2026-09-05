@@ -35,6 +35,7 @@ from typing import List, Optional
 from sqlalchemy import update
 from sqlalchemy.orm import Session
 
+from app.ai.input_guard import render_prompt
 from app.ai.output_guard import looks_like_prompt_leak
 from app.ai.provider import AIGenerationError, AIProvider
 from app.ai.schemas.recruiter_attack import GeneratedRecruiterAttackEvaluation, GeneratedRecruiterAttackQuestion
@@ -261,7 +262,8 @@ def get_next_turn(
     based_on: Optional[str] = None
     try:
         template = _QUESTION_PROMPT_PATH.read_text(encoding="utf-8")
-        prompt = template.format(
+        prompt = render_prompt(
+            template,
             turn_number=len(turns) + 1, total_turns=_TURNS_PER_SESSION, role_name=role_name,
             claim_context=claim_context, prior_turns=_prior_turns_text(turns),
         )
@@ -323,20 +325,33 @@ def answer_turn(
     return _turn_read(turn)
 
 
-def _fallback_evaluation(turns: List[RecruiterAttackTurn]) -> GeneratedRecruiterAttackEvaluation:
+def _fallback_feedback(turns: List[RecruiterAttackTurn]) -> str:
+    """The text shown when the AI evaluation could not be produced. Deliberately carries NO
+    scores of any kind.
+
+    This used to return a full GeneratedRecruiterAttackEvaluation whose five score fields were
+    all set to `0.3 + 0.3 * (answered / total)` -- a completion ratio, not a judgment of the
+    defense -- and those numbers were then written to the same columns a real grade uses. A
+    prior pass noticed half the problem and stopped Interview Memory from learning from them,
+    but three other consumers were still reading them as real grades:
+      1. evidence_engine._fetch_profile_sources selects recruiter-attack turns on
+         `RecruiterAttackSession.overall_score.isnot(None)`, so the placeholder became a
+         *scored evidence source* feeding skill state, Career Twin readiness and Skill
+         Passport -- a student who was never graded had their readiness moved by a number
+         that meant nothing.
+      2. get_results short-circuits on `session.overall_score is not None`, so the fallback's
+         own promise ("try again later for a full evaluation") could never be honored: the
+         placeholder permanently blocked any regrade.
+      3. RecruiterAttackResultsRead had no way to say "this wasn't really graded", so the
+         client rendered a completion ratio as a measurement.
+    Leaving the score columns NULL fixes all three at once: (1) the evidence filter excludes
+    it for free, (2) the short-circuit no longer trips so a retry genuinely regrades, and (3)
+    the response's `used_fallback` flag is derived from exactly that NULL-ness.
+    """
     answered = sum(1 for t in turns if t.answer_text)
-    ratio = (answered / len(turns)) if turns else 0.0
-    # Deliberately conservative (0.3-0.6) -- this is not a real quality judgment, only an
-    # honest acknowledgment of how much of the session was completed. Never presented as if
-    # the AI actually evaluated the defense.
-    score = round(0.3 + 0.3 * ratio, 2)
-    return GeneratedRecruiterAttackEvaluation(
-        technical_defense=score, project_ownership=score, specificity=score, communication=score,
-        overall_score=score,
-        feedback=(
-            "We couldn't generate detailed AI feedback for this session right now. "
-            f"You answered {answered}/{len(turns)} questions -- try again later for a full evaluation."
-        ),
+    return (
+        "We couldn't generate detailed AI feedback for this session right now. "
+        f"You answered {answered}/{len(turns)} questions -- try again later for a full evaluation."
     )
 
 
@@ -345,6 +360,10 @@ def _results_read(session: RecruiterAttackSession) -> RecruiterAttackResultsRead
         technical_defense=session.technical_defense, project_ownership=session.project_ownership,
         specificity=session.specificity, communication=session.communication,
         overall_score=session.overall_score, feedback=session.feedback_text,
+        # Derived, not stored: an ungraded session is exactly one whose scores were never
+        # persisted, so there is no second piece of state that could drift out of sync with
+        # the scores themselves.
+        used_fallback=session.overall_score is None,
     )
 
 
@@ -367,10 +386,9 @@ def get_results(
         for t in turns
     )
 
-    used_fallback = False
     try:
         template = _EVALUATION_PROMPT_PATH.read_text(encoding="utf-8")
-        prompt = template.format(role_name=role_name, claim_context=claim_context, transcript=transcript)
+        prompt = render_prompt(template, role_name=role_name, claim_context=claim_context, transcript=transcript)
         generated: GeneratedRecruiterAttackEvaluation = ai_provider.generate_structured(
             prompt, GeneratedRecruiterAttackEvaluation
         )
@@ -378,17 +396,20 @@ def get_results(
             raise AIGenerationError("Recruiter attack evaluation output was empty or leaked prompt scaffolding")
     except AIGenerationError as exc:
         logger.warning(
-            "Recruiter attack evaluation failed for session_id=%s, using conservative fallback "
-            "(Interview Memory will NOT be updated from this result): %s", session_id, exc,
+            "Recruiter attack evaluation failed for session_id=%s -- persisting feedback text only, "
+            "leaving every score NULL so this session stays ungraded (no Interview Memory update, no "
+            "Evidence Engine contribution, and a later call regrades it): %s", session_id, exc,
         )
-        generated = _fallback_evaluation(turns)
-        used_fallback = True
+        # Scores are deliberately NOT written here -- see _fallback_feedback. Only the
+        # explanatory text is persisted, so the session remains genuinely ungraded.
+        session.feedback_text = _fallback_feedback(turns)
+        db.commit()
+        return _results_read(session)
 
     # Every dimension of GeneratedRecruiterAttackEvaluation is documented (in
     # recruiter_attack_evaluation_v2.txt) as a float from 0.0 to 1.0 -- the schema enforces no
-    # such bound, so this clamps before persisting or feeding Interview Memory below. Applied
-    # uniformly to both the real AI path and the fallback (the fallback is already computed
-    # in-range, so this is a no-op there, but there's no reason to special-case it).
+    # such bound, so this clamps before persisting or feeding Interview Memory below. Only
+    # reached on the real-AI path now; the fallback returned above without persisting a score.
     context = f"recruiter attack evaluation, session_id={session_id}"
     session.technical_defense = clamp_unit_score(generated.technical_defense, field_name="technical_defense", context=context)
     session.project_ownership = clamp_unit_score(generated.project_ownership, field_name="project_ownership", context=context)
@@ -398,16 +419,13 @@ def get_results(
     session.feedback_text = generated.feedback
     db.commit()
 
-    # Interview Memory must only ever learn from a real AI-graded evaluation. The completion-
-    # ratio fallback above is an honest "we couldn't grade this" placeholder, not a judgment of
-    # the candidate's defense -- feeding it in here would silently corrupt persisted
-    # cross-session weakness tracking (e.g. resetting a real improvement streak back to
-    # REPEATED, or creating a brand-new weak record) purely because the AI provider was
-    # unavailable during this one session.
-    if not used_fallback:
-        for dimension in _EVALUATION_DIMENSIONS:
-            weakness_record_service.record_or_update(
-                db, profile_id, f"recruiter_attack:{dimension}", getattr(session, dimension)
-            )
+    # Interview Memory only ever learns from a real AI-graded evaluation. That is now
+    # structurally true rather than guarded by a flag: the fallback path returns above without
+    # ever reaching this loop, and without leaving a score for anything else to mistake for
+    # one either.
+    for dimension in _EVALUATION_DIMENSIONS:
+        weakness_record_service.record_or_update(
+            db, profile_id, f"recruiter_attack:{dimension}", getattr(session, dimension)
+        )
 
     return _results_read(session)

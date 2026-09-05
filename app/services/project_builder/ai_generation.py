@@ -12,6 +12,7 @@ import logging
 from pathlib import Path
 from typing import Dict, Optional
 
+from app.ai.input_guard import render_prompt
 from app.ai.output_guard import looks_like_prompt_leak
 from app.ai.provider import AIGenerationError, AIProvider
 from app.ai.schemas.project_builder import GeneratedStageGuidanceSet
@@ -25,7 +26,8 @@ _PROMPT_PATH = Path(__file__).resolve().parent.parent.parent / "ai" / "prompts" 
 def _build_prompt(role_name: str, title: str, stack_summary: Optional[str]) -> str:
     stage_lines = "\n".join(f"{key} | {STAGE_TITLES[key]}" for key in STAGE_ORDER)
     template = _PROMPT_PATH.read_text(encoding="utf-8")
-    return template.format(
+    return render_prompt(
+        template,
         role_name=role_name, title=title, stack_summary=stack_summary or "(not specified)", stage_lines=stage_lines
     )
 

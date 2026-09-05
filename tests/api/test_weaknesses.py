@@ -108,7 +108,7 @@ def _run_full_interview(client, auth_headers, evaluation: GeneratedInterviewEval
 
 
 def test_requires_auth(client):
-    assert client.get("/weaknesses").status_code == 403
+    assert client.get("/weaknesses").status_code == 401
 
 
 def test_no_interviews_yet_returns_empty_list(client, auth_headers):

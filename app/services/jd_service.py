@@ -4,6 +4,7 @@ from typing import Dict, List, Optional
 
 from sqlalchemy.orm import Session
 
+from app.ai.input_guard import render_prompt
 from app.ai.provider import AIGenerationError, AIProvider
 from app.ai.schemas.jd import AIParsedJD
 from app.ai.schemas.job_preparation_plan import GeneratedJobPreparationContent
@@ -60,7 +61,7 @@ _SYSTEM_DESIGN_TRIGGER_TRACKS = {"web_backend", "cloud_devops", "ml_data_science
 
 def _build_prompt(jd_text: str) -> str:
     template = _PROMPT_PATH.read_text(encoding="utf-8")
-    return template.format(jd_text=jd_text)
+    return render_prompt(template, jd_text=jd_text)
 
 
 def detect_role(db: Session, role_title: str) -> Optional[Role]:
@@ -312,6 +313,10 @@ def _bucket_skill_gaps(job_match: JobMatchRead, weaknesses_by_tag: dict) -> List
     gaps: List[SkillGapStatusRead] = []
     for skill in job_match.matching_skills:
         is_weak = skill.lower() in weaknesses_by_tag
+        # Same caveat as career_path/service._compute_skill_gaps: "strong" here means the JD's
+        # skill matched the student's resume and nothing flagged it weak -- a claim, not
+        # evidence. It is a different, weaker thing than evidence_engine's "strong", and the
+        # client labels it "On Your Resume" so the two are not confused on screen.
         gaps.append(SkillGapStatusRead(skill=skill, status="needs_improvement" if is_weak else "strong"))
     for skill in job_match.missing_skills:
         gaps.append(SkillGapStatusRead(skill=skill, status="missing"))
@@ -320,7 +325,8 @@ def _bucket_skill_gaps(job_match: JobMatchRead, weaknesses_by_tag: dict) -> List
 
 def _build_prep_plan_prompt(role_title: str, company_name: Optional[str], job_match: JobMatchRead, categories: List[str]) -> str:
     template = _PREP_PLAN_PROMPT_PATH.read_text(encoding="utf-8")
-    return template.format(
+    return render_prompt(
+        template,
         role_title=role_title,
         company_name=company_name or "not specified",
         matching_skills=", ".join(job_match.matching_skills) or "none identified",

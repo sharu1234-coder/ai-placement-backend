@@ -60,7 +60,7 @@ def _answer_all(client, headers, assessment_id, correct=True):
 
 
 def test_requires_auth(client):
-    assert client.get("/arena/challenges").status_code == 403
+    assert client.get("/arena/challenges").status_code == 401
 
 
 def test_list_challenges_returns_the_static_catalog(client, auth_headers):

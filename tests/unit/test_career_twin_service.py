@@ -464,3 +464,71 @@ def test_readiness_trend_is_none_with_no_prior_snapshot(db):
 
     twin = get_current(db, profile)
     assert twin.readiness_trend_percent is None
+
+
+def test_readiness_trend_ignores_a_baseline_far_older_than_this_week(db):
+    """Real audit gap, now fixed: the trend query took the newest snapshot at least 6 days
+    old, with no lower bound on how old. A student who used the app months ago and came back
+    had that ancient snapshot used as "last week", so Home greeted them with an impressive
+    "+40% this week" describing half a year of work -- or, just as wrong, a large negative
+    delta for a week in which they did nothing at all. With no baseline inside the real
+    comparison window there is no honest weekly number to show, so none is shown."""
+    profile = _profile(db)
+    db.add(
+        CareerPath(
+            profile_id=profile.id,
+            role_family_key="sde",
+            display_role_name="Software Engineer",
+            is_primary=True,
+            generated_via="catalog",
+            role_overview={"core_skills": ["Python"], "tools": []},
+        )
+    )
+    db.commit()
+
+    long_ago = datetime.date.today() - datetime.timedelta(days=180)
+    db.add(
+        ReadinessSnapshot(
+            profile_id=profile.id,
+            role_family_key="sde",
+            snapshot_date=long_ago,
+            readiness_percent=10,
+            per_skill_confidence_percent={"Python": 10},
+        )
+    )
+    db.commit()
+
+    twin = get_current(db, profile)
+    assert twin.readiness_trend_percent is None
+
+
+def test_readiness_trend_still_works_at_the_far_edge_of_the_window(db):
+    """The bound must not be so tight that a student with slightly irregular usage loses their
+    trend -- snapshots are written on read, so gaps are normal and expected."""
+    profile = _profile(db)
+    db.add(
+        CareerPath(
+            profile_id=profile.id,
+            role_family_key="sde",
+            display_role_name="Software Engineer",
+            is_primary=True,
+            generated_via="catalog",
+            role_overview={"core_skills": ["Python"], "tools": []},
+        )
+    )
+    db.commit()
+
+    edge = datetime.date.today() - datetime.timedelta(days=13)
+    db.add(
+        ReadinessSnapshot(
+            profile_id=profile.id,
+            role_family_key="sde",
+            snapshot_date=edge,
+            readiness_percent=10,
+            per_skill_confidence_percent={"Python": 10},
+        )
+    )
+    db.commit()
+
+    twin = get_current(db, profile)
+    assert twin.readiness_trend_percent == twin.readiness_percent - 10

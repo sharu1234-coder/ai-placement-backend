@@ -136,7 +136,7 @@ def test_generate_unknown_role_id_returns_404(client, auth_headers, use_fake_ai)
 
 def test_generate_requires_auth(client):
     resp = client.post("/career-path/generate", json={"custom_role": "Data Analyst"})
-    assert resp.status_code == 403
+    assert resp.status_code == 401
 
 
 def test_selecting_second_role_keeps_first_saved_not_deleted(client, auth_headers, use_fake_ai):

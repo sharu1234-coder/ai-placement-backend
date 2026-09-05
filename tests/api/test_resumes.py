@@ -180,7 +180,7 @@ def test_upload_requires_auth(client):
         "/resumes",
         files={"file": ("resume.pdf", make_pdf_with_text("hello"), "application/pdf")},
     )
-    assert resp.status_code == 403
+    assert resp.status_code == 401
 
 
 def test_ai_failure_still_creates_resume_with_failed_status(client, auth_headers, use_fake_ai):

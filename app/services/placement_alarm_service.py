@@ -5,6 +5,7 @@ from typing import List, Optional
 
 from sqlalchemy.orm import Session
 
+from app.ai.input_guard import render_prompt
 from app.ai.output_guard import looks_like_prompt_leak
 from app.ai.provider import AIGenerationError, AIProvider
 from app.ai.schemas.assessment import GeneratedQuestion
@@ -110,7 +111,7 @@ def select_alarm_skills(db: Session, profile_id: int) -> List[str]:
 
 def _build_question_prompt(skill_tag: str) -> str:
     template = _PROMPT_PATH.read_text(encoding="utf-8")
-    return template.format(skill_tag=skill_tag)
+    return render_prompt(template, skill_tag=skill_tag)
 
 
 def _challenge_question_read(question: Question, index: int) -> ChallengeQuestionRead:

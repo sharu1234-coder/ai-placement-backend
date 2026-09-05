@@ -59,10 +59,19 @@ def check_skills(extracted_skills: List[str], raw_text: str) -> CategoryResult:
     else:
         strengths.append(f"{len(extracted_skills)} skills listed")
 
-    normalized = [_normalize(s) for s in extracted_skills if s.strip()]
+    # Real misalignment bug, now fixed: `normalized` drops blank entries but the list this was
+    # zipped against (`extracted_skills`) does not, so a single whitespace-only skill shifted
+    # every subsequent pairing by one -- "Java" would be compared against the normalized form
+    # of a different skill entirely, and the last real skill dropped off the end. That made
+    # duplicate detection both miss genuine duplicates and invent ones that were not there,
+    # and the resulting count feeds a penalty on the student's ATS score. Deriving both values
+    # in a single pass over the same filtered items makes the pairing correct by construction
+    # rather than by two list comprehensions happening to agree.
+    non_blank_skills = [s for s in extracted_skills if s.strip()]
+    normalized = [_normalize(s) for s in non_blank_skills]
     seen: dict = {}
     duplicate_groups = 0
-    for original, norm in zip(extracted_skills, normalized):
+    for original, norm in zip(non_blank_skills, normalized, strict=True):
         if norm in seen and seen[norm].lower() != original.lower():
             duplicate_groups += 1
         seen[norm] = original

@@ -71,7 +71,7 @@ def test_refresh_rejects_garbage_token(client):
 
 def test_logout_requires_auth(client):
     resp = client.post("/auth/logout")
-    assert resp.status_code == 403
+    assert resp.status_code == 401
 
 
 def test_logout_invalidates_existing_access_token(client):
@@ -164,3 +164,41 @@ def test_refresh_rate_limited(client):
 
     blocked = client.post("/auth/refresh", json={"refresh_token": "not-a-real-token"})
     assert blocked.status_code == 429
+
+
+def test_authentication_and_authorization_failures_use_distinct_status_codes(client):
+    """Locks in the 401-vs-403 split so neither can drift back into the other.
+
+    These mean different things and clients act on them differently: Android's auth
+    interceptor retries a 401 once with a refreshed token and, if that fails, tells the
+    student their session expired and sends them to sign in (see ErrorMessages.kt). Doing
+    that in response to a *permission* denial would sign out a perfectly valid session; the
+    reverse -- reporting a missing token as "forbidden" -- tells a signed-out student they
+    are not allowed in rather than that they need to sign in.
+
+    This distinction was previously blurred: FastAPI's HTTPBearer used to answer a missing
+    Authorization header with 403, so a whole class of "not signed in" responses arrived
+    labelled as "signed in but not permitted", disagreeing with this app's own handler for an
+    invalid token (401) two lines away in app/api/deps.py. The dependency upgrade corrected
+    the missing-credentials case to 401 (RFC 7235), which is why ~19 *_requires_auth tests
+    moved. Both halves are asserted together here so a future change cannot quietly collapse
+    them again.
+    """
+    # No credentials at all -> 401, not 403.
+    assert client.get("/users/me").status_code == 401
+
+    # Credentials present but unusable -> also 401. Same "who are you?" failure.
+    assert client.get("/users/me", headers={"Authorization": "Bearer not-a-real-token"}).status_code == 401
+
+    # Authenticated successfully, then denied on the merits -> 403, and it must NOT be 401.
+    client.post("/auth/signup", json={"email": "authz@example.com", "password": "supersecret123"})
+    token = client.post(
+        "/auth/login", json={"email": "authz@example.com", "password": "supersecret123"}
+    ).json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    denied = client.request("DELETE", "/users/me", json={"password": "wrong-password"}, headers=headers)
+    assert denied.status_code == 403
+
+    # ...and the account survives the denied attempt.
+    assert client.get("/users/me", headers=headers).status_code == 200

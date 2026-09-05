@@ -18,6 +18,7 @@ from typing import List, Optional
 
 from sqlalchemy.orm import Session
 
+from app.ai.input_guard import render_prompt
 from app.ai.output_guard import looks_like_prompt_leak
 from app.ai.provider import AIGenerationError, AIProvider
 from app.ai.schemas.project_builder import GeneratedProjectProof
@@ -42,7 +43,8 @@ def _build_prompt(role_name: str, title: str, stack_summary: Optional[str], stag
         f"{STAGE_TITLES[s.stage_key]} | {s.notes or '(no notes)'}" for s in sorted(stages, key=lambda s: s.order_index)
     )
     template = _PROMPT_PATH.read_text(encoding="utf-8")
-    return template.format(
+    return render_prompt(
+        template,
         role_name=role_name, title=title, stack_summary=stack_summary or "(not specified)", stage_notes=stage_notes
     )
 

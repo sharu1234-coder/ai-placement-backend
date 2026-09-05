@@ -6,6 +6,7 @@ from typing import Optional
 import fitz
 from sqlalchemy.orm import Session
 
+from app.ai.input_guard import render_prompt
 from app.ai.provider import AIGenerationError, AIProvider
 from app.ai.schemas.resume import ParsedResume
 from app.models.placement_path import PlacementPath
@@ -41,7 +42,7 @@ def extract_text_from_pdf(file_bytes: bytes) -> str:
 
 def _build_prompt(raw_text: str) -> str:
     template = _PROMPT_PATH.read_text(encoding="utf-8")
-    return template.format(resume_text=raw_text)
+    return render_prompt(template, resume_text=raw_text)
 
 
 def _save_upload(storage: StorageProvider, profile_id: int, filename: str, file_bytes: bytes) -> str:

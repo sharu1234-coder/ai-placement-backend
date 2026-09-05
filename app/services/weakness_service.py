@@ -76,8 +76,19 @@ def _from_assessment_results(db: Session, profile_id: int, jd_id: Optional[int],
 
     for result, _assessment_id in query.all():
         for skill_tag in result.priority_weaknesses:
-            score = result.skill_scores.get(skill_tag, 0.5)
-            severity = "high" if score < _INTERVIEW_HIGH_SEVERITY_THRESHOLD else "medium"
+            score = result.skill_scores.get(skill_tag)
+            if score is None:
+                # The grader flagged this as a priority weakness but recorded no per-skill
+                # score for it, so we know *that* it is weak and not *how* weak. This used to
+                # substitute 0.5 and run it through the threshold below -- an invented number
+                # dressed up as a measurement, and circular besides (the fake score existed
+                # only to be compared). Classify it directly at the non-escalating rank
+                # instead: it still surfaces as a weakness, but an unmeasured one can never
+                # outrank a genuinely measured "high". If another source has real evidence,
+                # _upsert promotes it on that evidence rather than on this default.
+                severity = "medium"
+            else:
+                severity = "high" if score < _INTERVIEW_HIGH_SEVERITY_THRESHOLD else "medium"
             _upsert(weaknesses, skill_tag, severity, "test_result")
 
 

@@ -39,12 +39,40 @@ def _post_and_raise(base_url: str, payload: dict, timeout: float) -> httpx.Respo
 
 def _is_transient_ollama_error(exc: Exception) -> bool:
     """Transient: a network-level failure with no response at all (timeout, connection
-    refused, ...), or an HTTP 429/5xx response. Anything else -- a 4xx response, or the
-    KeyError/ValueError raised for an unexpected-but-200 response body -- is permanent and
-    must not be retried."""
+    refused, ...), or an HTTP 429/5xx response. Anything else -- a 4xx response, or an
+    unexpected-but-200 response body -- is permanent and must not be retried. (Body-shape
+    parsing deliberately happens outside call_with_retry entirely, so a malformed 200 can
+    never even reach this classifier.)"""
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code == 429 or exc.response.status_code >= 500
     return isinstance(exc, httpx.HTTPError)
+
+
+def _extract_response_text(body: object) -> str:
+    """Pull Ollama's `response` string out of an already-parsed 200 body, raising
+    AIGenerationError for every shape that isn't `{"response": "<text>"}`.
+
+    Split out from _call_ollama because the previous inline `response.json()["response"]`
+    only had its KeyError/ValueError paths covered. Re-verified by reproduction, not assumed:
+    a 200 whose JSON body is a *list*, a bare string, or literal `null` (all things a
+    misconfigured reverse proxy or a non-Ollama service on OLLAMA_BASE_URL can return) raises
+    TypeError -- `list indices must be integers`, `'NoneType' object is not subscriptable` --
+    which is neither a KeyError nor a ValueError, so it sailed straight past the handler that
+    was added for exactly this class of bug and surfaced as an unhandled 500. A 200 of
+    `{"response": null}` is the same failure a step later: it returned None from a function
+    annotated `-> str`, leaving every caller to fail on it further downstream instead of here.
+    """
+    if not isinstance(body, dict):
+        raise AIGenerationError(
+            f"Ollama returned an unexpected response shape: expected a JSON object, got {type(body).__name__}"
+        )
+    text = body.get("response")
+    if not isinstance(text, str):
+        raise AIGenerationError(
+            "Ollama returned an unexpected response shape: 'response' was "
+            f"{type(text).__name__}, expected a string"
+        )
+    return text
 
 
 # Module-level cache: the Whisper model is expensive to load (~seconds, plus a one-time
@@ -145,22 +173,26 @@ class OllamaProvider(AIProvider):
 
         # call_with_retry wraps only the raw HTTP call + status check: a genuinely transient
         # failure (connection error, timeout, 429, 5xx) gets up to two bounded retries with
-        # backoff before this ever becomes an AIGenerationError. A permanent 4xx, or the
-        # KeyError/ValueError below for an unexpected-but-200 body, is never retried.
+        # backoff before this ever becomes an AIGenerationError. A permanent 4xx, or an
+        # unexpected-but-200 body (parsed below, outside the retry), is never retried.
         try:
             response = call_with_retry(
                 lambda: _post_and_raise(self.base_url, payload, settings.ollama_timeout_seconds),
                 is_transient=_is_transient_ollama_error,
                 context="Ollama /api/generate",
             )
-            return response.json()["response"]
+            body = response.json()
         except httpx.HTTPError as exc:
             raise AIGenerationError(f"Could not reach Ollama at {self.base_url}: {exc}") from exc
-        except (KeyError, ValueError) as exc:
-            # A 200 with an unexpected body shape -- e.g. Ollama returning {"error": "..."}
-            # instead of {"response": "..."} (a model-not-found/config problem), or a body
-            # that isn't valid JSON at all (response.json() raises a ValueError subclass).
-            # Found via a real repro, not assumed: this previously raised a bare KeyError/
-            # JSONDecodeError here, bypassing every `except AIGenerationError` handler in the
-            # API layer and surfacing as an unhandled 500 instead of the intended error path.
-            raise AIGenerationError(f"Ollama returned an unexpected response shape: {exc}") from exc
+        except ValueError as exc:
+            # A 200 whose body isn't valid JSON at all -- response.json() raises a ValueError
+            # subclass (json.JSONDecodeError). Found via a real repro, not assumed: this
+            # previously escaped as a bare JSONDecodeError, bypassing every
+            # `except AIGenerationError` handler in the API layer and surfacing as an
+            # unhandled 500 instead of the intended error path.
+            raise AIGenerationError(f"Ollama returned a non-JSON response body: {exc}") from exc
+
+        # Every remaining unexpected-but-200 shape (wrong container type, missing key, null
+        # value) is handled here -- see _extract_response_text for the specific shapes and why
+        # the previous KeyError/ValueError-only handling was not enough.
+        return _extract_response_text(body)

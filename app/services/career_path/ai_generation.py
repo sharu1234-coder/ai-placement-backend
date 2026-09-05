@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Sequence, Tuple
 
+from app.ai.input_guard import render_prompt
 from app.ai.provider import AIGenerationError, AIProvider
 from app.ai.schemas.career_path import GeneratedCareerPathExplanations, GeneratedRoleCatalog
 from app.services.career_path.role_catalog import PHASE_ORDER, ProjectTemplate, RoleFamilyDef, SkillTemplate
@@ -248,7 +249,7 @@ def _generic_role_family(family_key: str, role_name: str) -> RoleFamilyDef:
 
 def _build_role_prompt(role_name: str) -> str:
     template = _ROLE_PROMPT_PATH.read_text(encoding="utf-8")
-    return template.format(role_name=role_name)
+    return render_prompt(template, role_name=role_name)
 
 
 def get_or_generate_role_definition(role_name: str, ai_provider: AIProvider) -> Tuple[RoleFamilyDef, str]:
@@ -301,7 +302,7 @@ def get_or_generate_role_definition(role_name: str, ai_provider: AIProvider) -> 
 def _build_explainer_prompt(role_name: str, items: Sequence[ExplainerSkillInput]) -> str:
     lines = [f"{item.skill_key} | {item.title} | {item.phase_key} | {item.level}" for item in items]
     template = _EXPLAINER_PROMPT_PATH.read_text(encoding="utf-8")
-    return template.format(role_name=role_name, skill_lines="\n".join(lines))
+    return render_prompt(template, role_name=role_name, skill_lines="\n".join(lines))
 
 
 def _fallback_skill_explanation(role_name: str, item: ExplainerSkillInput) -> str:

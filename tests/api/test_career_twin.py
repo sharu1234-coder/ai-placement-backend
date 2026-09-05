@@ -55,7 +55,7 @@ def _sde_role_id(client, auth_headers):
 
 def test_requires_auth(client):
     response = client.get("/career-twin")
-    assert response.status_code == 403  # no bearer token supplied at all
+    assert response.status_code == 401  # no bearer token supplied at all
 
 
 def test_no_role_returns_has_role_false_not_a_fabricated_zero(client, auth_headers):

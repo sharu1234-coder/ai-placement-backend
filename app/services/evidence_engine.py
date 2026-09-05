@@ -51,13 +51,28 @@ class EvidenceItem(BaseModel):
     label: str
     score: Optional[float] = None  # 0-100, when the source produces a real score
     detected_at: Optional[datetime.datetime] = None
+    # True when the student simply *told us* this, with nothing on our side confirming it: a
+    # keyword on an uploaded resume, or a free-text Project row they typed in themselves.
+    # Distinct from `score is None` -- a completed Project Builder build is also unscored, but
+    # the student actually did the work and marked it done, so it is NOT self-asserted. This
+    # is what keeps _compute_state_and_confidence from promoting pure claims (see there).
+    self_asserted: bool = False
 
 
 class SkillEvidenceView(BaseModel):
     skill: str
     state: str  # claimed | supported | strong | verified | stale
     confidence: float  # 0-1
+    # The coarse band `confidence` actually represents. `confidence` only ever takes five
+    # discrete values (see _CONFIDENCE_BANDS), so rendering it as a precise percentage
+    # ("70% confident") claims a measurement resolution this engine does not have. Clients
+    # should show this band; the numeric confidence stays for ordering and bar lengths.
+    confidence_band: str  # none | low | moderate | high | very_high
     items: List[EvidenceItem]
+    # The newest timestamp among evidence the student did NOT simply assert about themselves.
+    # A resume keyword or a typed-in project row is a claim, not a verification, so it must
+    # never set this field -- "Last verified" has to mean something was actually observed.
+    # None when nothing independent has been seen yet, even if self-asserted items exist.
     last_verified_at: Optional[datetime.datetime] = None
 
 
@@ -188,7 +203,12 @@ def _match_projects(sources: _ProfileEvidenceSources, skill: str) -> Optional[Ev
     for project in sources.projects:
         blob = " ".join(filter(None, [project.title, project.description, project.tech_stack]))
         if skill_present(skill, [blob]):
-            return EvidenceItem(source="project", source_id=project.id, label=f"Project — {project.title}")
+            # Free text the student typed themselves (POST /users/me/projects), with no status
+            # field and nothing verifying it -- a claim, unlike the two completed-work branches
+            # below.
+            return EvidenceItem(
+                source="project", source_id=project.id, label=f"Project — {project.title}", self_asserted=True
+            )
 
     # Completed Career Path project recommendations -- only counts once the student has
     # actually marked it done, unlike the flat Project list above (which has no status field).
@@ -252,7 +272,9 @@ def _match_resume(sources: _ProfileEvidenceSources, skill: str) -> Optional[Evid
     if sources.resume_skills is None:
         return None
     if skill_present(skill, sources.resume_skills):
-        return EvidenceItem(source="resume", source_id=None, label="Resume evidence detected")
+        return EvidenceItem(
+            source="resume", source_id=None, label="Resume evidence detected", self_asserted=True
+        )
     return None
 
 
@@ -265,12 +287,37 @@ def _as_utc(dt: datetime.datetime) -> datetime.datetime:
     return dt if dt.tzinfo is not None else dt.replace(tzinfo=datetime.timezone.utc)
 
 
+# Every state's coarse confidence band, keyed so it cannot drift from the numeric confidence
+# returned alongside it in _compute_state_and_confidence. `confidence` is not a measurement on
+# a continuous scale -- it takes exactly five values, one per state -- so any UI that renders
+# it as a precise percentage is overstating what this engine knows. Clients show the band.
+_CONFIDENCE_BANDS = {
+    "claimed": "none",
+    "stale": "low",
+    "supported": "moderate",
+    "strong": "high",
+    "verified": "very_high",
+}
+
+
 def _compute_state_and_confidence(items: List[EvidenceItem]) -> tuple[str, float]:
     """A documented, deterministic rule -- not a black box. verified requires *both* breadth
     (3+ independent sources) and depth (at least one strongly-scored source); strong requires
-    just breadth; supported is a single real source; claimed is zero. stale overrides all of
-    the above once every dated piece of evidence has aged past _STALE_DAYS (undated evidence,
-    e.g. a plain project listing with no timestamp, never triggers staleness on its own)."""
+    breadth AND at least one source the student did not simply assert about themselves;
+    supported is a single real source, or any number of purely self-asserted ones; claimed is
+    zero. stale overrides all of the above once every dated piece of evidence has aged past
+    _STALE_DAYS (undated evidence, e.g. a plain project listing with no timestamp, never
+    triggers staleness on its own).
+
+    The self-asserted requirement on `strong` exists because breadth alone was satisfiable
+    entirely by claims: a keyword on the uploaded resume plus a free-text Project row the
+    student typed in are two *different sources* but zero actual proof, and that combination
+    used to yield "strong / 70% confidence" plus a "{skill} is now Strong!" push notification.
+    That contradicted both this module's own rule that a claim must never by itself produce
+    supported/strong/verified evidence, and the Skill Passport's promise to students: "Proof
+    that you can actually perform each skill -- not just a claim." Note `verified` was never
+    exposed to this, since has_strong_score already requires a scored (therefore
+    non-self-asserted) source."""
     if not items:
         return "claimed", 0.0
 
@@ -283,9 +330,11 @@ def _compute_state_and_confidence(items: List[EvidenceItem]) -> tuple[str, float
     sources = {item.source for item in items}
     has_strong_score = any(item.score is not None and item.score >= _STRONG_SCORE_THRESHOLD for item in items)
 
+    has_independent_source = any(not item.self_asserted for item in items)
+
     if len(sources) >= 3 and has_strong_score:
         return "verified", 0.9
-    if len(sources) >= 2:
+    if len(sources) >= 2 and has_independent_source:
         return "strong", 0.7
     return "supported", 0.45
 
@@ -304,13 +353,22 @@ def _evidence_view_from_sources(sources: _ProfileEvidenceSources, skill: str) ->
         if item is not None
     ]
     state, confidence = _compute_state_and_confidence(items)
-    dated = [item.detected_at for item in items if item.detected_at is not None]
+    # Only independently-observed evidence can date a *verification*. Previously this took
+    # max() over every dated item, so a resume upload -- a claim the student typed -- set
+    # "Last verified", and the Skill Passport showed a verification date for a skill nothing
+    # had ever verified.
+    verified_dates = [
+        item.detected_at
+        for item in items
+        if item.detected_at is not None and not item.self_asserted
+    ]
     return SkillEvidenceView(
         skill=skill,
         state=state,
         confidence=confidence,
+        confidence_band=_CONFIDENCE_BANDS[state],
         items=items,
-        last_verified_at=max(dated) if dated else None,
+        last_verified_at=max(verified_dates) if verified_dates else None,
     )
 
 

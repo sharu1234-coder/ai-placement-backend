@@ -19,6 +19,7 @@ improving."
 import datetime
 from typing import List, Optional
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models.weakness_record import WeaknessRecord
@@ -70,9 +71,27 @@ def record_or_update(db: Session, profile_id: int, skill_key: str, score: float)
             last_seen_at=now,
         )
         db.add(record)
-        db.commit()
-        db.refresh(record)
-        return record
+        try:
+            db.commit()
+        except IntegrityError:
+            # Lost the create race for this (profile_id, skill_key) to a concurrent
+            # evaluation -- uq_weakness_record_per_skill is the real guarantee and it fired.
+            # This is a genuinely reachable race, not a theoretical one: record_or_update is
+            # called in a LOOP over every evaluation dimension from interview_service's
+            # get_evaluation AND from recruiter_attack_service's get_results, so two
+            # evaluations finishing at once for the same profile hit the same first-ever
+            # skill_key. Before this, the loser raised an uncaught IntegrityError out of a
+            # request that had already made (and paid for) its AI call, and left the session
+            # unusable for everything after it. Falling through to the existing-row path is
+            # the correct recovery -- this call's own signal still gets applied on top of the
+            # winner's row, exactly like a sequential second call would.
+            db.rollback()
+            existing = _get(db, profile_id, skill_key)
+            if existing is None:  # pragma: no cover -- the constraint only fires if a row exists
+                raise
+        else:
+            db.refresh(record)
+            return record
 
     old_status = existing.status
     existing.last_score = score

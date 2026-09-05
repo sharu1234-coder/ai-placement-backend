@@ -4,6 +4,7 @@ from typing import List, Optional
 
 from sqlalchemy.orm import Session
 
+from app.ai.input_guard import render_prompt
 from app.ai.provider import AIGenerationError, AIProvider
 from app.ai.schemas.resume_ats_check import GeneratedAtsCheckContent
 from app.models.resume import Resume
@@ -46,7 +47,8 @@ def _build_prompt(scoring: ScoringResult, target_role: Optional[str]) -> str:
     ]
     findings_block = "\n".join(findings_lines) if findings_lines else "(no issues detected)"
 
-    return template.format(
+    return render_prompt(
+        template,
         overall_score=scoring.overall_score,
         score_band=scoring.score_category,
         category_scores=category_scores_str,

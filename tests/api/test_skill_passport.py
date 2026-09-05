@@ -25,7 +25,7 @@ def _sde_role_id(client, auth_headers):
 
 
 def test_requires_auth(client):
-    assert client.get("/skill-passport").status_code == 403
+    assert client.get("/skill-passport").status_code == 401
 
 
 def test_no_role_returns_empty_list_not_fabricated_skills(client, auth_headers):

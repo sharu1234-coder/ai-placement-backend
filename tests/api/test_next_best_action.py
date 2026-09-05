@@ -21,7 +21,7 @@ def _sde_role_id(client, auth_headers):
 
 
 def test_requires_auth(client):
-    assert client.get("/next-best-action").status_code == 403
+    assert client.get("/next-best-action").status_code == 401
 
 
 def test_no_role_has_no_recommendation(client, auth_headers):

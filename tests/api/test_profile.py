@@ -58,7 +58,7 @@ def test_update_my_profile_rejects_overlong_mobile_number(client, auth_headers):
 
 def test_get_my_profile_requires_auth(client):
     resp = client.get("/users/me")
-    assert resp.status_code == 403  # no Authorization header at all
+    assert resp.status_code == 401  # no Authorization header at all
 
 
 def test_update_my_profile(client, auth_headers):

@@ -151,3 +151,39 @@ def test_target_role_is_not_an_accepted_parameter():
     from app.services.ats_scoring.engine import score_resume as fn
 
     assert "target_role" not in inspect.signature(fn).parameters
+
+
+def test_a_blank_skill_entry_does_not_misalign_duplicate_detection():
+    """Real bug, now fixed: duplicate detection zipped `extracted_skills` against a
+    `normalized` list built with a `if s.strip()` filter. A single whitespace-only entry made
+    the two lists different lengths, so every pairing after it was shifted by one -- each
+    skill was compared against a different skill's normalized form, and the last real skill
+    fell off the end entirely. The resulting duplicate count both missed genuine duplicates
+    and invented ones, and it feeds a points penalty on the student's ATS score.
+
+    These five skills are all distinct, so a correct implementation finds no duplicates
+    regardless of where the blank sits."""
+    from app.services.ats_scoring.checks.skills import check_skills
+
+    with_blank = check_skills(
+        ["Python", "   ", "SQL", "Java", "Git", "Docker"], raw_text=STRONG_RESUME_TEXT
+    )
+    without_blank = check_skills(
+        ["Python", "SQL", "Java", "Git", "Docker"], raw_text=STRONG_RESUME_TEXT
+    )
+
+    assert not any("more than once" in imp for imp in with_blank.improvements)
+    # A blank entry is noise, not signal: it must not change the score either.
+    assert with_blank.score == without_blank.score
+
+
+def test_genuine_duplicate_skills_are_still_detected_after_the_alignment_fix():
+    """The guard against over-correcting the test above into a no-op: real duplicates written
+    differently ("NodeJS" / "Node.js") must still be caught."""
+    from app.services.ats_scoring.checks.skills import check_skills
+
+    result = check_skills(
+        ["Python", "NodeJS", "Node.js", "SQL", "Java", "Git"], raw_text=STRONG_RESUME_TEXT
+    )
+
+    assert any("more than once" in imp for imp in result.improvements)

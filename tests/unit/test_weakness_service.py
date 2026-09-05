@@ -177,3 +177,63 @@ def test_sorted_high_severity_first(db):
 
     weaknesses = compute_weaknesses(db, profile_id=1, jd_id=None)
     assert [w.skill_tag for w in weaknesses] == ["Aardvark", "Zebra"]
+
+
+def test_a_priority_weakness_with_no_recorded_score_is_not_given_an_invented_one(db):
+    """Real audit gap, now fixed: a skill flagged as a priority weakness but missing from
+    skill_scores used to be substituted with a hard-coded 0.5, which was then compared against
+    the 0.4 severity threshold to produce "medium". That number was invented -- it existed
+    only to be measured against, and it made an unmeasured weakness indistinguishable from a
+    genuinely mid-scoring one. The weakness must still surface (the grader did flag it), but
+    at the non-escalating rank, and without pretending a score was recorded."""
+    blueprint = AssessmentBlueprint(role_id=1, jd_id=None, profile_id=1, source="default_taxonomy", sections=[])
+    db.add(blueprint)
+    db.commit()
+    db.refresh(blueprint)
+    assessment = Assessment(profile_id=1, blueprint_id=blueprint.id, status="completed")
+    db.add(assessment)
+    db.commit()
+    db.refresh(assessment)
+    db.add(
+        AssessmentResult(
+            assessment_id=assessment.id,
+            # "Kafka" is called out as a priority weakness but never scored.
+            skill_scores={"DSA": 0.9},
+            overall_score=0.9,
+            priority_weaknesses=["Kafka"],
+        )
+    )
+    db.commit()
+
+    weaknesses = compute_weaknesses(db, profile_id=1, jd_id=None)
+    assert len(weaknesses) == 1
+    assert weaknesses[0].skill_tag == "Kafka"
+    assert weaknesses[0].severity == "medium"
+
+
+def test_an_unmeasured_weakness_never_outranks_a_measured_high_severity_one(db):
+    """The point of the fix above: sorting puts genuinely-measured severe gaps first. If an
+    unscored weakness could land on "high" it would compete for the student's attention with
+    a skill actually measured at 0.2, on the strength of a number nobody recorded."""
+    blueprint = AssessmentBlueprint(role_id=1, jd_id=None, profile_id=1, source="default_taxonomy", sections=[])
+    db.add(blueprint)
+    db.commit()
+    db.refresh(blueprint)
+    assessment = Assessment(profile_id=1, blueprint_id=blueprint.id, status="completed")
+    db.add(assessment)
+    db.commit()
+    db.refresh(assessment)
+    db.add(
+        AssessmentResult(
+            assessment_id=assessment.id,
+            skill_scores={"DSA": 0.2},
+            overall_score=0.2,
+            priority_weaknesses=["DSA", "Kafka"],
+        )
+    )
+    db.commit()
+
+    weaknesses = compute_weaknesses(db, profile_id=1, jd_id=None)
+    assert [w.skill_tag for w in weaknesses] == ["DSA", "Kafka"]
+    assert weaknesses[0].severity == "high"
+    assert weaknesses[1].severity == "medium"

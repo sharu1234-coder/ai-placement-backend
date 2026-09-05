@@ -1,5 +1,8 @@
 [tool.ruff]
-target-version = "py39"
+# Matches local, CI and production (all 3.12). Was "py39" to keep the codebase compatible with
+# a local dev machine that no longer exists -- see requirements.txt's header for what that
+# single stale constraint ended up costing in unpatchable dependencies.
+target-version = "py312"
 # Matches this codebase's existing style (verbose explanatory comments are the established
 # convention throughout -- see README/CLAUDE.md discipline), not a new stylistic mandate.
 # 130 is the longest line already in the codebase; anything past it still gets flagged.

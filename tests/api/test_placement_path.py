@@ -337,7 +337,7 @@ def test_history_includes_superseded_and_active_most_recent_first(
 
 def test_history_requires_auth(client):
     resp = client.get("/placement-path/history")
-    assert resp.status_code == 403
+    assert resp.status_code == 401
 
 
 def test_topic_isolated_per_user(client, auth_headers, resume_with_skills, use_fake_ai):

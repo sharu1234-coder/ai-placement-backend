@@ -4,6 +4,7 @@ from typing import Optional
 
 from sqlalchemy.orm import Session
 
+from app.ai.input_guard import render_prompt
 from app.ai.provider import AIProvider
 from app.ai.schemas.roadmap import GeneratedRoadmap
 from app.models.job_description import JobDescription
@@ -65,7 +66,7 @@ def _build_prompt(weaknesses, duration_days: int) -> str:
     weaknesses_text = "\n".join(
         f"- {w.skill_tag} (severity: {w.severity}, source: {', '.join(w.sources)})" for w in weaknesses
     )
-    return template.format(weaknesses=weaknesses_text, duration_days=duration_days)
+    return render_prompt(template, weaknesses=weaknesses_text, duration_days=duration_days)
 
 
 def generate_roadmap(

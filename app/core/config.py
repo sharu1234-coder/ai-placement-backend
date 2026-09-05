@@ -1,4 +1,5 @@
 from typing import Optional
+from urllib.parse import urlparse
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -109,6 +110,20 @@ class Settings(BaseSettings):
 
 settings = Settings()
 
+# Hosts that only ever resolve to the API process's own machine/container. Matched on the URL
+# host specifically (not a substring of the whole URL) so a legitimate deployment whose real
+# Ollama host merely *contains* one of these strings isn't caught.
+_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+
+
+def _is_loopback_url(url: str) -> bool:
+    host = urlparse(url).hostname
+    if host is None:
+        return False
+    host = host.strip("[]").lower()
+    # 127.0.0.0/8 as a whole, not just 127.0.0.1 -- 127.1 and 127.0.1.5 are equally loopback.
+    return host in _LOOPBACK_HOSTS or host.startswith("127.")
+
 
 def validate_for_production() -> None:
     """Called once at app startup (app/main.py). Every secret-shaped setting
@@ -157,6 +172,27 @@ def validate_for_production() -> None:
         raise RuntimeError(
             "ALLOWED_HOSTS is still '*' -- set it to your real production domain(s) "
             '(comma-separated, e.g. "api.aiplacementos.com") before running in production.'
+        )
+    if settings.ai_provider == "ollama" and _is_loopback_url(settings.ollama_base_url):
+        # Same failure class as the test-mode Razorpay key below, and the same reason it needs
+        # an explicit check: nothing else complains. AI_PROVIDER defaults to "ollama" and
+        # OLLAMA_BASE_URL defaults to localhost, so a deployment that simply never set either
+        # starts cleanly, then fails every AI call with a connection error -- and every call
+        # site in app/services/ catches AIGenerationError and falls back to hand-authored
+        # template text, so the API keeps returning 200s with generic content forever. Career
+        # Path, Project Builder, Recruiter Attack, JD prep and answer grading would all
+        # silently degrade for every user with no startup error and no 5xx to alert on.
+        #
+        # Deliberately NOT "ollama is forbidden in production": a genuinely self-hosted Ollama
+        # is a legitimate topology. Only the un-overridden dev default (loopback) fails here.
+        raise RuntimeError(
+            "AI_PROVIDER is 'ollama' with OLLAMA_BASE_URL still pointing at localhost "
+            f"({settings.ollama_base_url}) -- nothing on the API host will answer there in "
+            "production, and every AI feature would silently fall back to generic template "
+            "text instead of failing loudly. Either set AI_PROVIDER=anthropic (with "
+            "ANTHROPIC_API_KEY), or, if you genuinely self-host Ollama, set OLLAMA_BASE_URL "
+            "to its real reachable address (a hostname or service address the API can dial) "
+            "-- from inside a container, localhost is the API container itself, not Ollama."
         )
     if settings.razorpay_key_id is not None and settings.razorpay_key_id.startswith("rzp_test_"):
         # Unlike the checks above, a missing/None razorpay_key_id is left alone here -- that

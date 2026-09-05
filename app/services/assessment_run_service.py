@@ -5,6 +5,7 @@ from typing import List, Optional
 from sqlalchemy import update
 from sqlalchemy.orm import Session
 
+from app.ai.input_guard import render_prompt
 from app.ai.output_guard import looks_like_prompt_leak
 from app.ai.provider import AIProvider
 from app.ai.schemas.assessment import AnswerGrade, GeneratedQuestion
@@ -29,6 +30,10 @@ _GRADER_PROMPT_PATH = Path(__file__).resolve().parent.parent / "ai" / "prompts" 
 
 _DIFFICULTIES = ["easy", "medium", "hard"]
 _WEAKNESS_THRESHOLD = 0.6
+# The pass mark answer_grader_v3.txt documents for is_correct. Kept here, not in the prompt
+# alone, because submit_answer now derives is_correct from the score rather than trusting the
+# model's own boolean -- see the comment at that derivation.
+_IS_CORRECT_SCORE_THRESHOLD = 0.6
 
 logger = logging.getLogger(__name__)
 
@@ -172,7 +177,7 @@ def _next_difficulty(db: Session, assessment_id: int, skill_tag: str) -> str:
 
 def _build_question_prompt(skill_tag: str, assessment_type: str, difficulty: str) -> str:
     template = _QUESTION_PROMPT_PATH.read_text(encoding="utf-8")
-    return template.format(skill_tag=skill_tag, assessment_type=assessment_type, difficulty=difficulty)
+    return render_prompt(template, skill_tag=skill_tag, assessment_type=assessment_type, difficulty=difficulty)
 
 
 def get_next_question(
@@ -259,17 +264,37 @@ def submit_answer(
     if question.type == "mcq":
         is_correct = student_answer.strip().lower() == question.expected_answer_or_rubric.strip().lower()
         score = 1.0 if is_correct else 0.0
+    elif not student_answer.strip():
+        # Deterministic, before any AI call: a blank (or whitespace-only) answer is 0.0 by
+        # definition, and no model output can override that. answer_grader_v3.txt already
+        # *instructs* the grader to score a blank answer 0.0, but that is a prompt-level
+        # control over an untrusted-by-design output -- the historical exploit recorded in
+        # tests/unit/test_prompt_injection_hardening.py was, verbatim, "a blank/irrelevant
+        # assessment answer scored 1.0/is_correct=True". Short-circuiting here makes the
+        # security requirement ("a blank answer must never become correct") independent of
+        # model behaviour entirely, and skips a pointless paid AI call as a side effect.
+        is_correct = False
+        score = 0.0
     else:
-        grade_prompt = _GRADER_PROMPT_PATH.read_text(encoding="utf-8").format(
+        grade_prompt = render_prompt(
+            _GRADER_PROMPT_PATH.read_text(encoding="utf-8"),
             question=question.prompt,
             rubric=question.expected_answer_or_rubric,
             student_answer=student_answer,
         )
         grade: AnswerGrade = ai_provider.generate_structured(grade_prompt, AnswerGrade)
-        is_correct = grade.is_correct
         score = clamp_unit_score(
             grade.score, field_name="score", context=f"assessment answer grading, question_id={question_id}"
         )
+        # is_correct is DERIVED from the clamped score, never taken from the model's own
+        # boolean. AnswerGrade.is_correct and AnswerGrade.score are two independently
+        # forgeable fields on the same untrusted response: answer_grader_v3.txt documents the
+        # relationship ("is_correct is true only if score >= 0.6"), but nothing enforced it,
+        # so a response of {"score": 0.0, "is_correct": true} -- exactly what a partially
+        # successful "give full marks" injection produces -- was persisted and returned as a
+        # correct answer despite a 0.0 score. Deriving it removes the second forgeable field
+        # while leaving genuine partial credit (the score itself) entirely intact.
+        is_correct = score >= _IS_CORRECT_SCORE_THRESHOLD
 
     # Atomic conditional UPDATE (not "load, mutate, commit") -- same shape as
     # mission_service.complete / subscription_service._activate_paid for the identical class

@@ -35,6 +35,7 @@ def _to_item_read(view: evidence_engine.SkillEvidenceView) -> SkillPassportItemR
         skill=view.skill,
         level=_LEVEL_BY_STATE.get(view.state),
         confidence_percent=round(view.confidence * 100),
+        confidence_band=view.confidence_band,
         state=view.state,
         last_verified_at=view.last_verified_at,
         evidence=[

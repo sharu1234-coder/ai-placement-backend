@@ -266,7 +266,7 @@ def test_list_ats_checks_most_recent_first_with_filename(client, auth_headers, u
 
 def test_create_ats_check_requires_auth(client):
     resp = client.post("/resumes/1/ats-check", json={})
-    assert resp.status_code == 403
+    assert resp.status_code == 401
 
 
 def test_same_resume_checked_twice_produces_the_same_score(client, auth_headers, use_fake_ai):

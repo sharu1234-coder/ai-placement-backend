@@ -3,6 +3,14 @@ import pytest
 from app.core.config import Settings, settings, validate_for_production
 
 
+def _production_ready_ai(monkeypatch) -> None:
+    """AI_PROVIDER defaults to 'ollama' at localhost, which validate_for_production now
+    rejects in production (nothing would answer there, and every AI feature would silently
+    degrade to template text). Tests below that are about *other* settings set a real cloud
+    provider so they aren't coupled to that unrelated default."""
+    monkeypatch.setattr(settings, "ai_provider", "anthropic")
+
+
 def test_validate_for_production_is_a_noop_outside_production(monkeypatch) -> None:
     monkeypatch.setattr(settings, "environment", "development")
     monkeypatch.setattr(settings, "jwt_secret_key", Settings.model_fields["jwt_secret_key"].default)
@@ -24,6 +32,7 @@ def test_validate_for_production_passes_with_a_real_secret(monkeypatch) -> None:
     monkeypatch.setattr(settings, "email_provider", "smtp")
     monkeypatch.setattr(settings, "debug", False)
     monkeypatch.setattr(settings, "allowed_hosts", "api.aiplacementos.com")
+    _production_ready_ai(monkeypatch)
     # This dev checkout's .env ships a real rzp_test_ key (needed for the Razorpay-flow
     # tests elsewhere) -- explicitly override it here so this "everything else is production-
     # ready" test isn't coupled to that unrelated local dev value.
@@ -74,6 +83,7 @@ def test_validate_for_production_raises_with_a_test_mode_razorpay_key(monkeypatc
     monkeypatch.setattr(settings, "email_provider", "smtp")
     monkeypatch.setattr(settings, "debug", False)
     monkeypatch.setattr(settings, "allowed_hosts", "api.aiplacementos.com")
+    _production_ready_ai(monkeypatch)
     monkeypatch.setattr(settings, "razorpay_key_id", "rzp_test_abc123")
 
     with pytest.raises(RuntimeError, match="RAZORPAY_KEY_ID"):
@@ -86,6 +96,7 @@ def test_validate_for_production_passes_with_a_live_razorpay_key(monkeypatch) ->
     monkeypatch.setattr(settings, "email_provider", "smtp")
     monkeypatch.setattr(settings, "debug", False)
     monkeypatch.setattr(settings, "allowed_hosts", "api.aiplacementos.com")
+    _production_ready_ai(monkeypatch)
     monkeypatch.setattr(settings, "razorpay_key_id", "rzp_live_abc123")
 
     validate_for_production()  # must not raise
@@ -101,6 +112,7 @@ def test_validate_for_production_does_not_require_razorpay_to_be_configured(monk
     monkeypatch.setattr(settings, "email_provider", "smtp")
     monkeypatch.setattr(settings, "debug", False)
     monkeypatch.setattr(settings, "allowed_hosts", "api.aiplacementos.com")
+    _production_ready_ai(monkeypatch)
     monkeypatch.setattr(settings, "razorpay_key_id", None)
 
     validate_for_production()  # must not raise
@@ -118,3 +130,69 @@ def test_validate_for_production_still_validates_a_typoed_environment_value(monk
 
     with pytest.raises(RuntimeError, match="JWT_SECRET_KEY"):
         validate_for_production()
+
+
+def _production_base(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "environment", "production")
+    monkeypatch.setattr(settings, "jwt_secret_key", "a-real-random-64-char-secret-not-the-dev-default")
+    monkeypatch.setattr(settings, "email_provider", "smtp")
+    monkeypatch.setattr(settings, "debug", False)
+    monkeypatch.setattr(settings, "allowed_hosts", "api.aiplacementos.com")
+    monkeypatch.setattr(settings, "razorpay_key_id", "rzp_live_abc123")
+
+
+@pytest.mark.parametrize(
+    "loopback_url",
+    [
+        "http://localhost:11434",  # the literal un-overridden default
+        "http://127.0.0.1:11434",
+        "http://127.1:11434",  # still 127.0.0.0/8
+        "http://127.0.1.5:11434",
+        "http://0.0.0.0:11434",
+        "http://[::1]:11434",
+    ],
+)
+def test_validate_for_production_raises_for_ollama_on_loopback(monkeypatch, loopback_url) -> None:
+    """Real audit gap: AI_PROVIDER defaults to 'ollama' and OLLAMA_BASE_URL to localhost, and
+    unlike ANTHROPIC_API_KEY/SMTP_*/STORAGE_S3_* that combination does NOT fail loudly on
+    first use -- the connection error is caught as AIGenerationError and every call site falls
+    back to hand-authored template text. A deployment that simply never set either would serve
+    generic content from Career Path, Project Builder, Recruiter Attack, JD prep and answer
+    grading forever, returning 200s the whole time with no startup error and no 5xx to alert
+    on. Same silent-misconfiguration class as the rzp_test_ key check."""
+    _production_base(monkeypatch)
+    monkeypatch.setattr(settings, "ai_provider", "ollama")
+    monkeypatch.setattr(settings, "ollama_base_url", loopback_url)
+
+    with pytest.raises(RuntimeError, match="AI_PROVIDER"):
+        validate_for_production()
+
+
+def test_validate_for_production_allows_a_genuinely_self_hosted_ollama(monkeypatch) -> None:
+    """Deliberately NOT "ollama is forbidden in production" -- self-hosting Ollama at a real
+    reachable address is a legitimate topology, and only the un-overridden dev default is
+    rejected."""
+    _production_base(monkeypatch)
+    monkeypatch.setattr(settings, "ai_provider", "ollama")
+    monkeypatch.setattr(settings, "ollama_base_url", "http://ollama.internal:11434")
+
+    validate_for_production()  # must not raise
+
+
+def test_validate_for_production_ignores_ollama_url_when_provider_is_anthropic(monkeypatch) -> None:
+    """A leftover localhost OLLAMA_BASE_URL is harmless once the provider is the cloud one --
+    nothing reads it, so failing on it would be a false positive."""
+    _production_base(monkeypatch)
+    monkeypatch.setattr(settings, "ai_provider", "anthropic")
+    monkeypatch.setattr(settings, "ollama_base_url", "http://localhost:11434")
+
+    validate_for_production()  # must not raise
+
+
+def test_ollama_on_loopback_is_fine_in_development(monkeypatch) -> None:
+    """The default dev checkout -- every developer runs exactly this and must not be blocked."""
+    monkeypatch.setattr(settings, "environment", "development")
+    monkeypatch.setattr(settings, "ai_provider", "ollama")
+    monkeypatch.setattr(settings, "ollama_base_url", "http://localhost:11434")
+
+    validate_for_production()  # must not raise

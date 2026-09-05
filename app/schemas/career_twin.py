@@ -11,8 +11,13 @@ class SkillTwinItemRead(BaseModel):
     # interview score). None when the only evidence is unscored (a project, a resume mention)
     # -- never fabricated to fill the field.
     measured_score: Optional[float] = None
-    confidence_percent: int  # 0-100, evidence_engine's confidence rounded for display
+    # 0-100, but only ever one of five values (0/30/45/70/90) -- one per state. Kept for
+    # ordering and for bar lengths; do NOT render it as a precise percentage, because the
+    # engine has no such resolution. Show confidence_band instead.
+    confidence_percent: int
+    confidence_band: str  # none | low | moderate | high | very_high
     state: str  # claimed | supported | strong | verified | stale
+    # An actual verification date: set only by evidence the student did not self-assert.
     last_verified_at: Optional[datetime.datetime] = None
 
 

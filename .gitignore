@@ -1,7 +1,10 @@
 __pycache__/
 *.py[cod]
 *.egg-info/
-.venv/
+# Matches .venv, .venv312, .venv-py313, ... -- the bare `.venv/` rule silently failed to
+# cover a second, version-suffixed environment, which is exactly what gets created when
+# upgrading interpreters.
+.venv*/
 venv/
 env/
 

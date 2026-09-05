@@ -61,7 +61,7 @@ def _role_ids(client, auth_headers):
 
 def test_requires_auth(client):
     resp = client.post("/career-decisions/simulate", json={"role_ids": [1, 2]})
-    assert resp.status_code == 403
+    assert resp.status_code == 401
 
 
 def test_requires_premium(client, auth_headers):

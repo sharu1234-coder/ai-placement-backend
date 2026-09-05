@@ -25,7 +25,7 @@ def _sde_role_id(client, auth_headers):
 
 
 def test_requires_auth(client):
-    assert client.get("/missions/today").status_code == 403
+    assert client.get("/missions/today").status_code == 401
 
 
 def test_get_today_creates_a_mission(client, auth_headers):

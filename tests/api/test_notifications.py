@@ -32,7 +32,7 @@ def _complete_a_mission(client, auth_headers) -> None:
 
 
 def test_requires_auth(client):
-    assert client.get("/notifications/pending").status_code == 403
+    assert client.get("/notifications/pending").status_code == 401
 
 
 def test_empty_when_nothing_has_happened(client, auth_headers):

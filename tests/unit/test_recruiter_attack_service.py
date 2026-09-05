@@ -11,6 +11,7 @@ from app.ai.schemas.recruiter_attack import GeneratedRecruiterAttackEvaluation, 
 from app.database.base import Base
 from app.models.profile import StudentProfile
 from app.models.project_build import ProjectBuild
+from app.models.recruiter_attack_session import RecruiterAttackSession
 from app.models.recruiter_attack_turn import RecruiterAttackTurn
 from app.models.resume import Resume
 from app.models.weakness_record import WeaknessRecord
@@ -380,15 +381,60 @@ def test_results_are_computed_once_and_then_cached(db):
     assert ai.evaluation_calls == 1  # not recomputed on the second call
 
 
-def test_ai_failure_during_results_falls_back_to_a_conservative_summary(db):
+def test_ai_failure_during_results_reports_an_ungraded_session_with_no_scores(db):
+    """The fallback used to invent a 0.3-0.6 "score" from the completion ratio -- how many
+    questions were answered, not how well they were defended -- and write it to the same
+    columns a real grade uses. It now carries feedback text only, and every score stays NULL so
+    nothing downstream can mistake it for a judgment."""
     profile = _profile(db)
     build = _completed_build(db, profile)
     session = svc.start_session(db, profile, "project_build", build.id, None)
     _finish_session(db, profile, FailingAIProvider(), session.id)
 
     results = svc.get_results(db, profile.id, session.id, FailingAIProvider())
-    assert 0.0 <= results.overall_score <= 0.6
+
+    assert results.used_fallback is True
+    assert results.overall_score is None
+    assert results.technical_defense is None
+    assert results.project_ownership is None
+    assert results.specificity is None
+    assert results.communication is None
     assert "couldn't generate detailed AI feedback" in results.feedback
+
+
+def test_ungraded_session_contributes_no_evidence(db):
+    """evidence_engine selects recruiter-attack sessions on `overall_score.isnot(None)`, so
+    persisting the placeholder made an ungraded session a *scored evidence source* -- moving a
+    student's skill state, Career Twin readiness and Skill Passport by a number that meant
+    nothing. Leaving the score NULL is what keeps it out."""
+    profile = _profile(db)
+    build = _completed_build(db, profile)
+    session = svc.start_session(db, profile, "project_build", build.id, None)
+    _finish_session(db, profile, FailingAIProvider(), session.id)
+    svc.get_results(db, profile.id, session.id, FailingAIProvider())
+
+    row = db.query(RecruiterAttackSession).filter(RecruiterAttackSession.id == session.id).first()
+    assert row.overall_score is None  # exactly the column the evidence query filters on
+
+
+def test_an_ungraded_session_is_regraded_once_the_ai_recovers(db):
+    """get_results short-circuits on `session.overall_score is not None`. While the fallback
+    persisted a score, that short-circuit tripped forever -- so the fallback's own promise to
+    the student ("try again later for a full evaluation") could never actually be honored."""
+    profile = _profile(db)
+    build = _completed_build(db, profile)
+    session = svc.start_session(db, profile, "project_build", build.id, None)
+    _finish_session(db, profile, FailingAIProvider(), session.id)
+
+    first = svc.get_results(db, profile.id, session.id, FailingAIProvider())
+    assert first.used_fallback is True
+
+    # Same session, AI now available -- this must produce a real grade rather than returning
+    # the cached ungraded result.
+    second = svc.get_results(db, profile.id, session.id, SucceedingAIProvider())
+
+    assert second.used_fallback is False
+    assert second.overall_score is not None
 
 
 def test_ai_failure_fallback_never_touches_interview_memory(db):

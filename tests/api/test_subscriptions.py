@@ -68,7 +68,7 @@ def test_plans_are_server_authoritative(client, auth_headers):
 
 def test_status_requires_auth(client):
     response = client.get("/subscriptions/status")
-    assert response.status_code == 403
+    assert response.status_code == 401
 
 
 def test_status_defaults_to_free_never_subscribed(client, auth_headers):

@@ -6,6 +6,14 @@ topic_key | title | track | stage | skill_tag
 
 {topic_lines}
 
+(Maintainer note: this is the only shipped prompt with no <<<X_START>>>/<<<X_END>>> untrusted-
+data fence, and that is deliberate -- every field in topic_lines comes from the static,
+code-defined track catalog in placement_path_rules.py, so nothing a student can type reaches
+this template. If you ever add a field that a student CAN influence -- a custom role name, a
+resume-derived string, free-text notes -- fence it the way the other prompts do and add the
+matching SECURITY RULE clause. Do not assume the absence of a fence here means one is not
+needed for the value you are adding.)
+
 For EVERY topic_key listed above, write one short why_it_matters explanation (1-3 sentences)
 of why that specific topic matters for placement/interview preparation. Follow these rules
 strictly:
