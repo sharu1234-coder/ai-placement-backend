@@ -49,3 +49,24 @@ def get_current_user(
         # app/services/password_reset_service.py's reset_password both bump token_version).
         raise credentials_error
     return user
+
+
+def require_premium(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> User:
+    """Server-side enforcement for the "advanced tier" features the Android app already gates
+    behind PaywallGate (Career Decision Lab in full; Career Twin's evidence-breakdown reasons).
+    PaywallGate only ever hides UI -- without this, any authenticated free user could call the
+    underlying endpoint directly and get the full premium response. Local imports avoid a
+    module-load-time circular import between the API layer and the service layer."""
+    from app.services.profile_service import get_or_create_profile
+    from app.services.subscription_service import is_premium
+
+    profile = get_or_create_profile(db, current_user)
+    if not is_premium(db, profile.id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="This feature requires an active Premium subscription",
+        )
+    return current_user

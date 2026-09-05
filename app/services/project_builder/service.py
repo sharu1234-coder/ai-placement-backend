@@ -31,6 +31,10 @@ from app.services.project_builder.ai_generation import generate_stage_guidance
 from app.services.project_builder.stages import STAGE_ORDER, STAGE_TITLES
 from app.services.role_context import resolve_role_context
 
+# Safety cap, not a product pagination feature (disclosed gap -- see assessment_service.py's
+# _MAX_HISTORY_ROWS for the full rationale): protects response size for a long-lived account.
+_MAX_HISTORY_ROWS = 200
+
 
 class ProjectBuildError(Exception):
     pass
@@ -132,6 +136,7 @@ def list_builds(db: Session, profile_id: int) -> List[ProjectBuildListItemRead]:
         db.query(ProjectBuild)
         .filter(ProjectBuild.profile_id == profile_id)
         .order_by(ProjectBuild.created_at.desc())
+        .limit(_MAX_HISTORY_ROWS)
         .all()
     )
     return [_list_item_read(b) for b in builds]

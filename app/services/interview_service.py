@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.ai.provider import AIProvider
 from app.ai.schemas.interview import GeneratedInterviewEvaluation, GeneratedInterviewQuestion
+from app.ai.score_utils import clamp_unit_score
 from app.models.interview import Interview
 from app.models.interview_answer import InterviewAnswer
 from app.models.interview_evaluation import InterviewEvaluation
@@ -392,23 +393,32 @@ def get_evaluation(
         if answer_texts:
             filler_word_rate = _filler_word_rate(" ".join(answer_texts))
 
+    def _clamped(field_name: str) -> float:
+        # Every dimension of GeneratedInterviewEvaluation is documented (in
+        # interview_evaluation_v3.txt) as a float from 0.0 to 1.0 -- the schema itself enforces
+        # no such bound, so this is the actual enforcement before anything is persisted or fed
+        # into Interview Memory below.
+        return clamp_unit_score(
+            getattr(generated, field_name), field_name=field_name, context=f"interview evaluation, interview_id={interview_id}"
+        )
+
     evaluation = InterviewEvaluation(
         interview_id=interview_id,
-        technical_correctness=generated.technical_correctness,
-        relevance=generated.relevance,
-        completeness=generated.completeness,
-        reasoning=generated.reasoning,
-        structure=generated.structure,
-        clarity=generated.clarity,
+        technical_correctness=_clamped("technical_correctness"),
+        relevance=_clamped("relevance"),
+        completeness=_clamped("completeness"),
+        reasoning=_clamped("reasoning"),
+        structure=_clamped("structure"),
+        clarity=_clamped("clarity"),
         # grammar is a text-mode field per the doc's schema; voice answers are judged on
         # speaking_pace/filler_word_rate instead.
-        grammar=generated.grammar if interview.mode == "text" else None,
+        grammar=_clamped("grammar") if interview.mode == "text" else None,
         # speaking_pace would need audio duration, which isn't available since raw audio
         # is never persisted -- left None for V1, see README.
         speaking_pace=None,
         filler_word_rate=filler_word_rate,
-        role_jd_coverage=generated.role_jd_coverage,
-        overall_score=generated.overall_score,
+        role_jd_coverage=_clamped("role_jd_coverage"),
+        overall_score=_clamped("overall_score"),
         feedback_text=generated.feedback,
     )
     db.add(evaluation)

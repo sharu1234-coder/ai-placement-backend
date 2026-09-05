@@ -1,9 +1,10 @@
 import datetime
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_db
+from app.core.rate_limit import limiter
 from app.core.security import verify_password
 from app.models.certification import Certification
 from app.models.education import Education
@@ -218,7 +219,9 @@ def delete_skill(
 @router.post(
     "/users/me/projects", response_model=ProjectRead, status_code=status.HTTP_201_CREATED
 )
+@limiter.limit("20/hour")
 def add_project(
+    request: Request,
     payload: ProjectCreate,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),

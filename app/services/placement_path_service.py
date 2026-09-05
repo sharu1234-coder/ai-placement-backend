@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -22,6 +23,8 @@ from app.schemas.placement_path import (
 from app.services import placement_path_rules as rules
 from app.services.skill_matching import latest_resume_skills
 from app.services.weakness_service import compute_weaknesses
+
+logger = logging.getLogger(__name__)
 
 # Safety cap, not a product pagination feature (disclosed gap -- see assessment_service.py's
 # _MAX_HISTORY_ROWS for the full rationale): protects response size for a long-lived account.
@@ -98,8 +101,8 @@ def _generate_explanations(ai_provider: AIProvider, specs: List[rules.TopicSpec]
         for item in generated.explanations:
             if item.topic_key in valid_keys:
                 explanations[item.topic_key] = item.why_it_matters
-    except AIGenerationError:
-        pass
+    except AIGenerationError as exc:
+        logger.warning("AI topic-explanation generation failed for %d topics, using template fallback: %s", len(specs), exc)
 
     for spec in specs:
         if spec.topic_key not in explanations:

@@ -25,12 +25,23 @@ from app.models.assessment_blueprint import AssessmentBlueprint
 from app.models.assessment_result import AssessmentResult
 from app.models.career_path import CareerPath
 from app.models.interview import Interview
+from app.models.job_description import JobDescription
 from app.models.placement_path import PlacementPath
+from app.models.profile import StudentProfile  # noqa: F401  (registers the FK target table)
+from app.models.project_build import ProjectBuild
+from app.models.recruiter_attack_session import RecruiterAttackSession
 from app.models.resume import Resume
 from app.models.resume_ats_check import ResumeAtsCheck
-from app.services import assessment_service, interview_service, placement_path_service
+from app.services import (
+    assessment_service,
+    interview_service,
+    jd_service,
+    placement_path_service,
+    recruiter_attack_service,
+)
 from app.services.ats_check_service import list_ats_checks
 from app.services.career_path import service as career_path_service
+from app.services.project_builder import service as project_builder_service
 
 PROFILE_ID = 1
 _OVER_CAP = 205  # comfortably past every service's 200-row cap
@@ -138,6 +149,56 @@ def test_ats_check_list_is_capped(db):
 
     history = list_ats_checks(db, PROFILE_ID)
     assert len(history) == ats_check_service._MAX_HISTORY_ROWS
+
+
+def test_recruiter_attack_list_sessions_is_capped(db):
+    """Real audit gap, now fixed: list_sessions previously had no equivalent to the
+    _MAX_HISTORY_ROWS cap every sibling list endpoint already applies."""
+    for i in range(_OVER_CAP):
+        db.add(
+            RecruiterAttackSession(
+                profile_id=PROFILE_ID,
+                source_type="resume_claim",
+                source_label=f"Claim {i}",
+                status="completed",
+                created_at=datetime.datetime.utcnow() + datetime.timedelta(seconds=i),
+            )
+        )
+    db.commit()
+
+    sessions = recruiter_attack_service.list_sessions(db, PROFILE_ID)
+    assert len(sessions) == recruiter_attack_service._MAX_HISTORY_ROWS
+
+
+def test_project_builder_list_builds_is_capped(db):
+    for i in range(_OVER_CAP):
+        db.add(
+            ProjectBuild(
+                profile_id=PROFILE_ID,
+                title=f"Build {i}",
+                status="not_started",
+                created_at=datetime.datetime.utcnow() + datetime.timedelta(seconds=i),
+            )
+        )
+    db.commit()
+
+    builds = project_builder_service.list_builds(db, PROFILE_ID)
+    assert len(builds) == project_builder_service._MAX_HISTORY_ROWS
+
+
+def test_jd_service_list_job_descriptions_is_capped(db):
+    for i in range(_OVER_CAP):
+        db.add(
+            JobDescription(
+                profile_id=PROFILE_ID,
+                raw_text=f"JD text {i}",
+                created_at=datetime.datetime.utcnow() + datetime.timedelta(seconds=i),
+            )
+        )
+    db.commit()
+
+    jds = jd_service.list_job_descriptions(db, PROFILE_ID)
+    assert len(jds) == jd_service._MAX_HISTORY_ROWS
 
 
 def test_career_path_list_all_is_capped(db):

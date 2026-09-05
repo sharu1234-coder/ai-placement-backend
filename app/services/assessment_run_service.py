@@ -2,11 +2,13 @@ import logging
 from pathlib import Path
 from typing import List, Optional
 
+from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from app.ai.output_guard import looks_like_prompt_leak
 from app.ai.provider import AIProvider
 from app.ai.schemas.assessment import AnswerGrade, GeneratedQuestion
+from app.ai.score_utils import clamp_unit_score
 from app.models.assessment import Assessment
 from app.models.assessment_blueprint import AssessmentBlueprint
 from app.models.assessment_result import AssessmentResult
@@ -23,7 +25,7 @@ from app.schemas.assessment import (
 )
 
 _QUESTION_PROMPT_PATH = Path(__file__).resolve().parent.parent / "ai" / "prompts" / "question_generator_v2.txt"
-_GRADER_PROMPT_PATH = Path(__file__).resolve().parent.parent / "ai" / "prompts" / "answer_grader_v2.txt"
+_GRADER_PROMPT_PATH = Path(__file__).resolve().parent.parent / "ai" / "prompts" / "answer_grader_v3.txt"
 
 _DIFFICULTIES = ["easy", "medium", "hard"]
 _WEAKNESS_THRESHOLD = 0.6
@@ -35,10 +37,18 @@ def _sanitize_generated_question(generated: GeneratedQuestion, skill: str) -> Ge
     """Code-level backstop, independent of the prompt's own hardening (see
     app/ai/output_guard.py's module docstring for why prompt wording alone was not reliable
     enough here): if skill_tag was ever attacker-influenced instruction-shaped text, this
-    catches a model that echoed prompt scaffolding into `prompt`/`explanation` instead of
-    generating a genuine question, and swaps in a safe generic question rather than ever
-    surfacing the leak to a student."""
-    if looks_like_prompt_leak(generated.prompt) or looks_like_prompt_leak(generated.explanation):
+    catches a model that echoed prompt scaffolding into `prompt`/`explanation`/
+    `expected_answer_or_rubric` instead of generating a genuine question, and swaps in a safe
+    generic question rather than ever surfacing the leak to a student.
+
+    `expected_answer_or_rubric` is checked here too (a real audit gap: it previously wasn't)
+    because it is exactly the field answer_grader_v3.txt re-interpolates as {rubric} for every
+    non-mcq answer -- a leak that survived here would flow straight into a second AI prompt."""
+    if (
+        looks_like_prompt_leak(generated.prompt)
+        or looks_like_prompt_leak(generated.explanation)
+        or looks_like_prompt_leak(generated.expected_answer_or_rubric)
+    ):
         logger.warning(
             "Discarding a generated question for skill=%r: output contained prompt-leak markers.",
             skill,
@@ -257,13 +267,30 @@ def submit_answer(
         )
         grade: AnswerGrade = ai_provider.generate_structured(grade_prompt, AnswerGrade)
         is_correct = grade.is_correct
-        score = grade.score
+        score = clamp_unit_score(
+            grade.score, field_name="score", context=f"assessment answer grading, question_id={question_id}"
+        )
 
-    attempt.student_answer = student_answer
-    attempt.is_correct = is_correct
-    attempt.score = score
-    attempt.time_taken_seconds = time_taken_seconds
+    # Atomic conditional UPDATE (not "load, mutate, commit") -- same shape as
+    # mission_service.complete / subscription_service._activate_paid for the identical class
+    # of race: two concurrent submissions for the same pending question can both pass the
+    # "still pending" read above (and, for a non-mcq question, both complete a real AI grading
+    # call) before either commits. Only the request whose UPDATE actually flips a still-NULL
+    # student_answer row wins; the loser's grade -- however it was computed -- is discarded
+    # here rather than silently overwriting the winner's already-persisted grade.
+    result = db.execute(
+        update(QuestionAttempt)
+        .where(QuestionAttempt.id == attempt.id, QuestionAttempt.student_answer.is_(None))
+        .values(
+            student_answer=student_answer,
+            is_correct=is_correct,
+            score=score,
+            time_taken_seconds=time_taken_seconds,
+        )
+    )
     db.commit()
+    if not result.rowcount:
+        raise QuestionNotPendingError("No pending question with this id for this assessment")
 
     return AnswerResult(question_id=question.id, is_correct=is_correct, score=score, explanation=question.explanation)
 

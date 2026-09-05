@@ -35,7 +35,6 @@ anthropic==0.125.0
 # S3 or any S3-compatible provider (R2, MinIO, B2, Spaces, ...) via STORAGE_S3_ENDPOINT_URL.
 boto3==1.35.99
 
-pytest==8.3.4
 httpx==0.28.1
 
 # Rate limiting / brute-force protection (auth endpoints) -- in-memory storage by default, no

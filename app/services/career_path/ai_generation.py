@@ -11,6 +11,7 @@ AIGenerationError, generation falls back to hand-authored, deterministic content
 raises -- a Career Path must never fail to generate just because the AI call failed.
 """
 
+import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +20,8 @@ from typing import Dict, List, Sequence, Tuple
 from app.ai.provider import AIGenerationError, AIProvider
 from app.ai.schemas.career_path import GeneratedCareerPathExplanations, GeneratedRoleCatalog
 from app.services.career_path.role_catalog import PHASE_ORDER, ProjectTemplate, RoleFamilyDef, SkillTemplate
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -33,7 +36,7 @@ class ExplainerSkillInput:
 
 
 _ROLE_PROMPT_PATH = Path(__file__).resolve().parent.parent.parent / "ai" / "prompts" / "career_path_role_v2.txt"
-_EXPLAINER_PROMPT_PATH = Path(__file__).resolve().parent.parent.parent / "ai" / "prompts" / "career_path_explainer_v2.txt"
+_EXPLAINER_PROMPT_PATH = Path(__file__).resolve().parent.parent.parent / "ai" / "prompts" / "career_path_explainer_v3.txt"
 
 _SLUG_PATTERN = re.compile(r"[^a-z0-9]+")
 
@@ -290,7 +293,8 @@ def get_or_generate_role_definition(role_name: str, ai_provider: AIProvider) -> 
             project_templates=_generic_project_templates(role_name),
         )
         return family, "ai_generated"
-    except AIGenerationError:
+    except AIGenerationError as exc:
+        logger.warning("AI role-family generation failed for role_family_key=%s, using fallback: %s", family_key, exc)
         return _generic_role_family(family_key, role_name), "fallback"
 
 
@@ -318,8 +322,8 @@ def generate_skill_explanations(role_name: str, ai_provider: AIProvider, items: 
             for explanation in generated.explanations:
                 if explanation.skill_key in valid_keys:
                     explanations[explanation.skill_key] = explanation.why_it_matters
-        except AIGenerationError:
-            pass
+        except AIGenerationError as exc:
+            logger.warning("AI skill-explanation generation failed for role=%s, using template text: %s", role_name, exc)
 
     for item in items:
         if item.skill_key not in explanations:

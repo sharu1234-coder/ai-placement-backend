@@ -11,6 +11,7 @@ from app.ai.schemas.recruiter_attack import GeneratedRecruiterAttackEvaluation, 
 from app.database.base import Base
 from app.models.profile import StudentProfile
 from app.models.project_build import ProjectBuild
+from app.models.recruiter_attack_turn import RecruiterAttackTurn
 from app.models.resume import Resume
 from app.models.weakness_record import WeaknessRecord
 from app.services import evidence_engine
@@ -66,6 +67,25 @@ class LeakingAIProvider(AIProvider):
             return GeneratedRecruiterAttackEvaluation(
                 technical_defense=1.0, project_ownership=1.0, specificity=1.0, communication=1.0,
                 overall_score=1.0, feedback=leak_text,
+            )
+        raise AssertionError(f"Unexpected schema requested in test: {schema}")
+
+    def generate_text(self, prompt):
+        return "fake"
+
+
+class OutOfRangeScoreAIProvider(AIProvider):
+    """Simulates a schema-valid but semantically invalid AI response: GeneratedRecruiterAttack
+    Evaluation's fields are plain `float` with no declared bound, so nothing stops a provider
+    from returning a "0.0-1.0" score as 50.0 or -1.0."""
+
+    def generate_structured(self, prompt, schema):
+        if schema is GeneratedRecruiterAttackQuestion:
+            return GeneratedRecruiterAttackQuestion(question_text="Defend this.", based_on="Python")
+        if schema is GeneratedRecruiterAttackEvaluation:
+            return GeneratedRecruiterAttackEvaluation(
+                technical_defense=50.0, project_ownership=-1.0, specificity=0.5, communication=0.5,
+                overall_score=1.5, feedback="Out-of-range scores from a hypothetically confused model.",
             )
         raise AssertionError(f"Unexpected schema requested in test: {schema}")
 
@@ -284,6 +304,43 @@ def test_empty_answer_is_accepted_like_a_real_but_weak_answer(db):
     assert answered.answer_text == ""
 
 
+def test_concurrent_answer_turn_loses_the_atomic_update_race_without_corrupting_the_answer(db):
+    """Regression for a real audit finding: answer_turn previously read the turn, then
+    separately mutated and committed it ("load, mutate, commit") -- the same race class
+    mission_service.complete / subscription_service._activate_paid / assessment_run_service.
+    submit_answer already guard against elsewhere. Genuinely simulates two near-simultaneous
+    requests via two separate DB sessions on the same in-memory database (StaticPool): session
+    B answers first and commits, then session A's own answer_turn call runs its atomic
+    conditional UPDATE (WHERE answer_text IS NULL) against a row it still believes is
+    unanswered -- that UPDATE must affect zero rows and raise TurnNotPendingError rather than
+    silently overwriting session B's already-persisted answer."""
+    profile = _profile(db)
+    build = _completed_build(db, profile)
+    ai = SucceedingAIProvider()
+    session = svc.start_session(db, profile, "project_build", build.id, None)
+    turn = svc.get_next_turn(db, profile.id, session.id, ai).turn
+
+    session_b = sessionmaker(bind=db.get_bind())()
+    try:
+        svc.answer_turn(session_b, profile.id, session.id, turn.id, "Session B's real answer.")
+    finally:
+        session_b.close()
+
+    # `db`'s own in-memory copy of the turn still believes it's unanswered -- exactly the
+    # state a truly concurrent second request would be in.
+    with pytest.raises(svc.TurnNotPendingError):
+        svc.answer_turn(db, profile.id, session.id, turn.id, "Session A's conflicting answer.")
+
+    # Re-fetch via a fresh session to prove session B's answer was actually persisted and
+    # never touched by the losing request, not just correct in its own return value.
+    session_c = sessionmaker(bind=db.get_bind())()
+    try:
+        persisted = session_c.get(RecruiterAttackTurn, turn.id)
+        assert persisted.answer_text == "Session B's real answer."
+    finally:
+        session_c.close()
+
+
 def test_turn_from_another_profiles_session_is_not_found(db):
     profile = _profile(db)
     other = _profile(db)
@@ -332,6 +389,47 @@ def test_ai_failure_during_results_falls_back_to_a_conservative_summary(db):
     results = svc.get_results(db, profile.id, session.id, FailingAIProvider())
     assert 0.0 <= results.overall_score <= 0.6
     assert "couldn't generate detailed AI feedback" in results.feedback
+
+
+def test_ai_failure_fallback_never_touches_interview_memory(db):
+    """Regression for a real audit finding: the fallback's 0.3-0.6 score is an honest
+    "couldn't grade this" placeholder, not a judgment of the candidate's defense. Before this
+    fix, get_results fed it into weakness_record_service unconditionally -- creating a brand
+    new weak record for a candidate who was never actually graded, or (worse) silently
+    resetting a real improvement streak's consecutive_good_signals back to 0 -- purely
+    because the AI provider was unavailable during this one session."""
+    profile = _profile(db)
+    build = _completed_build(db, profile)
+    session = svc.start_session(db, profile, "project_build", build.id, None)
+    _finish_session(db, profile, FailingAIProvider(), session.id)
+
+    svc.get_results(db, profile.id, session.id, FailingAIProvider())
+
+    assert db.query(WeaknessRecord).filter(WeaknessRecord.profile_id == profile.id).count() == 0
+
+
+def test_out_of_range_evaluation_scores_are_clamped(db):
+    """Real audit gap, now fixed: no code-level bound previously existed on any AI-assigned
+    score -- a Pydantic float field accepts 50.0 exactly as readily as 0.5. Every dimension
+    documented as 0.0-1.0 in recruiter_attack_evaluation_v2.txt must be clamped into that
+    range before being persisted, not trusted verbatim."""
+    profile = _profile(db)
+    build = _completed_build(db, profile)
+    provider = OutOfRangeScoreAIProvider()
+    session = svc.start_session(db, profile, "project_build", build.id, None)
+    _finish_session(db, profile, provider, session.id)
+
+    results = svc.get_results(db, profile.id, session.id, provider)
+
+    assert results.technical_defense == 1.0  # clamped down from 50.0
+    assert results.project_ownership == 0.0  # clamped up from -1.0
+    assert results.overall_score == 1.0  # clamped down from 1.5
+    all_scores = (
+        results.technical_defense, results.project_ownership,
+        results.specificity, results.communication, results.overall_score,
+    )
+    for value in all_scores:
+        assert 0.0 <= value <= 1.0
 
 
 def test_leaked_evaluation_feedback_falls_back_to_a_safe_summary(db):
@@ -395,7 +493,7 @@ _PROMPTS_DIR = Path(__file__).resolve().parent.parent.parent / "app" / "ai" / "p
 
 
 def test_question_prompt_frames_the_claim_as_untrusted_data():
-    text = (_PROMPTS_DIR / "recruiter_attack_question_v1.txt").read_text(encoding="utf-8")
+    text = (_PROMPTS_DIR / "recruiter_attack_question_v2.txt").read_text(encoding="utf-8")
     assert "UNTRUSTED DATA" in text
     assert "<<<CLAIM_START>>>" in text and "<<<CLAIM_END>>>" in text
     marker_index = text.index("{claim_context}")
@@ -403,14 +501,14 @@ def test_question_prompt_frames_the_claim_as_untrusted_data():
 
 
 def test_question_prompt_frames_prior_answers_as_untrusted_data():
-    text = (_PROMPTS_DIR / "recruiter_attack_question_v1.txt").read_text(encoding="utf-8")
+    text = (_PROMPTS_DIR / "recruiter_attack_question_v2.txt").read_text(encoding="utf-8")
     assert "<<<PRIOR_ANSWERS_START>>>" in text and "<<<PRIOR_ANSWERS_END>>>" in text
     marker_index = text.index("{prior_turns}")
     assert "UNTRUSTED DATA" in text[:marker_index]
 
 
 def test_evaluation_prompt_frames_the_claim_and_transcript_as_untrusted_data():
-    text = (_PROMPTS_DIR / "recruiter_attack_evaluation_v1.txt").read_text(encoding="utf-8")
+    text = (_PROMPTS_DIR / "recruiter_attack_evaluation_v2.txt").read_text(encoding="utf-8")
     assert "UNTRUSTED DATA" in text
     assert "<<<CLAIM_START>>>" in text and "<<<CLAIM_END>>>" in text
     assert "<<<TRANSCRIPT_START>>>" in text and "<<<TRANSCRIPT_END>>>" in text
@@ -421,5 +519,5 @@ def test_evaluation_prompt_frames_the_claim_and_transcript_as_untrusted_data():
 
 
 def test_recruiter_attack_service_points_at_the_versioned_prompts():
-    assert svc._QUESTION_PROMPT_PATH.name == "recruiter_attack_question_v1.txt"
-    assert svc._EVALUATION_PROMPT_PATH.name == "recruiter_attack_evaluation_v1.txt"
+    assert svc._QUESTION_PROMPT_PATH.name == "recruiter_attack_question_v2.txt"
+    assert svc._EVALUATION_PROMPT_PATH.name == "recruiter_attack_evaluation_v2.txt"

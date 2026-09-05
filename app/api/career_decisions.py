@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
-from app.api.deps import get_current_user, get_db
+from app.api.deps import get_db, require_premium
 from app.core.rate_limit import limiter
 from app.models.user import User
 from app.schemas.career_decision import CareerDecisionSimulationRead, SimulateCareerDecisionsRequest
@@ -16,7 +16,7 @@ router = APIRouter(prefix="/career-decisions", tags=["career-decisions"])
 def simulate(
     request: Request,
     payload: SimulateCareerDecisionsRequest,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(require_premium),
     db: Session = Depends(get_db),
 ) -> CareerDecisionSimulationRead:
     profile = get_or_create_profile(db, current_user)

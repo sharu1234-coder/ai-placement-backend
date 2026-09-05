@@ -158,3 +158,16 @@ def validate_for_production() -> None:
             "ALLOWED_HOSTS is still '*' -- set it to your real production domain(s) "
             '(comma-separated, e.g. "api.aiplacementos.com") before running in production.'
         )
+    if settings.razorpay_key_id is not None and settings.razorpay_key_id.startswith("rzp_test_"):
+        # Unlike the checks above, a missing/None razorpay_key_id is left alone here -- that
+        # already fails loudly on first real use (subscription_service's own "Razorpay is not
+        # configured" error), matching the same "fail loudly on first use" treatment this file's
+        # own docstring already applies to ANTHROPIC_API_KEY/STORAGE_S3_*/SMTP_*. What has no
+        # such safety net is a *configured* key that's silently still in test mode: a
+        # `rzp_test_...` key id surviving into a production deployment would accept real user
+        # traffic while every "payment" is actually a free Razorpay test-mode transaction --
+        # the checkout would appear to work end-to-end while collecting no real money.
+        raise RuntimeError(
+            "RAZORPAY_KEY_ID is still a test-mode key ('rzp_test_...') -- set it to your real "
+            "live-mode key ('rzp_live_...') before running in production."
+        )

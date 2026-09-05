@@ -1,3 +1,4 @@
+import logging
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -32,6 +33,8 @@ from app.services import placement_path_rules as rules
 from app.services.matching_service import match_resume_to_job
 from app.services.weakness_service import compute_weaknesses
 
+logger = logging.getLogger(__name__)
+
 
 class JobDescriptionInUseError(Exception):
     """Raised when trying to delete a JD that an AssessmentBlueprint or Interview still
@@ -39,8 +42,12 @@ class JobDescriptionInUseError(Exception):
 
 _PROMPT_PATH = Path(__file__).resolve().parent.parent / "ai" / "prompts" / "jd_parser_v2.txt"
 _PREP_PLAN_PROMPT_PATH = (
-    Path(__file__).resolve().parent.parent / "ai" / "prompts" / "jd_preparation_plan_v2.txt"
+    Path(__file__).resolve().parent.parent / "ai" / "prompts" / "jd_preparation_plan_v3.txt"
 )
+
+# Safety cap, not a product pagination feature (disclosed gap -- see assessment_service.py's
+# _MAX_HISTORY_ROWS for the full rationale): protects response size for a long-lived account.
+_MAX_HISTORY_ROWS = 200
 
 # Always-relevant preparation categories for this app's campus-placement domain -- matches
 # placement_path_rules.py's own "DSA/Aptitude are baseline, near-universal" philosophy.
@@ -177,6 +184,7 @@ def list_job_descriptions(db: Session, profile_id: int) -> List[JobDescriptionLi
         db.query(JobDescription)
         .filter(JobDescription.profile_id == profile_id)
         .order_by(JobDescription.created_at.desc())
+        .limit(_MAX_HISTORY_ROWS)
         .all()
     )
     jd_ids = [jd.id for jd in jds]
@@ -362,8 +370,9 @@ def generate_preparation_plan(
         interview_questions = [
             InterviewPrepQuestionRead(bucket=q.bucket, question=q.question) for q in generated.interview_questions
         ]
-    except AIGenerationError:
-        pass  # never blocks plan generation -- categories fall back to a template reason below
+    except AIGenerationError as exc:
+        # Never blocks plan generation -- categories fall back to a template reason below.
+        logger.warning("AI prep-plan generation failed for jd_id=%s, using template fallback: %s", jd_id, exc)
 
     preparation_plan = [
         PreparationPlanCategoryRead(

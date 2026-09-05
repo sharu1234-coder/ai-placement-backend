@@ -73,7 +73,7 @@ _PROMPTS_DIR = Path(__file__).resolve().parent.parent.parent / "app" / "ai" / "p
 
 
 def test_stage_guidance_prompt_frames_title_and_stack_as_untrusted_data():
-    text = (_PROMPTS_DIR / "project_builder_stage_guidance_v1.txt").read_text(encoding="utf-8")
+    text = (_PROMPTS_DIR / "project_builder_stage_guidance_v2.txt").read_text(encoding="utf-8")
     assert "UNTRUSTED DATA" in text
     assert "<<<TITLE_START>>>" in text and "<<<TITLE_END>>>" in text
     assert "<<<STACK_START>>>" in text and "<<<STACK_END>>>" in text
@@ -84,4 +84,4 @@ def test_stage_guidance_prompt_frames_title_and_stack_as_untrusted_data():
 
 
 def test_ai_generation_points_at_the_versioned_prompt():
-    assert ai_generation._PROMPT_PATH.name == "project_builder_stage_guidance_v1.txt"
+    assert ai_generation._PROMPT_PATH.name == "project_builder_stage_guidance_v2.txt"

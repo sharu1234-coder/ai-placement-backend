@@ -2,6 +2,7 @@ import logging
 
 from sqlalchemy.orm import Session
 
+from app.models.arena_attempt import ArenaAttempt
 from app.models.assessment import Assessment
 from app.models.assessment_blueprint import AssessmentBlueprint
 from app.models.assessment_result import AssessmentResult
@@ -11,6 +12,7 @@ from app.models.career_path_project import CareerPathProject
 from app.models.career_path_skill_item import CareerPathSkillItem
 from app.models.certification import Certification
 from app.models.education import Education
+from app.models.evidence_state_snapshot import EvidenceStateSnapshot
 from app.models.experience import Experience
 from app.models.interview import Interview
 from app.models.interview_answer import InterviewAnswer
@@ -19,6 +21,8 @@ from app.models.interview_question import InterviewQuestion
 from app.models.job_description import JobDescription
 from app.models.job_match import JobMatch
 from app.models.job_preparation_plan import JobPreparationPlan
+from app.models.mission import Mission
+from app.models.notification_event import NotificationEvent
 from app.models.password_reset_token import PasswordResetToken
 from app.models.placement_alarm_challenge import PlacementAlarmChallenge
 from app.models.placement_alarm_question_attempt import PlacementAlarmQuestionAttempt
@@ -26,7 +30,12 @@ from app.models.placement_path import PlacementPath
 from app.models.placement_path_topic import PlacementPathTopic
 from app.models.profile import StudentProfile
 from app.models.project import Project
+from app.models.project_build import ProjectBuild
+from app.models.project_build_stage import ProjectBuildStage
 from app.models.question_attempt import QuestionAttempt
+from app.models.readiness_snapshot import ReadinessSnapshot
+from app.models.recruiter_attack_session import RecruiterAttackSession
+from app.models.recruiter_attack_turn import RecruiterAttackTurn
 from app.models.requirement import Requirement
 from app.models.resume import Resume
 from app.models.resume_analysis import ResumeAnalysis
@@ -37,6 +46,7 @@ from app.models.skill import Skill
 from app.models.skill_gap import SkillGap
 from app.models.subscription import Subscription
 from app.models.user import User
+from app.models.weakness_record import WeaknessRecord
 from app.storage.provider import StorageProvider
 
 logger = logging.getLogger(__name__)
@@ -95,6 +105,29 @@ def delete_account(db: Session, user: User, storage: StorageProvider) -> None:
         db.query(QuestionAttempt).filter(
             QuestionAttempt.assessment_id.in_(db.query(Assessment.id).filter(Assessment.profile_id == pid))
         ).delete(synchronize_session=False)
+        # arena_attempts.assessment_id is NOT NULL+unique and missions.assessment_id is
+        # nullable but frequently set on completion (mission_service.complete) -- both must
+        # go before the `assessments` delete below or that delete raises IntegrityError the
+        # moment either feature has ever been used (no FK in this schema has ondelete=CASCADE).
+        db.query(ArenaAttempt).filter(ArenaAttempt.profile_id == pid).delete(synchronize_session=False)
+        db.query(Mission).filter(Mission.profile_id == pid).delete(synchronize_session=False)
+        # Pure leaves: profile_id-owned, referenced by nothing else in this schema.
+        db.query(EvidenceStateSnapshot).filter(EvidenceStateSnapshot.profile_id == pid).delete(
+            synchronize_session=False
+        )
+        db.query(NotificationEvent).filter(NotificationEvent.profile_id == pid).delete(synchronize_session=False)
+        db.query(ReadinessSnapshot).filter(ReadinessSnapshot.profile_id == pid).delete(synchronize_session=False)
+        db.query(WeaknessRecord).filter(WeaknessRecord.profile_id == pid).delete(synchronize_session=False)
+        # recruiter_attack_turns.session_id and project_build_stages.build_id must go before
+        # their respective parents (recruiter_attack_sessions, project_builds) below.
+        db.query(RecruiterAttackTurn).filter(
+            RecruiterAttackTurn.session_id.in_(
+                db.query(RecruiterAttackSession.id).filter(RecruiterAttackSession.profile_id == pid)
+            )
+        ).delete(synchronize_session=False)
+        db.query(ProjectBuildStage).filter(
+            ProjectBuildStage.build_id.in_(db.query(ProjectBuild.id).filter(ProjectBuild.profile_id == pid))
+        ).delete(synchronize_session=False)
         db.query(InterviewAnswer).filter(
             InterviewAnswer.interview_question_id.in_(
                 db.query(InterviewQuestion.id).filter(
@@ -136,6 +169,15 @@ def delete_account(db: Session, user: User, storage: StorageProvider) -> None:
         db.query(Interview).filter(Interview.profile_id == pid).delete(synchronize_session=False)
         db.query(Roadmap).filter(Roadmap.profile_id == pid).delete(synchronize_session=False)
         db.query(JobMatch).filter(JobMatch.profile_id == pid).delete(synchronize_session=False)
+
+        # -- recruiter_attack_sessions: its own turns are gone (leaves, above); must precede
+        # project_builds below since source_project_build_id nullably references it. ---------
+        db.query(RecruiterAttackSession).filter(RecruiterAttackSession.profile_id == pid).delete(
+            synchronize_session=False
+        )
+        # -- project_builds: its own stages are gone and recruiter_attack_sessions no longer
+        # references it (both above). -------------------------------------------------------
+        db.query(ProjectBuild).filter(ProjectBuild.profile_id == pid).delete(synchronize_session=False)
 
         # -- assessment_blueprints: must follow everything that references it
         # (placement_path_topics, career_path_skill_items, assessments -- all deleted above)

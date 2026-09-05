@@ -277,6 +277,13 @@ def mark_failed_from_webhook(db: Session, razorpay_order_id: str) -> None:
     db.commit()
 
 
+def is_premium(db: Session, profile_id: int) -> bool:
+    """Single source of truth for server-side premium enforcement (app.api.deps.require_premium)
+    -- same "an active, unexpired, paid subscription row" definition get_status already uses,
+    so a route's enforcement can never drift from what the client's own status check reports."""
+    return _get_active_subscription(db, profile_id, datetime.datetime.utcnow()) is not None
+
+
 def get_status(db: Session, profile_id: int) -> dict:
     now = datetime.datetime.utcnow()
     active = _get_active_subscription(db, profile_id, now)

@@ -1,6 +1,6 @@
 import pytest
 
-from app.ai.provider import AIProvider, get_ai_provider
+from app.ai.provider import AIGenerationError, AIProvider, get_ai_provider
 from app.ai.schemas.assessment import GeneratedQuestion
 from app.ai.schemas.roadmap import GeneratedRoadmap, GeneratedRoadmapTask
 from app.core.config import settings
@@ -71,6 +71,16 @@ def use_fake_ai():
     app.dependency_overrides.pop(get_ai_provider, None)
 
 
+class FailingAIProvider(AIProvider):
+    def generate_structured(self, prompt, schema):
+        if schema is GeneratedQuestion:
+            return SAMPLE_GENERATED_MCQ
+        raise AIGenerationError("AI provider is unavailable right now")
+
+    def generate_text(self, prompt):
+        return "fake text"
+
+
 @pytest.fixture()
 def sde_role_id(client):
     roles = client.get("/roles").json()
@@ -122,6 +132,35 @@ def test_generate_from_assessment_weaknesses(client, auth_headers, sde_role_id, 
     assert body["tasks"][0]["day_number"] == 1
     assert body["tasks"][0]["status"] == "pending"
     assert body["tasks"][0]["skill_tag"] == "DSA"
+
+
+def test_generate_returns_422_not_500_when_ai_provider_fails(client, auth_headers, sde_role_id, use_fake_ai):
+    """Regression for a real audit gap: only interviews.py previously converted
+    AIGenerationError into a documented 422 -- the identical failure here surfaced as an
+    opaque 500, burning a rate-limited student's quota on an unrecoverable-feeling error
+    instead of a clean, retryable-feeling 422."""
+    _complete_assessment_with_wrong_answers(client, auth_headers, sde_role_id)
+
+    app.dependency_overrides[get_ai_provider] = lambda: FailingAIProvider()
+    try:
+        resp = client.post("/roadmap/generate", json={"duration_days": 7}, headers=auth_headers)
+    finally:
+        app.dependency_overrides.pop(get_ai_provider, None)
+
+    assert resp.status_code == 422
+
+
+def test_reassess_returns_422_not_500_when_ai_provider_fails(client, auth_headers, sde_role_id, use_fake_ai):
+    _complete_assessment_with_wrong_answers(client, auth_headers, sde_role_id)
+    roadmap = client.post("/roadmap/generate", json={}, headers=auth_headers).json()
+
+    app.dependency_overrides[get_ai_provider] = lambda: FailingAIProvider()
+    try:
+        resp = client.post(f"/roadmap/{roadmap['id']}/reassess", headers=auth_headers)
+    finally:
+        app.dependency_overrides.pop(get_ai_provider, None)
+
+    assert resp.status_code == 422
 
 
 def test_generate_rejects_invalid_duration(client, auth_headers, sde_role_id, use_fake_ai):

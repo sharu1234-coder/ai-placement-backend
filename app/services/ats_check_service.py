@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 # _MAX_HISTORY_ROWS for the full rationale): protects response size for a long-lived account.
 _MAX_HISTORY_ROWS = 200
 
-_PROMPT_PATH = Path(__file__).resolve().parent.parent / "ai" / "prompts" / "resume_ats_check_v1.txt"
+_PROMPT_PATH = Path(__file__).resolve().parent.parent / "ai" / "prompts" / "resume_ats_check_v2.txt"
 
 
 def _finding_key(category: str, title: str) -> str:

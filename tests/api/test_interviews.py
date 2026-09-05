@@ -25,6 +25,24 @@ SAMPLE_GENERATED_EVALUATION = GeneratedInterviewEvaluation(
 
 SAMPLE_TRANSCRIPT = "Um, so I basically used a debugger and, like, bisected the change."
 
+# A schema only validates type -- GeneratedInterviewEvaluation's fields are plain `float`
+# with no declared bound, so an AI provider is free to return a "0.0-1.0" score as 50.0 (a
+# real, if hypothetical, failure mode: a model confusing this schema with a 0-100 one, or a
+# prompt-injection attempt that changes a score without leaking any marker phrase). This
+# fixture simulates exactly that.
+OUT_OF_RANGE_EVALUATION = GeneratedInterviewEvaluation(
+    technical_correctness=50.0,
+    relevance=-3.0,
+    completeness=0.7,
+    reasoning=0.8,
+    structure=0.7,
+    clarity=0.85,
+    grammar=0.9,
+    role_jd_coverage=0.7,
+    overall_score=1.5,
+    feedback="Solid technical grasp; be more concise and close with a clear conclusion.",
+)
+
 # Bytes 4:8 spell "ftyp" -- the minimal structural marker submit_audio_answer's magic-byte
 # check (app/api/interviews.py) requires of a real M4A/MP4 file. The rest is arbitrary; this
 # is a fake payload for testing business logic, not a real audio file.
@@ -63,6 +81,26 @@ def auth_headers(client):
 @pytest.fixture()
 def use_fake_ai():
     provider = FakeAIProvider()
+    app.dependency_overrides[get_ai_provider] = lambda: provider
+    yield provider
+    app.dependency_overrides.pop(get_ai_provider, None)
+
+
+class OutOfRangeScoreAIProvider(AIProvider):
+    def generate_structured(self, prompt, schema):
+        if schema is GeneratedInterviewQuestion:
+            return SAMPLE_GENERATED_QUESTION
+        if schema is GeneratedInterviewEvaluation:
+            return OUT_OF_RANGE_EVALUATION
+        raise AssertionError(f"Unexpected schema requested in test: {schema}")
+
+    def generate_text(self, prompt):
+        return "fake text"
+
+
+@pytest.fixture()
+def use_out_of_range_score_ai():
+    provider = OutOfRangeScoreAIProvider()
     app.dependency_overrides[get_ai_provider] = lambda: provider
     yield provider
     app.dependency_overrides.pop(get_ai_provider, None)
@@ -345,6 +383,44 @@ def test_full_interview_lifecycle_reaches_evaluation(client, auth_headers, role_
     assert body["feedback"]
 
     # Result is persisted -- a second call returns the same computed values.
+    result_again = client.get(f"/interviews/{interview_id}/evaluation", headers=auth_headers)
+    assert result_again.json() == body
+
+
+def test_out_of_range_ai_scores_are_clamped_not_persisted_verbatim(
+    client, auth_headers, role_selected, use_out_of_range_score_ai
+):
+    """Regression for a real audit gap: nothing previously enforced GeneratedInterviewEvaluation's
+    documented 0.0-1.0 range at the code level -- only the AI's own (unenforceable) prompt
+    instructions did. A provider returning technical_correctness=50.0, relevance=-3.0,
+    overall_score=1.5 must have every one of those clamped into [0.0, 1.0] before the
+    evaluation is persisted or returned, never accepted verbatim."""
+    interview_id = client.post("/interviews", json={"type": "technical"}, headers=auth_headers).json()["id"]
+
+    for _ in range(20):
+        next_q = client.get(f"/interviews/{interview_id}/next-question", headers=auth_headers).json()
+        if next_q["completed"]:
+            break
+        question = next_q["question"]
+        client.post(
+            f"/interviews/{interview_id}/answer",
+            json={"interview_question_id": question["id"], "answer_text": "A thoughtful, complete answer."},
+            headers=auth_headers,
+        )
+
+    result = client.get(f"/interviews/{interview_id}/evaluation", headers=auth_headers)
+    assert result.status_code == 200
+    body = result.json()
+    for field in (
+        "technical_correctness", "relevance", "completeness", "reasoning",
+        "structure", "clarity", "grammar", "role_jd_coverage", "overall_score",
+    ):
+        assert 0.0 <= body[field] <= 1.0, f"{field}={body[field]!r} was not clamped into [0.0, 1.0]"
+    assert body["technical_correctness"] == 1.0  # clamped down from 50.0
+    assert body["relevance"] == 0.0  # clamped up from -3.0
+    assert body["overall_score"] == 1.0  # clamped down from 1.5
+
+    # Persisted, not just clamped in the response -- a second call returns the same clamped row.
     result_again = client.get(f"/interviews/{interview_id}/evaluation", headers=auth_headers)
     assert result_again.json() == body
 

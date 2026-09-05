@@ -8,8 +8,10 @@ from sqlalchemy.orm import Session
 
 from app.ai.provider import AIGenerationError, AIProvider
 from app.ai.schemas.resume import ParsedResume
+from app.models.placement_path import PlacementPath
 from app.models.resume import Resume
 from app.models.resume_analysis import ResumeAnalysis
+from app.models.resume_ats_check import ResumeAtsCheck
 from app.schemas.resume import ResumeAnalysisRead, ResumeSummaryRead, ResumeUploadResponse
 from app.storage.provider import StorageProvider
 
@@ -148,12 +150,27 @@ def get_resume_analysis(db: Session, resume_id: int, profile_id: int) -> Optiona
 def delete_resume(db: Session, resume_id: int, profile_id: int, storage: StorageProvider) -> bool:
     """PROJECT_HANDOFF.md section 6: "Provide deletion controls for user data" /
     "Protect resumes and uploaded documents" -- there was previously no way to delete an
-    uploaded resume at all. Removes the DB rows and the stored file itself."""
+    uploaded resume at all. Removes the DB rows and the stored file itself.
+
+    Must clear every other FK pointing at this resume first, or the final db.commit() below
+    raises IntegrityError *after* the file is already gone -- the transaction rolls back so
+    the Resume row survives, but its file_path now points at nothing, and every retry hits
+    the identical error: a permanently undeletable resume. resume_ats_checks.resume_id is
+    NOT NULL, so those rows must be deleted outright (mirrors account_service.delete_account's
+    already-correct handling of this same table). placement_paths.source_resume_id is
+    nullable and is only this resume's provenance, not the roadmap's data -- deleting a whole
+    PlacementPath (and the topics/progress it carries) just because its source resume was
+    cleaned up would be a worse bug than the one being fixed, so that FK is nulled out
+    instead of the row being deleted."""
     resume = db.get(Resume, resume_id)
     if resume is None or resume.profile_id != profile_id:
         return False
 
     db.query(ResumeAnalysis).filter(ResumeAnalysis.resume_id == resume.id).delete()
+    db.query(ResumeAtsCheck).filter(ResumeAtsCheck.resume_id == resume.id).delete()
+    db.query(PlacementPath).filter(PlacementPath.source_resume_id == resume.id).update(
+        {PlacementPath.source_resume_id: None}
+    )
 
     try:
         storage.delete(resume.file_path)

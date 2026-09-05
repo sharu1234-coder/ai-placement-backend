@@ -1,7 +1,7 @@
 import datetime
 from typing import Optional
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class EducationCreate(BaseModel):
@@ -30,10 +30,16 @@ class SkillRead(SkillCreate):
 
 
 class ProjectCreate(BaseModel):
-    title: str
-    description: Optional[str] = None
-    tech_stack: Optional[str] = None
-    url: Optional[str] = None
+    # max_length values match this app's other free-text project/AI-input fields for the
+    # same shape of content (see app/schemas/project_builder.py's ProjectBuild title/
+    # stack_summary/repo_url caps) -- description/tech_stack in particular were previously
+    # completely unbounded despite reaching an AI prompt verbatim (interview_service's
+    # question-generation prompt, via {projects}), a real resource-exhaustion/AI-cost vector
+    # every other large free-text AI input in the app already had a cap against.
+    title: str = Field(max_length=200)
+    description: Optional[str] = Field(default=None, max_length=2000)
+    tech_stack: Optional[str] = Field(default=None, max_length=300)
+    url: Optional[str] = Field(default=None, max_length=500)
 
 
 class ProjectRead(ProjectCreate):

@@ -1,2 +1,8 @@
 # Dev/CI-only tooling -- not needed to run the app, so kept out of requirements.txt.
 ruff==0.16.4
+# Was previously (incorrectly) in requirements.txt, shipping into any environment that
+# installs production deps alone. pip-audit flags PYSEC-2026-1845 (fix: 9.0.3) against this
+# 8.3.4 pin -- not bumped here, since 8->9 is a major version with its own compatibility
+# surface (fixture/plugin behavior) that deserves a dedicated verification pass against this
+# suite, not a drive-by version bump in an unrelated audit fix.
+pytest==8.3.4

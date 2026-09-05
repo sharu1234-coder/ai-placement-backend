@@ -12,7 +12,7 @@ from app.models.roadmap_task import RoadmapTask
 from app.schemas.roadmap import RoadmapRead, RoadmapTaskRead
 from app.services.weakness_service import compute_weaknesses
 
-_ROADMAP_PROMPT_PATH = Path(__file__).resolve().parent.parent / "ai" / "prompts" / "roadmap_generator_v1.txt"
+_ROADMAP_PROMPT_PATH = Path(__file__).resolve().parent.parent / "ai" / "prompts" / "roadmap_generator_v2.txt"
 
 
 class InvalidRoadmapRequestError(Exception):

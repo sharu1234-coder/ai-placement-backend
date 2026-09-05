@@ -207,6 +207,27 @@ def test_roadmap_generate_rate_limited(client, auth_headers):
     assert blocked.status_code == 429
 
 
+def test_add_project_rate_limited(client, auth_headers):
+    """Real audit gap, now fixed: POST /users/me/projects previously had no rate limit at
+    all, unlike every other creation endpoint whose content later reaches an AI prompt
+    (Project.description/tech_stack feed interview_service's question-generation prompt via
+    {projects})."""
+    for _ in range(20):
+        resp = client.post(
+            "/users/me/projects",
+            json={"title": "A project", "description": "Does things.", "tech_stack": "Python"},
+            headers=auth_headers,
+        )
+        assert resp.status_code == 201
+
+    blocked = client.post(
+        "/users/me/projects",
+        json={"title": "A project", "description": "Does things.", "tech_stack": "Python"},
+        headers=auth_headers,
+    )
+    assert blocked.status_code == 429
+
+
 def test_roadmap_reassess_rate_limited(client, auth_headers):
     for _ in range(10):
         resp = client.post("/roadmap/999999/reassess", headers=auth_headers)

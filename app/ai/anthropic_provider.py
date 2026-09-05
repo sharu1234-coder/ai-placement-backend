@@ -5,6 +5,7 @@ import anthropic
 from pydantic import ValidationError
 
 from app.ai.provider import AIGenerationError, AIProvider, T
+from app.ai.retry import call_with_retry
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -13,6 +14,31 @@ logger = logging.getLogger(__name__)
 # evaluations, roadmap task lists) comfortably fit well under this; sized generously per
 # "don't lowball max_tokens" rather than tuned to the smallest schema.
 _MAX_TOKENS = 16000
+
+
+def _redact_validation_error(error: ValidationError) -> str:
+    """A short, safe summary of a Pydantic ValidationError -- error count, field path, and
+    error type per field, deliberately never the error's own str()/repr(). Real gap:
+    ValidationError.__str__() includes each field's actual `input_value`, which for this
+    app's schemas can be an excerpt of AI-generated text ultimately derived from a student's
+    resume/JD/interview answers -- logging it verbatim would put that content into
+    application logs on every validation failure."""
+    field_summaries = [
+        f"{'.'.join(str(p) for p in e['loc']) or '<root>'} ({e['type']})" for e in error.errors()
+    ]
+    return f"{len(field_summaries)} field error(s): {', '.join(field_summaries)}"
+
+
+def _is_transient_anthropic_error(exc: Exception) -> bool:
+    """Transient: a network-level failure, or an HTTP 429 (rate limit) / 5xx (server error)
+    response -- all of these can plausibly succeed on an unchanged retry. Anything else (a
+    4xx client error such as bad auth or a malformed request) is permanent and must not be
+    retried -- an unchanged request cannot fix an unchanged client error."""
+    if isinstance(exc, anthropic.APIConnectionError):
+        return True
+    if isinstance(exc, anthropic.APIStatusError):
+        return exc.status_code == 429 or exc.status_code >= 500
+    return False
 
 
 class AnthropicProvider(AIProvider):
@@ -46,7 +72,9 @@ class AnthropicProvider(AIProvider):
         try:
             return self._call_parse(prompt, schema)
         except ValidationError as first_error:
-            logger.warning("AI output failed schema validation, retrying once: %s", first_error)
+            logger.warning(
+                "AI output failed schema validation, retrying once: %s", _redact_validation_error(first_error)
+            )
             correction_prompt = (
                 f"{prompt}\n\n"
                 f"Your previous response did not match the required schema. "
@@ -57,19 +85,28 @@ class AnthropicProvider(AIProvider):
                 return self._call_parse(correction_prompt, schema)
             except ValidationError as second_error:
                 raise AIGenerationError(
-                    f"AI output failed schema validation twice: {second_error}"
+                    f"AI output failed schema validation twice: {_redact_validation_error(second_error)}"
                 ) from second_error
 
     def _call_parse(self, prompt: str, schema: type[T]) -> T:
         # output_format enforces the JSON schema server-side (same guarantee OllamaProvider
         # gets from Ollama's `format=` parameter) -- a ValidationError here means the model
         # produced text that still didn't conform, not a network/auth problem.
+        #
+        # call_with_retry wraps only the raw SDK call: a genuinely transient failure (network
+        # blip, 429, 5xx) gets up to two bounded retries with backoff before this ever becomes
+        # an AIGenerationError -- a permanent 4xx (or the final retry's failure) raises straight
+        # through, matching the "never retry a permanent failure pointlessly" rule.
         try:
-            response = self._client.messages.parse(
-                model=self.model,
-                max_tokens=_MAX_TOKENS,
-                messages=[{"role": "user", "content": prompt}],
-                output_format=schema,
+            response = call_with_retry(
+                lambda: self._client.messages.parse(
+                    model=self.model,
+                    max_tokens=_MAX_TOKENS,
+                    messages=[{"role": "user", "content": prompt}],
+                    output_format=schema,
+                ),
+                is_transient=_is_transient_anthropic_error,
+                context="messages.parse",
             )
         except anthropic.APIStatusError as exc:
             raise AIGenerationError(f"Anthropic API call failed ({exc.status_code}): {exc.message}") from exc
@@ -82,10 +119,14 @@ class AnthropicProvider(AIProvider):
 
     def generate_text(self, prompt: str) -> str:
         try:
-            response = self._client.messages.create(
-                model=self.model,
-                max_tokens=_MAX_TOKENS,
-                messages=[{"role": "user", "content": prompt}],
+            response = call_with_retry(
+                lambda: self._client.messages.create(
+                    model=self.model,
+                    max_tokens=_MAX_TOKENS,
+                    messages=[{"role": "user", "content": prompt}],
+                ),
+                is_transient=_is_transient_anthropic_error,
+                context="messages.create",
             )
         except anthropic.APIStatusError as exc:
             raise AIGenerationError(f"Anthropic API call failed ({exc.status_code}): {exc.message}") from exc

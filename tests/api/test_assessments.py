@@ -1,6 +1,6 @@
 import pytest
 
-from app.ai.provider import AIProvider, get_ai_provider
+from app.ai.provider import AIGenerationError, AIProvider, get_ai_provider
 from app.ai.schemas.assessment import AnswerGrade, GeneratedQuestion
 from app.ai.schemas.jd import AIParsedJD, JDRequirementItem
 from app.ai.schemas.resume import ParsedResume
@@ -100,6 +100,46 @@ def use_fake_ai():
 @pytest.fixture()
 def use_fake_ai_short_answer():
     provider = FakeAIProvider(generated_question=SAMPLE_GENERATED_SHORT_ANSWER)
+    app.dependency_overrides[get_ai_provider] = lambda: provider
+    yield provider
+    app.dependency_overrides.pop(get_ai_provider, None)
+
+
+class OutOfRangeGradeAIProvider(AIProvider):
+    """Simulates a schema-valid but semantically invalid grading response: AnswerGrade.score
+    is a plain `float` with no declared bound, so nothing stops a provider from returning a
+    "0.0-1.0" score as 50.0."""
+
+    def generate_structured(self, prompt, schema):
+        if schema is GeneratedQuestion:
+            return SAMPLE_GENERATED_SHORT_ANSWER
+        if schema is AnswerGrade:
+            return AnswerGrade(is_correct=True, score=50.0, feedback="Out-of-range score.")
+        raise AssertionError(f"Unexpected schema requested in test: {schema}")
+
+    def generate_text(self, prompt):
+        return "fake text"
+
+
+@pytest.fixture()
+def use_out_of_range_grade_ai():
+    provider = OutOfRangeGradeAIProvider()
+    app.dependency_overrides[get_ai_provider] = lambda: provider
+    yield provider
+    app.dependency_overrides.pop(get_ai_provider, None)
+
+
+class FailingAIProvider(AIProvider):
+    def generate_structured(self, prompt, schema):
+        raise AIGenerationError("AI provider is unavailable right now")
+
+    def generate_text(self, prompt):
+        return "fake text"
+
+
+@pytest.fixture()
+def use_failing_ai():
+    provider = FailingAIProvider()
     app.dependency_overrides[get_ai_provider] = lambda: provider
     yield provider
     app.dependency_overrides.pop(get_ai_provider, None)
@@ -365,6 +405,64 @@ def test_submit_short_answer_uses_ai_grading(client, auth_headers, blueprint_id,
     body = resp.json()
     assert body["is_correct"] is True
     assert body["score"] == 0.8
+
+
+def test_next_question_returns_422_not_500_when_ai_provider_fails(client, auth_headers, blueprint_id, use_failing_ai):
+    """Regression for a real audit gap: only interviews.py previously converted
+    AIGenerationError into a documented 422 -- the identical failure here surfaced as an
+    opaque 500, burning a rate-limited student's quota on an unrecoverable-feeling error
+    instead of a clean, retryable-feeling 422."""
+    assessment_id = client.post(
+        "/assessments", json={"blueprint_id": blueprint_id}, headers=auth_headers
+    ).json()["id"]
+
+    resp = client.get(f"/assessments/{assessment_id}/next-question", headers=auth_headers)
+    assert resp.status_code == 422
+
+
+def test_submit_answer_returns_422_not_500_when_ai_provider_fails(
+    client, auth_headers, blueprint_id, use_fake_ai_short_answer
+):
+    assessment_id = client.post(
+        "/assessments", json={"blueprint_id": blueprint_id}, headers=auth_headers
+    ).json()["id"]
+    question = client.get(
+        f"/assessments/{assessment_id}/next-question", headers=auth_headers
+    ).json()["question"]
+    assert question["type"] == "short_answer"  # non-mcq -> grading goes through the AI provider
+
+    app.dependency_overrides[get_ai_provider] = lambda: FailingAIProvider()
+    try:
+        resp = client.post(
+            f"/assessments/{assessment_id}/answer",
+            json={"question_id": question["id"], "student_answer": "It uniquely identifies a row."},
+            headers=auth_headers,
+        )
+    finally:
+        app.dependency_overrides.pop(get_ai_provider, None)
+
+    assert resp.status_code == 422
+
+
+def test_out_of_range_ai_grade_score_is_clamped(client, auth_headers, blueprint_id, use_out_of_range_grade_ai):
+    """Regression for a real audit gap: nothing previously enforced AnswerGrade.score's
+    documented 0.0-1.0 range at the code level. A provider returning score=50.0 must have it
+    clamped to 1.0 before it is ever persisted or returned."""
+    assessment_id = client.post(
+        "/assessments", json={"blueprint_id": blueprint_id}, headers=auth_headers
+    ).json()["id"]
+    question = client.get(
+        f"/assessments/{assessment_id}/next-question", headers=auth_headers
+    ).json()["question"]
+    assert question["type"] == "short_answer"
+
+    resp = client.post(
+        f"/assessments/{assessment_id}/answer",
+        json={"question_id": question["id"], "student_answer": "It uniquely identifies a row."},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["score"] == 1.0  # clamped down from 50.0, never persisted verbatim
 
 
 def test_answer_rejected_when_no_pending_question(client, auth_headers, blueprint_id, use_fake_ai):

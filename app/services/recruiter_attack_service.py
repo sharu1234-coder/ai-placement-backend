@@ -28,14 +28,17 @@ function (see evidence_engine._from_recruiter_attack) reading directly from thes
 """
 
 import datetime
+import logging
 from pathlib import Path
 from typing import List, Optional
 
+from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from app.ai.output_guard import looks_like_prompt_leak
 from app.ai.provider import AIGenerationError, AIProvider
 from app.ai.schemas.recruiter_attack import GeneratedRecruiterAttackEvaluation, GeneratedRecruiterAttackQuestion
+from app.ai.score_utils import clamp_unit_score
 from app.models.profile import StudentProfile
 from app.models.project_build import ProjectBuild
 from app.models.project_build_stage import ProjectBuildStage
@@ -53,9 +56,15 @@ from app.services import weakness_record_service
 from app.services.project_builder.stages import STAGE_TITLES
 from app.services.role_context import resolve_role_context
 
-_QUESTION_PROMPT_PATH = Path(__file__).resolve().parent.parent / "ai" / "prompts" / "recruiter_attack_question_v1.txt"
+logger = logging.getLogger(__name__)
+
+# Safety cap, not a product pagination feature (disclosed gap -- see assessment_service.py's
+# _MAX_HISTORY_ROWS for the full rationale): protects response size for a long-lived account.
+_MAX_HISTORY_ROWS = 200
+
+_QUESTION_PROMPT_PATH = Path(__file__).resolve().parent.parent / "ai" / "prompts" / "recruiter_attack_question_v2.txt"
 _EVALUATION_PROMPT_PATH = (
-    Path(__file__).resolve().parent.parent / "ai" / "prompts" / "recruiter_attack_evaluation_v1.txt"
+    Path(__file__).resolve().parent.parent / "ai" / "prompts" / "recruiter_attack_evaluation_v2.txt"
 )
 
 # Attacking one specific claim needs fewer turns than a full multi-topic interview.
@@ -190,6 +199,7 @@ def list_sessions(db: Session, profile_id: int) -> List[RecruiterAttackSessionLi
         db.query(RecruiterAttackSession)
         .filter(RecruiterAttackSession.profile_id == profile_id)
         .order_by(RecruiterAttackSession.created_at.desc())
+        .limit(_MAX_HISTORY_ROWS)
         .all()
     )
     return [_session_list_item(s) for s in sessions]
@@ -265,7 +275,8 @@ def get_next_turn(
         ):
             raise AIGenerationError("Recruiter attack question output was empty or leaked prompt scaffolding")
         question_text, based_on = generated.question_text, generated.based_on
-    except AIGenerationError:
+    except AIGenerationError as exc:
+        logger.warning("Recruiter attack question generation failed for session_id=%s, using fallback: %s", session_id, exc)
         question_text, based_on = _FALLBACK_QUESTIONS[len(turns) % len(_FALLBACK_QUESTIONS)]
 
     turn = RecruiterAttackTurn(
@@ -288,8 +299,20 @@ def answer_turn(
     if turn.answer_text is not None:
         raise TurnNotPendingError("This question has already been answered")
 
-    turn.answer_text = answer_text
+    # Atomic conditional UPDATE (not "load, mutate, commit") -- same shape as
+    # mission_service.complete / subscription_service._activate_paid / assessment_run_service.
+    # submit_answer for the identical class of race: two concurrent answer submissions for the
+    # same turn can both pass the "still unanswered" read above before either commits. Only the
+    # request whose UPDATE actually flips a still-NULL answer_text row wins; the loser must
+    # never silently overwrite the winner's already-persisted answer.
+    result = db.execute(
+        update(RecruiterAttackTurn)
+        .where(RecruiterAttackTurn.id == turn.id, RecruiterAttackTurn.answer_text.is_(None))
+        .values(answer_text=answer_text)
+    )
     db.commit()
+    if not result.rowcount:
+        raise TurnNotPendingError("This question has already been answered")
     db.refresh(turn)
 
     if turn.order_index == _TURNS_PER_SESSION - 1:
@@ -344,6 +367,7 @@ def get_results(
         for t in turns
     )
 
+    used_fallback = False
     try:
         template = _EVALUATION_PROMPT_PATH.read_text(encoding="utf-8")
         prompt = template.format(role_name=role_name, claim_context=claim_context, transcript=transcript)
@@ -352,24 +376,38 @@ def get_results(
         )
         if not generated.feedback.strip() or looks_like_prompt_leak(generated.feedback):
             raise AIGenerationError("Recruiter attack evaluation output was empty or leaked prompt scaffolding")
-    except AIGenerationError:
+    except AIGenerationError as exc:
+        logger.warning(
+            "Recruiter attack evaluation failed for session_id=%s, using conservative fallback "
+            "(Interview Memory will NOT be updated from this result): %s", session_id, exc,
+        )
         generated = _fallback_evaluation(turns)
+        used_fallback = True
 
-    session.technical_defense = generated.technical_defense
-    session.project_ownership = generated.project_ownership
-    session.specificity = generated.specificity
-    session.communication = generated.communication
-    session.overall_score = generated.overall_score
+    # Every dimension of GeneratedRecruiterAttackEvaluation is documented (in
+    # recruiter_attack_evaluation_v2.txt) as a float from 0.0 to 1.0 -- the schema enforces no
+    # such bound, so this clamps before persisting or feeding Interview Memory below. Applied
+    # uniformly to both the real AI path and the fallback (the fallback is already computed
+    # in-range, so this is a no-op there, but there's no reason to special-case it).
+    context = f"recruiter attack evaluation, session_id={session_id}"
+    session.technical_defense = clamp_unit_score(generated.technical_defense, field_name="technical_defense", context=context)
+    session.project_ownership = clamp_unit_score(generated.project_ownership, field_name="project_ownership", context=context)
+    session.specificity = clamp_unit_score(generated.specificity, field_name="specificity", context=context)
+    session.communication = clamp_unit_score(generated.communication, field_name="communication", context=context)
+    session.overall_score = clamp_unit_score(generated.overall_score, field_name="overall_score", context=context)
     session.feedback_text = generated.feedback
     db.commit()
 
-    # Interview Memory: every dimension of every completed recruiter-attack session updates
-    # its own persisted cross-session record, same wiring interview_service uses (see
-    # weakness_record_service's status machine), just under a "recruiter_attack:" prefix so it
-    # never collides with interview-evaluation dimensions.
-    for dimension in _EVALUATION_DIMENSIONS:
-        weakness_record_service.record_or_update(
-            db, profile_id, f"recruiter_attack:{dimension}", getattr(session, dimension)
-        )
+    # Interview Memory must only ever learn from a real AI-graded evaluation. The completion-
+    # ratio fallback above is an honest "we couldn't grade this" placeholder, not a judgment of
+    # the candidate's defense -- feeding it in here would silently corrupt persisted
+    # cross-session weakness tracking (e.g. resetting a real improvement streak back to
+    # REPEATED, or creating a brand-new weak record) purely because the AI provider was
+    # unavailable during this one session.
+    if not used_fallback:
+        for dimension in _EVALUATION_DIMENSIONS:
+            weakness_record_service.record_or_update(
+                db, profile_id, f"recruiter_attack:{dimension}", getattr(session, dimension)
+            )
 
     return _results_read(session)

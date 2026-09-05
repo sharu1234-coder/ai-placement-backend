@@ -5,6 +5,7 @@ from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
 from app.database.base import Base
+from app.models.arena_attempt import ArenaAttempt
 from app.models.assessment import Assessment
 from app.models.assessment_blueprint import AssessmentBlueprint
 from app.models.assessment_result import AssessmentResult
@@ -14,6 +15,7 @@ from app.models.career_path_project import CareerPathProject
 from app.models.career_path_skill_item import CareerPathSkillItem
 from app.models.certification import Certification
 from app.models.education import Education
+from app.models.evidence_state_snapshot import EvidenceStateSnapshot
 from app.models.experience import Experience
 from app.models.interview import Interview
 from app.models.interview_answer import InterviewAnswer
@@ -22,6 +24,8 @@ from app.models.interview_question import InterviewQuestion
 from app.models.job_description import JobDescription
 from app.models.job_match import JobMatch
 from app.models.job_preparation_plan import JobPreparationPlan
+from app.models.mission import Mission
+from app.models.notification_event import NotificationEvent
 from app.models.password_reset_token import PasswordResetToken
 from app.models.placement_alarm_challenge import PlacementAlarmChallenge
 from app.models.placement_alarm_question_attempt import PlacementAlarmQuestionAttempt
@@ -29,8 +33,13 @@ from app.models.placement_path import PlacementPath
 from app.models.placement_path_topic import PlacementPathTopic
 from app.models.profile import StudentProfile
 from app.models.project import Project
+from app.models.project_build import ProjectBuild
+from app.models.project_build_stage import ProjectBuildStage
 from app.models.question import Question
 from app.models.question_attempt import QuestionAttempt
+from app.models.readiness_snapshot import ReadinessSnapshot
+from app.models.recruiter_attack_session import RecruiterAttackSession
+from app.models.recruiter_attack_turn import RecruiterAttackTurn
 from app.models.requirement import Requirement
 from app.models.resume import Resume
 from app.models.resume_analysis import ResumeAnalysis
@@ -41,6 +50,7 @@ from app.models.skill import Skill
 from app.models.skill_gap import SkillGap
 from app.models.subscription import Subscription
 from app.models.user import User
+from app.models.weakness_record import WeaknessRecord
 from app.services.account_service import delete_account
 from app.storage.provider import StorageProvider
 
@@ -263,6 +273,47 @@ def _seed_full_account(db, email: str):
     db.add(PasswordResetToken(
         user_id=user.id, token_hash="deadbeef",
         expires_at=datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=15),
+    ))
+
+    # The 10 tables the account-deletion FK-graph audit found delete_account never visited --
+    # every one of these has a real FK chain back to student_profiles.id (some via each
+    # other), so this is exactly what turns this test from "misses the same blind spot as the
+    # implementation" into a real regression guard for that fix.
+    db.add(ArenaAttempt(profile_id=profile.id, challenge_key="sql_basics", assessment_id=assessment.id))
+    db.add(Mission(
+        profile_id=profile.id, mission_date=datetime.date.today(), title="Fix SQL Window Functions",
+        action_type="practice", assessment_id=assessment.id,
+    ))
+    db.add(EvidenceStateSnapshot(profile_id=profile.id, skill_key="sql", state="strong"))
+    db.add(NotificationEvent(
+        profile_id=profile.id, kind="mission_completed", title="Mission complete", body="Nice work!",
+    ))
+    db.add(ReadinessSnapshot(
+        profile_id=profile.id, role_family_key="data_analyst", snapshot_date=datetime.date.today(),
+        readiness_percent=78, per_skill_confidence_percent={"sql": 80},
+    ))
+    db.add(WeaknessRecord(profile_id=profile.id, skill_key="interview:technical_correctness", last_score=0.4))
+
+    project_build = ProjectBuild(profile_id=profile.id, title="Real-Time Data Pipeline")
+    db.add(project_build)
+    db.commit()
+    db.refresh(project_build)
+    db.add(ProjectBuildStage(
+        build_id=project_build.id, stage_key="architecture", order_index=0, guidance_text="Design the schema.",
+    ))
+
+    # source_project_build_id nullably references the SAME build above -- exactly the ordering
+    # (recruiter_attack_sessions before project_builds) the account-deletion fix depends on.
+    recruiter_session = RecruiterAttackSession(
+        profile_id=profile.id, source_type="project_build", source_label="Real-Time Data Pipeline",
+        source_project_build_id=project_build.id,
+    )
+    db.add(recruiter_session)
+    db.commit()
+    db.refresh(recruiter_session)
+    db.add(RecruiterAttackTurn(
+        session_id=recruiter_session.id, order_index=0, question_text="Why Spark over Flink?",
+        based_on="Scaling claim",
     ))
 
     db.commit()

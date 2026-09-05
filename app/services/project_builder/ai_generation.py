@@ -8,6 +8,7 @@ response, every affected stage falls back to stages.FALLBACK_GUIDANCE and genera
 raises -- a ProjectBuild must never fail to create just because the AI call failed.
 """
 
+import logging
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -16,7 +17,9 @@ from app.ai.provider import AIGenerationError, AIProvider
 from app.ai.schemas.project_builder import GeneratedStageGuidanceSet
 from app.services.project_builder.stages import FALLBACK_GUIDANCE, STAGE_ORDER, STAGE_TITLES
 
-_PROMPT_PATH = Path(__file__).resolve().parent.parent.parent / "ai" / "prompts" / "project_builder_stage_guidance_v1.txt"
+logger = logging.getLogger(__name__)
+
+_PROMPT_PATH = Path(__file__).resolve().parent.parent.parent / "ai" / "prompts" / "project_builder_stage_guidance_v2.txt"
 
 
 def _build_prompt(role_name: str, title: str, stack_summary: Optional[str]) -> str:
@@ -40,8 +43,8 @@ def generate_stage_guidance(
             if looks_like_prompt_leak(stage.guidance_text):
                 continue  # code-level backstop -- see app/ai/output_guard.py
             guidance[stage.stage_key] = stage.guidance_text
-    except AIGenerationError:
-        pass
+    except AIGenerationError as exc:
+        logger.warning("AI stage-guidance generation failed for title=%r, using template fallback: %s", title, exc)
 
     for stage_key in STAGE_ORDER:
         if stage_key not in guidance:

@@ -147,7 +147,7 @@ _PROMPTS_DIR = Path(__file__).resolve().parent.parent.parent / "app" / "ai" / "p
 
 
 def test_proof_prompt_frames_title_stack_and_notes_as_untrusted_data():
-    text = (_PROMPTS_DIR / "project_builder_proof_v1.txt").read_text(encoding="utf-8")
+    text = (_PROMPTS_DIR / "project_builder_proof_v2.txt").read_text(encoding="utf-8")
     assert "UNTRUSTED DATA" in text
     assert "<<<TITLE_START>>>" in text and "<<<TITLE_END>>>" in text
     assert "<<<STACK_START>>>" in text and "<<<STACK_END>>>" in text
@@ -161,4 +161,4 @@ def test_proof_prompt_frames_title_stack_and_notes_as_untrusted_data():
 
 
 def test_project_proof_service_points_at_the_versioned_prompt():
-    assert svc._PROMPT_PATH.name == "project_builder_proof_v1.txt"
+    assert svc._PROMPT_PATH.name == "project_builder_proof_v2.txt"

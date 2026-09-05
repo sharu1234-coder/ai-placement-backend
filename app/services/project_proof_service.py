@@ -7,11 +7,12 @@ a build must never fail to complete just because proof generation failed. Result
 directly on the ProjectBuild row (see its docstring), not a separate table.
 
 The student's own per-stage notes are genuinely untrusted free text fed into this prompt (see
-project_builder_proof_v1.txt's SECURITY RULE) -- output_guard is applied to every generated
+project_builder_proof_v2.txt's SECURITY RULE) -- output_guard is applied to every generated
 text field before it's trusted, same backstop used everywhere else in this codebase's AI
 overlays.
 """
 
+import logging
 from pathlib import Path
 from typing import List, Optional
 
@@ -24,7 +25,9 @@ from app.models.project_build import ProjectBuild
 from app.models.project_build_stage import ProjectBuildStage
 from app.services.project_builder.stages import STAGE_TITLES
 
-_PROMPT_PATH = Path(__file__).resolve().parent.parent / "ai" / "prompts" / "project_builder_proof_v1.txt"
+logger = logging.getLogger(__name__)
+
+_PROMPT_PATH = Path(__file__).resolve().parent.parent / "ai" / "prompts" / "project_builder_proof_v2.txt"
 
 _FALLBACK_DEFENSE_QUESTIONS = [
     "Walk me through how this project works, end to end.",
@@ -82,7 +85,8 @@ def generate_proof(db: Session, build: ProjectBuild, stages: List[ProjectBuildSt
         generated: GeneratedProjectProof = ai_provider.generate_structured(prompt, GeneratedProjectProof)
         if not generated.defense_questions or not _looks_safe(generated):
             raise AIGenerationError("AI proof output was empty or contained prompt-leak markers")
-    except AIGenerationError:
+    except AIGenerationError as exc:
+        logger.warning("AI project-proof generation failed for build_id=%s, using template fallback: %s", build.id, exc)
         generated = _fallback_proof(role_name, build.title)
 
     build.proof_resume_bullet = generated.resume_bullet

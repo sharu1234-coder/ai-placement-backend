@@ -275,6 +275,36 @@ def test_delete_profile_subresource(client, auth_headers, path, payload):
     assert items == []
 
 
+def test_add_project_rejects_overlong_description(client, auth_headers):
+    """Real audit gap, now fixed: description/tech_stack previously had no max_length at
+    all, unlike every other free-text AI-input field in the app -- this content reaches
+    interview_service's question-generation prompt verbatim via {projects}."""
+    resp = client.post(
+        "/users/me/projects",
+        json={"title": "A project", "description": "x" * 2001},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 422
+
+
+def test_add_project_rejects_overlong_tech_stack(client, auth_headers):
+    resp = client.post(
+        "/users/me/projects",
+        json={"title": "A project", "tech_stack": "x" * 301},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 422
+
+
+def test_add_project_accepts_description_at_the_length_limit(client, auth_headers):
+    resp = client.post(
+        "/users/me/projects",
+        json={"title": "A project", "description": "x" * 2000, "tech_stack": "x" * 300},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 201
+
+
 def test_delete_profile_subresource_not_found(client, auth_headers):
     resp = client.delete("/users/me/skills/999999", headers=auth_headers)
     assert resp.status_code == 404
