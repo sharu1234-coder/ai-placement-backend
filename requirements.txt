@@ -22,7 +22,7 @@ pydantic-settings==2.15.0
 python-dotenv==1.2.3  # bumped from 1.2.1 (PYSEC-2026-2270)
 email-validator==2.2.0
 
-sqlalchemy==2.0.36
+sqlalchemy==2.0.52
 greenlet==3.0.3
 alembic==1.14.0
 psycopg2-binary==2.9.10  # production Postgres driver; SQLite (stdlib) stays the dev default
