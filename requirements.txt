@@ -20,7 +20,7 @@ uvicorn[standard]==0.34.0
 pydantic==2.10.5
 pydantic-settings==2.15.0
 python-dotenv==1.2.3  # bumped from 1.2.1 (PYSEC-2026-2270)
-email-validator==2.2.0
+email-validator==2.3.0
 
 sqlalchemy==2.0.36
 greenlet==3.0.3
