@@ -67,7 +67,7 @@ pywin32==312; sys_platform == "win32"  # pyttsx3's SAPI5 driver needs this on Wi
 # staging deployment and confirm a genuine structured generation still parses -- not before.
 # Also worth doing then: parse's output_format= is superseded by output_config=, so migrate
 # that in the same pass rather than leaving a deprecated request shape behind.
-anthropic==0.125.0
+anthropic==1.3.0
 
 # Production object storage (STORAGE_PROVIDER=s3) -- speaks the S3 API, works against AWS
 # S3 or any S3-compatible provider (R2, MinIO, B2, Spaces, ...) via STORAGE_S3_ENDPOINT_URL.
