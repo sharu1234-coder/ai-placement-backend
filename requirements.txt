@@ -16,16 +16,35 @@ fastapi==0.141.1  # bumped from 0.115.6: needed to allow starlette >=1.x (see th
 # FastAPI only requires starlette>=0.46.0 (no upper bound), and the resolver would otherwise
 # be free to sit on a version carrying PYSEC-2026-161/248/249/1941/1942/2280/2281.
 starlette==1.6.0
-uvicorn[standard]==0.34.0
+# Bumped from 0.34.0. Worth knowing: the test suite CANNOT validate this one. Starlette's
+# TestClient talks to the ASGI app directly, so uvicorn is never imported during a pytest
+# run and a completely broken server pin would still leave 940 tests green. Verified instead
+# by actually serving the app on 0.52.4 and hitting it over real HTTP: /health 200,
+# /health/ready 200 (so the DB session and migration check work through the real server),
+# and /openapi.json 200 (so every route in the app still builds).
+uvicorn[standard]==0.52.4
 pydantic==2.10.5
 pydantic-settings==2.15.0
 python-dotenv==1.2.3  # bumped from 1.2.1 (PYSEC-2026-2270)
-email-validator==2.2.0
+# Bumped from 2.2.0. This backs pydantic's EmailStr, so it sits in the auth/registration
+# request path. Verified through the suite and by posting a malformed address to a live
+# /auth/login on the running server -- still rejected with 422, not accepted.
+email-validator==2.3.0
 
-sqlalchemy==2.0.36
+# Bumped from 2.0.36 within the 2.0 series. Verified with the full suite (940 passed, and
+# the warning count did not move -- a 2.x bump that started emitting new deprecation warnings
+# would show up there first) plus a clean `alembic upgrade head` from an empty database
+# through all 49 tables, since migrations exercise SQLAlchemy's DDL layer that the tests do
+# not.
+sqlalchemy==2.0.52
 greenlet==3.0.3
 alembic==1.14.0
-psycopg2-binary==2.9.10  # production Postgres driver; SQLite (stdlib) stays the dev default
+# Production Postgres driver; SQLite (stdlib) stays the dev default. Bumped from 2.9.10 --
+# import and native-extension load verified on 3.12 (2.9.12, "dt dec pq3 ext lo64"), but note
+# that nothing in this environment connects to a real PostgreSQL server, so the driver's
+# actual wire behaviour on this version is unverified here. It is a patch bump within 2.9.x;
+# confirm against staging Postgres before treating it as production-proven.
+psycopg2-binary==2.9.12
 # Bumped from 4.0.1. The old pin's comment blamed "4.2.1 fails to import its native
 # extension on this Windows/Python build" -- that was the Python 3.9 machine, the same
 # constraint that held the CVE'd packages above. On 3.12 the extension imports fine.
