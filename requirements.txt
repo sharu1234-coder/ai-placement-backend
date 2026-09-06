@@ -25,7 +25,7 @@ email-validator==2.2.0
 sqlalchemy==2.0.36
 greenlet==3.0.3
 alembic==1.14.0
-psycopg2-binary==2.9.10  # production Postgres driver; SQLite (stdlib) stays the dev default
+psycopg2-binary==2.9.12  # production Postgres driver; SQLite (stdlib) stays the dev default
 # Bumped from 4.0.1. The old pin's comment blamed "4.2.1 fails to import its native
 # extension on this Windows/Python build" -- that was the Python 3.9 machine, the same
 # constraint that held the CVE'd packages above. On 3.12 the extension imports fine.
