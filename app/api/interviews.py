@@ -1,9 +1,12 @@
+import logging
+
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
 from app.ai.provider import AIGenerationError, AIProvider, get_ai_provider
+from app.api.ai_errors import ai_unavailable
 from app.api.deps import get_current_user, get_db
 from app.api.upload_utils import read_upload_limited
 from app.core.rate_limit import limiter
@@ -19,6 +22,8 @@ from app.schemas.interview import (
 )
 from app.services import interview_service
 from app.services.profile_service import get_or_create_profile
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/interviews", tags=["interviews"])
 
@@ -65,6 +70,12 @@ def next_question(
         return interview_service.get_next_question(db, profile.id, interview_id, ai_provider)
     except interview_service.InterviewNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    # This route generates a question through the AI provider, so it can raise
+    # AIGenerationError -- and until this was added it had no handler, unlike its direct
+    # counterpart in assessments.py. A provider outage mid-interview therefore surfaced as an
+    # unhandled 500 rather than the documented 422 the Android client knows how to show.
+    except AIGenerationError as exc:
+        raise ai_unavailable(exc, logger, "interviews")
 
 
 @router.post("/{interview_id}/answer", response_model=InterviewAnswerRead)
@@ -130,7 +141,7 @@ async def submit_audio_answer(
     except interview_service.InterviewQuestionNotPendingError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
     except AIGenerationError as exc:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+        raise ai_unavailable(exc, logger, "interviews")
 
 
 @router.get("/{interview_id}/questions/{question_id}/audio")
@@ -155,7 +166,7 @@ def get_question_audio(
     except interview_service.InterviewNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
     except AIGenerationError as exc:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+        raise ai_unavailable(exc, logger, "interviews")
 
     return Response(content=audio_bytes, media_type="audio/wav")
 
@@ -176,3 +187,8 @@ def get_evaluation(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
     except interview_service.InterviewNotCompleteError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+    # Same gap as next-question above, and this one lands at the worst moment: the student has
+    # finished the whole interview and is asking for their result. An AI failure here used to
+    # escape as a 500.
+    except AIGenerationError as exc:
+        raise ai_unavailable(exc, logger, "interviews")

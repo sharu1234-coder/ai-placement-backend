@@ -1,15 +1,19 @@
+import logging
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.ai.provider import AIGenerationError, AIProvider, get_ai_provider
+from app.api.ai_errors import ai_unavailable
 from app.api.deps import get_current_user, get_db
 from app.core.rate_limit import limiter
 from app.models.user import User
 from app.schemas.roadmap import GenerateRoadmapRequest, RoadmapRead, RoadmapTaskRead, UpdateRoadmapTaskRequest
 from app.services import roadmap_service
 from app.services.profile_service import get_or_create_profile
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/roadmap", tags=["roadmap"])
 
@@ -31,7 +35,7 @@ def generate_roadmap(
     except roadmap_service.NoWeaknessDataError as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
     except AIGenerationError as exc:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+        raise ai_unavailable(exc, logger, "roadmap")
 
 
 @router.get("/current", response_model=Optional[RoadmapRead])
@@ -78,4 +82,4 @@ def reassess(
     except roadmap_service.NoWeaknessDataError as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
     except AIGenerationError as exc:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+        raise ai_unavailable(exc, logger, "roadmap")

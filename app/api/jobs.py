@@ -1,7 +1,10 @@
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
-from app.ai.provider import AIProvider, get_ai_provider
+from app.ai.provider import AIGenerationError, AIProvider, get_ai_provider
+from app.api.ai_errors import ai_unavailable
 from app.api.deps import get_current_user, get_db
 from app.core.rate_limit import limiter
 from app.models.user import User
@@ -27,6 +30,8 @@ from app.services.matching_service import match_resume_to_job
 from app.services.profile_service import get_or_create_profile
 from app.services.skill_matching import NoResumeAnalysisError
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/jobs", tags=["jobs"])
 
 
@@ -48,7 +53,17 @@ def create_job_description(
     ai_provider: AIProvider = Depends(get_ai_provider),
 ) -> JobDescriptionParseResponse:
     profile = get_or_create_profile(db, current_user)
-    return parse_job_description(db, profile.id, payload.raw_text, ai_provider)
+    try:
+        return parse_job_description(db, profile.id, payload.raw_text, ai_provider)
+    # JD parsing is one of the few AI paths with no template fallback in its service (there is
+    # nothing sensible to invent from an unparsed job description), so AIGenerationError
+    # reaches the route. Without this it escaped as an unhandled 500, which is the wrong
+    # answer twice over: the client cannot distinguish "provider is down, retry" from "the
+    # server is broken", and every provider blip logged a full stack trace for an expected
+    # condition. Found by driving every AI-taking route with a failing provider; this was the
+    # only one of the twenty still returning 500.
+    except AIGenerationError as exc:
+        raise ai_unavailable(exc, logger, "jobs")
 
 
 @router.get("/{jd_id}/requirements", response_model=list[RequirementRead])

@@ -523,6 +523,16 @@ secret-shaped setting that had no fail-safe.
   first, it can misfire (redirect loops, or rejecting legitimate HTTPS traffic that arrives
   internally as plain HTTP from the proxy) — safer to document the real requirement than
   ship a redirect that silently assumes a specific deployment topology.
+- **The same two flags also decide whether rate limiting works at all**, which is easy to miss
+  because the paragraph above is about HTTPS. `app/core/rate_limit.py` keys every limit on the
+  client IP via slowapi's `get_remote_address`, i.e. the socket peer. Run behind a proxy
+  *without* `--proxy-headers` and every user shares one bucket, so login caps at 5/minute for
+  the whole user base and one attacker can lock everybody out. Run with
+  `--forwarded-allow-ips="*"` and the opposite happens: `X-Forwarded-For` becomes
+  attacker-controlled, so rotating a header value per request defeats every limit in the app,
+  login and password reset included. **Set `--forwarded-allow-ips` to the proxy's real
+  address or CIDR; only fall back to `"*"` if the platform genuinely cannot expose one**, and
+  treat that as a known weakening of brute-force protection rather than a neutral default.
 - CORS was deliberately **not** added: there's no browser-based client yet (Android talks
   to this API via Retrofit, which isn't subject to CORS) — add a restrictive
   `CORSMiddleware` if/when a web frontend is built, not preemptively.

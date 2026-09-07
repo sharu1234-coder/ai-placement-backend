@@ -42,13 +42,42 @@ negligible, and even when it does fire the student's text is preserved, just def
 import re
 from typing import Any, Mapping
 
-# Matches the exact marker syntax every prompt template in app/ai/prompts/ uses:
-# three angle brackets, an ALL-CAPS-ish identifier, three closing angle brackets. Tolerant of
-# internal whitespace and lowercase so a near-miss forgery ("<<< student_answer_end >>>")
-# is neutralized too -- a model reading the rendered prompt would treat that as a marker just
-# as readily as the canonical spelling, so matching only the canonical spelling would leave
-# the bypass open.
-_MARKER_RE = re.compile(r"<<<\s*[A-Za-z0-9_]{1,64}\s*>>>")
+# Matches the marker syntax every prompt template in app/ai/prompts/ uses: three angle
+# brackets, an ALL-CAPS-ish identifier, three closing angle brackets.
+#
+# The governing question for everything in this pattern is the one the module docstring sets:
+# *would a model reading the rendered prompt treat this run of characters as a boundary?* If
+# yes, it has to be neutralized, because the SECURITY RULE paragraph's whole framing collapses
+# the moment the model believes the untrusted block has closed. Matching only the canonical
+# spelling would leave that bypass open, so this is deliberately tolerant of near misses.
+#
+# Three classes of near miss are covered, each found by red-teaming this function directly
+# rather than assumed:
+#
+#   1. Case and whitespace  -- "<<< student_answer_end >>>".
+#   2. Separator substitution -- "<<<STUDENT-ANSWER-END>>>" and the "." variant. These read as
+#      the real "<<<STUDENT_ANSWER_END>>>" at a glance, and the earlier [A-Za-z0-9_] class let
+#      them through untouched. Underscore is not the only plausible separator, so it cannot be
+#      the only one defended.
+#   3. Homoglyph brackets -- fullwidth "＜＜＜...＞＞＞" and the CJK/mathematical angle
+#      brackets. These render almost identically to ASCII "<<<" and are trivially typed.
+#
+# Spaces inside the identifier are matched ONLY for an all-uppercase run ("<<<STUDENT ANSWER
+# END>>>"). That asymmetry is deliberate and load-bearing: allowing spaces in the general case
+# would let the pattern span ordinary prose, so a legitimate answer containing "a <<< b and c
+# >>> d" would have "b and c" replaced wholesale. This module promises it defangs content
+# rather than deleting it, and a rule that can swallow words breaks that promise. Restricting
+# the spaced form to uppercase keeps marker-shaped text in scope while leaving prose out.
+#
+# What is deliberately NOT matched, having been tested: an identifier longer than 64
+# characters, and an outer bracket pair wrapping an inner forgery ("<<<A<<<X_END>>>B>>>",
+# where the inner one is neutralized and the residue is not a real marker's name). Neither
+# resembles any marker this app's templates actually use, so neither would read as a boundary.
+_LT = "[<＜〈〈❮]"
+_GT = "[>＞〉〉❯]"
+_MARKER_RE = re.compile(
+    _LT + r"{3}\s*(?:[A-Za-z0-9_.\-]{1,64}|[A-Z0-9_.\- ]{1,64})\s*" + _GT + r"{3}"
+)
 
 # What a forged marker is replaced with. Not a silent deletion: the substitution is visible in
 # the rendered prompt, so a model that sees it reads it as ordinary quoted content rather than

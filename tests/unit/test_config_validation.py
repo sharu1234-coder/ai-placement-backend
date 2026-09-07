@@ -37,6 +37,9 @@ def test_validate_for_production_passes_with_a_real_secret(monkeypatch) -> None:
     # tests elsewhere) -- explicitly override it here so this "everything else is production-
     # ready" test isn't coupled to that unrelated local dev value.
     monkeypatch.setattr(settings, "razorpay_key_id", "rzp_live_abc123")
+    # Required alongside a configured key since the webhook-secret check was added: without
+    # it the webhook endpoint fails closed and paid users would never be activated.
+    monkeypatch.setattr(settings, "razorpay_webhook_secret", "a-real-webhook-secret")
 
     validate_for_production()  # must not raise
 
@@ -98,6 +101,9 @@ def test_validate_for_production_passes_with_a_live_razorpay_key(monkeypatch) ->
     monkeypatch.setattr(settings, "allowed_hosts", "api.aiplacementos.com")
     _production_ready_ai(monkeypatch)
     monkeypatch.setattr(settings, "razorpay_key_id", "rzp_live_abc123")
+    # Required alongside a configured key since the webhook-secret check was added: without
+    # it the webhook endpoint fails closed and paid users would never be activated.
+    monkeypatch.setattr(settings, "razorpay_webhook_secret", "a-real-webhook-secret")
 
     validate_for_production()  # must not raise
 
@@ -139,6 +145,9 @@ def _production_base(monkeypatch) -> None:
     monkeypatch.setattr(settings, "debug", False)
     monkeypatch.setattr(settings, "allowed_hosts", "api.aiplacementos.com")
     monkeypatch.setattr(settings, "razorpay_key_id", "rzp_live_abc123")
+    # Required alongside a configured key since the webhook-secret check was added: without
+    # it the webhook endpoint fails closed and paid users would never be activated.
+    monkeypatch.setattr(settings, "razorpay_webhook_secret", "a-real-webhook-secret")
 
 
 @pytest.mark.parametrize(
@@ -194,5 +203,47 @@ def test_ollama_on_loopback_is_fine_in_development(monkeypatch) -> None:
     monkeypatch.setattr(settings, "environment", "development")
     monkeypatch.setattr(settings, "ai_provider", "ollama")
     monkeypatch.setattr(settings, "ollama_base_url", "http://localhost:11434")
+
+    validate_for_production()  # must not raise
+
+
+def test_validate_for_production_requires_a_webhook_secret_when_razorpay_is_configured(
+    monkeypatch,
+) -> None:
+    """A live key with no webhook secret is the quietest way to lose a customer's money.
+
+    subscriptions.py fails the webhook closed without the secret -- correct, since it cannot
+    otherwise tell Razorpay from anyone who finds the URL -- but that turns every
+    payment.captured callback into a 503. The webhook is the path that survives the client
+    never coming back (app killed, network dropped mid-redirect), so a student could be
+    charged for real and never receive premium. Nothing else in the system complains: startup
+    succeeds, checkout works, and client-side verify works in every manual test.
+    """
+    monkeypatch.setattr(settings, "environment", "production")
+    monkeypatch.setattr(settings, "jwt_secret_key", "a-real-random-64-char-secret-not-the-dev-default")
+    monkeypatch.setattr(settings, "email_provider", "smtp")
+    monkeypatch.setattr(settings, "debug", False)
+    monkeypatch.setattr(settings, "allowed_hosts", "api.aiplacementos.com")
+    _production_ready_ai(monkeypatch)
+    monkeypatch.setattr(settings, "razorpay_key_id", "rzp_live_abc123")
+    monkeypatch.setattr(settings, "razorpay_webhook_secret", None)
+
+    with pytest.raises(RuntimeError, match="RAZORPAY_WEBHOOK_SECRET"):
+        validate_for_production()
+
+
+def test_validate_for_production_does_not_require_a_webhook_secret_when_razorpay_is_unset(
+    monkeypatch,
+) -> None:
+    """Payments being switched off entirely is a valid deployment -- subscription_service
+    already fails loudly on first use. Only a *configured* gateway needs the webhook."""
+    monkeypatch.setattr(settings, "environment", "production")
+    monkeypatch.setattr(settings, "jwt_secret_key", "a-real-random-64-char-secret-not-the-dev-default")
+    monkeypatch.setattr(settings, "email_provider", "smtp")
+    monkeypatch.setattr(settings, "debug", False)
+    monkeypatch.setattr(settings, "allowed_hosts", "api.aiplacementos.com")
+    _production_ready_ai(monkeypatch)
+    monkeypatch.setattr(settings, "razorpay_key_id", None)
+    monkeypatch.setattr(settings, "razorpay_webhook_secret", None)
 
     validate_for_production()  # must not raise

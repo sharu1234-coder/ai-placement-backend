@@ -1,7 +1,10 @@
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.ai.provider import AIGenerationError, AIProvider, get_ai_provider
+from app.api.ai_errors import ai_unavailable
 from app.api.deps import get_current_user, get_db
 from app.core.rate_limit import limiter
 from app.models.user import User
@@ -23,6 +26,8 @@ from app.services.assessment_service import (
     get_assessment_history,
 )
 from app.services.profile_service import get_or_create_profile
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/assessments", tags=["assessments"])
 
@@ -76,7 +81,7 @@ def next_question(
     except run_service.AssessmentNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
     except AIGenerationError as exc:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+        raise ai_unavailable(exc, logger, "assessments")
 
 
 @router.post("/{assessment_id}/answer", response_model=AnswerResult)
@@ -105,7 +110,7 @@ def submit_answer(
     except run_service.QuestionNotPendingError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
     except AIGenerationError as exc:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+        raise ai_unavailable(exc, logger, "assessments")
 
 
 @router.get("/{assessment_id}/result", response_model=AssessmentResultRead)
