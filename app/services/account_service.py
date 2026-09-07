@@ -19,8 +19,11 @@ from app.models.interview_answer import InterviewAnswer
 from app.models.interview_evaluation import InterviewEvaluation
 from app.models.interview_question import InterviewQuestion
 from app.models.job_description import JobDescription
+from app.models.job_listing_match import JobListingMatch
 from app.models.job_match import JobMatch
 from app.models.job_preparation_plan import JobPreparationPlan
+from app.models.job_saved_search import JobSavedSearch
+from app.models.job_search_profile import JobSearchProfile
 from app.models.mission import Mission
 from app.models.notification_event import NotificationEvent
 from app.models.password_reset_token import PasswordResetToken
@@ -42,6 +45,7 @@ from app.models.resume_analysis import ResumeAnalysis
 from app.models.resume_ats_check import ResumeAtsCheck
 from app.models.roadmap import Roadmap
 from app.models.roadmap_task import RoadmapTask
+from app.models.saved_job import SavedJob
 from app.models.skill import Skill
 from app.models.skill_gap import SkillGap
 from app.models.subscription import Subscription
@@ -115,6 +119,17 @@ def delete_account(db: Session, user: User, storage: StorageProvider) -> None:
         db.query(EvidenceStateSnapshot).filter(EvidenceStateSnapshot.profile_id == pid).delete(
             synchronize_session=False
         )
+        # Job Hunt's three profile-owned leaves. All reference job_listings, which is
+        # deliberately NOT deleted here: a listing is public provider content shared across
+        # every student who searched, so removing it would delete another user's saved job.
+        # Nothing personal lives on that table -- the personal part is exactly these rows.
+        db.query(JobListingMatch).filter(JobListingMatch.profile_id == pid).delete(
+            synchronize_session=False
+        )
+        db.query(SavedJob).filter(SavedJob.profile_id == pid).delete(synchronize_session=False)
+        db.query(JobSavedSearch).filter(JobSavedSearch.profile_id == pid).delete(
+            synchronize_session=False
+        )
         db.query(NotificationEvent).filter(NotificationEvent.profile_id == pid).delete(synchronize_session=False)
         db.query(ReadinessSnapshot).filter(ReadinessSnapshot.profile_id == pid).delete(synchronize_session=False)
         db.query(WeaknessRecord).filter(WeaknessRecord.profile_id == pid).delete(synchronize_session=False)
@@ -183,6 +198,15 @@ def delete_account(db: Session, user: User, storage: StorageProvider) -> None:
         # (placement_path_topics, career_path_skill_items, assessments -- all deleted above)
         # and precede job_descriptions (which it nullably references). ---------------------
         db.query(AssessmentBlueprint).filter(AssessmentBlueprint.profile_id == pid).delete(
+            synchronize_session=False
+        )
+
+        # -- job_search_profiles: nullably references BOTH resumes and roles, so it has to go
+        # before the resumes delete below for the same reason placement_paths does. Its own
+        # dependants (job_listing_matches, saved_jobs, job_saved_searches) are already gone
+        # above -- though none of them actually reference this table, they are all keyed to
+        # the profile directly. ---------------------------------------------------------------
+        db.query(JobSearchProfile).filter(JobSearchProfile.profile_id == pid).delete(
             synchronize_session=False
         )
 

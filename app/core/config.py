@@ -87,6 +87,29 @@ class Settings(BaseSettings):
     # route fails closed (503) rather than processing unauthenticated payloads.
     razorpay_webhook_secret: Optional[str] = None
 
+    # JOB_PROVIDER selects the Job Hunt job source, exactly like storage_provider/
+    # email_provider above. "none" (the default) is a real, deliberate state, not a broken
+    # one: Job Hunt then answers with a specific "not configured" 503 that the Android client
+    # renders as "Job Hunt isn't available yet". It must never degrade into an empty result
+    # list, which would tell a student there are no jobs for them -- a claim about the labour
+    # market that no unconfigured deployment has any evidence for.
+    #
+    # Both real options carry owner obligations that are NOT settled by setting a key here,
+    # and are recorded in the Job Hunt audit report as owner decisions:
+    #   * "adzuna"    -- commercial use beyond a 14-day evaluation requires written consent
+    #                    from Adzuna, and each advert must be labelled "Jobs by Adzuna" with a
+    #                    link back (developer.adzuna.com/docs/terms_of_service).
+    #   * "careerjet" -- requires a partner account for the affiliate id, and contractually
+    #                    requires sending each END USER's IP and user agent on every query,
+    #                    which is a real privacy disclosure to a third party.
+    job_provider: str = "none"
+    adzuna_app_id: Optional[str] = None
+    adzuna_app_key: Optional[str] = None
+    # Adzuna is per-country; "in" is India. Changing this changes which market students see.
+    adzuna_country: str = "in"
+    careerjet_affid: Optional[str] = None
+    careerjet_locale_code: str = "en_IN"
+
     # Comma-separated Host header allowlist (TrustedHostMiddleware, app/main.py). "*" (dev
     # default) accepts any Host -- fine locally, but a production deployment should set
     # this to its real domain(s) (e.g. "api.aiplacementos.com") to reject Host-header
@@ -206,4 +229,19 @@ def validate_for_production() -> None:
         raise RuntimeError(
             "RAZORPAY_KEY_ID is still a test-mode key ('rzp_test_...') -- set it to your real "
             "live-mode key ('rzp_live_...') before running in production."
+        )
+    if settings.razorpay_key_id is not None and not settings.razorpay_webhook_secret:
+        # Same "nothing else complains" class as the two checks above. app/api/subscriptions.py
+        # fails the webhook closed when this is unset -- correctly, since without the secret it
+        # cannot tell Razorpay from anyone who finds the URL -- but that means EVERY webhook
+        # call gets a 503. Razorpay's payment.captured callback is the path that survives the
+        # client never coming back (app closed, network dropped, browser killed mid-redirect),
+        # so with payments configured and this missing, a student can be charged for real and
+        # never receive premium, with nothing failing at startup to warn anyone. Checkout and
+        # the client-side verify would both look fine in testing.
+        raise RuntimeError(
+            "RAZORPAY_KEY_ID is configured but RAZORPAY_WEBHOOK_SECRET is not -- the webhook "
+            "endpoint fails closed (503) without it, so any payment whose client never "
+            "returns would be charged and never activate. Set the webhook secret from the "
+            "Razorpay dashboard's webhook configuration before running in production."
         )

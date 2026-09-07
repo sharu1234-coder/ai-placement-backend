@@ -26,8 +26,12 @@ from app.models.interview_answer import InterviewAnswer  # noqa: F401
 from app.models.interview_evaluation import InterviewEvaluation  # noqa: F401
 from app.models.interview_question import InterviewQuestion  # noqa: F401
 from app.models.job_description import JobDescription  # noqa: F401
+from app.models.job_listing import JobListing  # noqa: F401
+from app.models.job_listing_match import JobListingMatch  # noqa: F401
 from app.models.job_match import JobMatch  # noqa: F401
 from app.models.job_preparation_plan import JobPreparationPlan  # noqa: F401
+from app.models.job_saved_search import JobSavedSearch  # noqa: F401
+from app.models.job_search_profile import JobSearchProfile  # noqa: F401
 from app.models.mission import Mission  # noqa: F401
 from app.models.notification_event import NotificationEvent  # noqa: F401
 from app.models.password_reset_token import PasswordResetToken  # noqa: F401
@@ -50,6 +54,7 @@ from app.models.resume_analysis import ResumeAnalysis  # noqa: F401
 from app.models.resume_ats_check import ResumeAtsCheck  # noqa: F401
 from app.models.roadmap import Roadmap  # noqa: F401
 from app.models.roadmap_task import RoadmapTask  # noqa: F401
+from app.models.saved_job import SavedJob  # noqa: F401
 from app.models.role import Role  # noqa: F401
 from app.models.role_skill_weight import RoleSkillWeight  # noqa: F401
 from app.models.skill import Skill  # noqa: F401

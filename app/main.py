@@ -20,6 +20,7 @@ from app.api.career_path import router as career_path_router
 from app.api.career_twin import router as career_twin_router
 from app.api.deps import get_db
 from app.api.interviews import router as interviews_router
+from app.api.job_hunt import router as job_hunt_router
 from app.api.jobs import router as jobs_router
 from app.api.legal import router as legal_router
 from app.api.missions import router as missions_router
@@ -87,6 +88,7 @@ app.include_router(auth_router, dependencies=_app_check_dep)
 app.include_router(users_router, dependencies=_app_check_dep)
 app.include_router(resumes_router, dependencies=_app_check_dep)
 app.include_router(jobs_router, dependencies=_app_check_dep)
+app.include_router(job_hunt_router, dependencies=_app_check_dep)
 app.include_router(assessments_router, dependencies=_app_check_dep)
 app.include_router(interviews_router, dependencies=_app_check_dep)
 app.include_router(roadmap_router, dependencies=_app_check_dep)
