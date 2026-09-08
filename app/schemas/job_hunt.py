@@ -147,6 +147,10 @@ class JobMatchRead(BaseModel):
     # How many of the advert's skills the student can actually prove. A ranking signal and a
     # headline number, kept separate from total_score so proof strength never inflates fit.
     verified_skill_count: int = 0
+    # True when the employer is one the student named. Reported separately from the score,
+    # which never absorbs it -- a preferred employer orders two equal matches, it does not
+    # make a poor one look good.
+    preferred_company_match: bool = False
     # Honest fit label (spec phase 6). Never an outcome claim: "Best Match" means top of this
     # result set, not most likely to hire you. Null when nothing about the job was evaluable.
     ranking_label: Optional[

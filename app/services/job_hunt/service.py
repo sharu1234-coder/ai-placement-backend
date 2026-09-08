@@ -352,9 +352,18 @@ def search(
         )
         for listing_id, match in matches.items()
     }
+    # A job at a company the student named outranks an equally-scored one elsewhere. This is
+    # ordering, not scoring: the number stays a statement about fit, and a preferred employer
+    # can never make a poor match look like a good one.
+    wanted_companies = tuple(search_profile.preferred_companies or [])
+    preferred_company = {
+        listing.id: matching.matches_preferred_company(listing.company, wanted_companies)
+        for listing in listings
+    }
 
-    # Highest score first, then the job whose required skills the student can actually prove,
-    # then the job we could evaluate on the most evidence, then id.
+    # Highest score first, then a company the student named, then the job whose required
+    # skills they can actually prove, then the job we could evaluate on the most evidence,
+    # then id.
     #
     # That middle term is not cosmetic; it fixes a real mis-ranking. Because an unknown factor
     # is excluded from the weighted mean rather than scored as zero (see matching.py), a job
@@ -370,6 +379,7 @@ def search(
     listings.sort(
         key=lambda item: (
             -matches[item.id].total_score,
+            -int(preferred_company.get(item.id, False)),
             -verified_counts[item.id],
             -len(matches[item.id].component_scores or {}),
             item.id,
@@ -495,7 +505,10 @@ def build_match_input(
         preferred_location=search_profile.preferred_location,
         preferred_work_mode=search_profile.work_mode,
         preferred_employment_type=search_profile.employment_type,
+        open_to_relocation=search_profile.open_to_relocation,
+        preferred_companies=tuple(search_profile.preferred_companies or []),
         job_title=listing.title,
+        job_company=listing.company,
         job_skills=job_skills,
         job_location=listing.location,
         job_work_mode=listing.work_mode,
@@ -760,7 +773,15 @@ def get_saved_job_matches(
     db: Session, profile_id: int, listing_ids: list[int]
 ) -> dict[int, JobListingMatch]:
     """Matches for a set of listings in one query -- the companion to list_saved_jobs that
-    keeps the tracker screen at two queries total rather than one per row."""
+    keeps the tracker screen at two queries total rather than one per row.
+
+    Rows produced by an older engine version are recomputed first, for the same reason
+    get_listing_for_profile does it: a saved job the student has not reopened since a scoring
+    change would otherwise sit in their tracker showing a number today's engine would not
+    produce, next to jobs scored by the current one. Only stale rows are touched, and only
+    once each -- the common case is that nothing is stale and this costs one extra comparison
+    per row.
+    """
     if not listing_ids:
         return {}
     rows = (
@@ -771,6 +792,20 @@ def get_saved_job_matches(
         )
         .all()
     )
+    stale = [row for row in rows if row.score_version != matching.SCORE_VERSION]
+    if stale:
+        search_profile = get_or_create_search_profile(db, profile_id)
+        refreshed = []
+        for row in stale:
+            listing = db.get(JobListing, row.listing_id)
+            if listing is None:
+                # The shared listing was pruned out from under a saved row. Nothing to
+                # rescore against, so the old row is left as-is rather than guessed at.
+                continue
+            refreshed.append(_upsert_match(db, search_profile, listing))
+        if refreshed:
+            db.commit()
+        rows = [row for row in rows if row.score_version == matching.SCORE_VERSION] + refreshed
     return {row.listing_id: row for row in rows}
 
 

@@ -392,6 +392,7 @@ def _to_match_read(
             for item in items
         ],
         verified_skill_count=job_provenance.verified_count(items),
+        preferred_company_match=recomputed.preferred_company_match,
         ranking_label=matching.ranking_label(
             rank=rank,
             total_score=match.total_score,

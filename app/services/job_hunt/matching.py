@@ -22,7 +22,7 @@ match; it is a match we know less about, and the student is told exactly that.
 
 import dataclasses
 import datetime
-from typing import Optional
+from typing import Optional, Sequence
 
 from app.services.job_hunt.normalization import (
     role_family,
@@ -31,8 +31,12 @@ from app.services.job_hunt.normalization import (
 )
 
 # Bump on any change to weights or component semantics. Read by the service to decide whether
-# a stored JobListingMatch is still current.
-SCORE_VERSION = "v1"
+# a stored JobListingMatch is still current; an older version is recomputed rather than shown.
+#
+# v2: location_fit stopped treating "different city" as a flat zero for a student who has said
+# they are open to relocating. Scoring their own stated flexibility as a total mismatch made
+# every out-of-city job look like a rejection to exactly the students most willing to take one.
+SCORE_VERSION = "v2"
 
 # Server-authoritative weights (spec section 6: "Keep weights server-authoritative"). Never
 # read from a request, never overridable per user -- a client that could send its own weights
@@ -76,6 +80,17 @@ class MatchInput:
     job_seniority: Optional[str]
     job_posted_at: Optional[datetime.datetime]
 
+    # Defaulted fields, so they sit last: a dataclass cannot put a defaulted field before a
+    # required one. Both are optional inputs the engine works without.
+    job_company: Optional[str] = None
+    # Their own stated flexibility. None means they never answered, which is not the same as
+    # "no" -- see _location_score for why the two are scored differently.
+    open_to_relocation: Optional[bool] = None
+    # Employers the student named. Never a score component: a weight here would be a number
+    # invented for a preference, and a student who names three companies would see every other
+    # job marked down. It surfaces as a reason and as a ranking tie-break instead.
+    preferred_companies: tuple[str, ...] = ()
+
 
 @dataclasses.dataclass(frozen=True)
 class MatchResult:
@@ -88,6 +103,9 @@ class MatchResult:
     rationale: str
     reasons: list[str]
     apply_readiness: Optional[str]
+    # True when the advert's employer is one the student named. Reported separately from the
+    # score so a client can badge it without the number having silently absorbed it.
+    preferred_company_match: bool = False
 
 
 def score_match(data: MatchInput, now: Optional[datetime.datetime] = None) -> MatchResult:
@@ -182,6 +200,14 @@ def score_match(data: MatchInput, now: Optional[datetime.datetime] = None) -> Ma
         if age_days <= 3:
             reasons.append("Posted in the last few days")
 
+    # -- Preferred employer -----------------------------------------------------------------
+    # A named company is a fact about the student's intent, not about how well they fit the
+    # role, so it never enters the score. It is worth saying out loud, and worth using to
+    # order two jobs the engine otherwise rates identically.
+    company_match = _matches_preferred_company(data)
+    if company_match:
+        reasons.append(f"{data.job_company} is one of the companies you're targeting")
+
     total = _weighted_mean(components)
 
     return MatchResult(
@@ -194,6 +220,7 @@ def score_match(data: MatchInput, now: Optional[datetime.datetime] = None) -> Ma
         rationale=_rationale(components, matched, data),
         reasons=reasons,
         apply_readiness=_apply_readiness(data, matched, missing),
+        preferred_company_match=company_match,
     )
 
 
@@ -245,7 +272,22 @@ def _location_score(data: MatchInput) -> tuple[Optional[float], Optional[str], O
     # of "Bengaluru, India" should match a job listed simply as "Bengaluru".
     if preferred and (preferred in job_location or job_location in preferred):
         return 1.0, f"Located in {data.job_location}, matching your preference", None
-    # A different city is a real, knowable mismatch -- not an unknown.
+    # A different city is a real, knowable mismatch -- not an unknown. How much it counts
+    # against the job depends on something only the student can tell us.
+    if data.open_to_relocation:
+        # They said they would move. Scoring that as a total mismatch would mark down every
+        # out-of-city job for exactly the students most willing to take one, and would be the
+        # engine overruling a preference they stated explicitly. Not 1.0 either: relocating is
+        # a real cost, and a job in their own city is genuinely a better fit.
+        return (
+            0.5,
+            f"Located in {data.job_location} rather than {data.preferred_location}, "
+            "but you're open to relocating",
+            None,
+        )
+    # False, or never answered. These are deliberately scored the same: an unanswered
+    # relocation question is not a reason to assume flexibility on the student's behalf, and
+    # assuming it would quietly fill their results with cities they cannot move to.
     return 0.0, f"Located in {data.job_location}, not your preferred {data.preferred_location}", None
 
 
@@ -290,6 +332,37 @@ def _apply_readiness(data: MatchInput, matched: list[str], missing: list[str]) -
     if coverage >= 0.4:
         return "stretch"
     return "gap"
+
+
+def matches_preferred_company(
+    job_company: Optional[str], preferred_companies: Sequence[str]
+) -> bool:
+    """Case-insensitive containment either way, so "Acme" matches "Acme Technologies Pvt Ltd"
+    and a student who typed the full legal name still matches an advert listing "Acme".
+
+    Deliberately not fuzzy beyond that. A near-match on a company name is the kind of thing
+    that reads as a mistake rather than as helpfulness -- telling a student that "Amazon Web
+    Services" satisfies their interest in "Amazon Prime Video" would be a claim we cannot
+    support.
+
+    Public because the ranking step in service.py needs the same answer, and re-running the
+    whole scoring pass per listing just to read one boolean off it would be the expensive way
+    to duplicate a rule that has to stay singular anyway.
+    """
+    if not job_company or not preferred_companies:
+        return False
+    job = job_company.strip().lower()
+    if not job:
+        return False
+    for preferred in preferred_companies:
+        wanted = (preferred or "").strip().lower()
+        if wanted and (wanted in job or job in wanted):
+            return True
+    return False
+
+
+def _matches_preferred_company(data: MatchInput) -> bool:
+    return matches_preferred_company(data.job_company, data.preferred_companies)
 
 
 def _humanize(family_key: str) -> str:

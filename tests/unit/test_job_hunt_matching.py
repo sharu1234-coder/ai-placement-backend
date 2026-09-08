@@ -6,6 +6,7 @@ seniority, and scoring an absent field as zero would punish a job for its provid
 telling the student "you are a poor fit" -- a claim the data never supported.
 """
 
+import dataclasses
 import datetime
 
 from app.services.job_hunt import matching
@@ -322,3 +323,115 @@ class TestRankingLabel:
             for readiness in (None, "ready", "stretch", "gap")
         }
         assert produced <= set(matching.RANKING_LABELS)
+
+
+class TestRelocation:
+    """v2's one scoring change: a student's own stated flexibility stops counting against them."""
+
+    def _input(self, **overrides):
+        base = dict(
+            student_skills=["python"],
+            student_role_family="software_engineering",
+            student_experience_level="fresher",
+            preferred_location="Bengaluru",
+            preferred_work_mode=None,
+            preferred_employment_type=None,
+            job_title="Software Engineer",
+            job_skills=["python"],
+            job_location="Hyderabad",
+            job_work_mode="onsite",
+            job_employment_type=None,
+            job_seniority=None,
+            job_posted_at=_NOW,
+        )
+        base.update(overrides)
+        return matching.MatchInput(**base)
+
+    def test_a_different_city_is_a_partial_fit_when_the_student_will_move(self):
+        result = matching.score_match(self._input(open_to_relocation=True), now=_NOW)
+        assert result.component_scores["location_fit"] == 0.5
+        assert any("open to relocating" in reason for reason in result.reasons)
+
+    def test_it_is_still_not_a_perfect_fit_because_relocating_costs_something(self):
+        # A job in their own city genuinely suits them better; saying otherwise would flatten
+        # a real difference the student would feel.
+        moving = matching.score_match(self._input(open_to_relocation=True), now=_NOW)
+        local = matching.score_match(
+            self._input(job_location="Bengaluru", open_to_relocation=True), now=_NOW
+        )
+        assert local.component_scores["location_fit"] > moving.component_scores["location_fit"]
+
+    def test_declining_to_relocate_is_scored_as_a_mismatch(self):
+        result = matching.score_match(self._input(open_to_relocation=False), now=_NOW)
+        assert result.component_scores["location_fit"] == 0.0
+
+    def test_an_unanswered_relocation_question_is_not_read_as_a_yes(self):
+        # Assuming flexibility nobody stated would fill a student's results with cities they
+        # cannot move to. Unanswered is scored exactly like "no", and that is deliberate.
+        unanswered = matching.score_match(self._input(open_to_relocation=None), now=_NOW)
+        declined = matching.score_match(self._input(open_to_relocation=False), now=_NOW)
+        assert unanswered.component_scores["location_fit"] == declined.component_scores["location_fit"]
+
+    def test_relocation_does_not_override_a_remote_preference(self):
+        # Work mode still dominates: a non-remote job cannot satisfy "remote only" just
+        # because the student would move.
+        result = matching.score_match(
+            self._input(preferred_work_mode="remote", open_to_relocation=True), now=_NOW
+        )
+        assert result.component_scores["location_fit"] == 0.0
+
+
+class TestPreferredCompany:
+    def test_a_named_employer_is_recognised_inside_a_longer_legal_name(self):
+        assert matching.matches_preferred_company("Acme Technologies Pvt Ltd", ("Acme",))
+
+    def test_a_full_legal_name_still_matches_a_short_advert_listing(self):
+        assert matching.matches_preferred_company("Acme", ("Acme Technologies Pvt Ltd",))
+
+    def test_matching_is_case_insensitive(self):
+        assert matching.matches_preferred_company("ACME", ("acme",))
+
+    def test_an_unrelated_company_does_not_match(self):
+        assert not matching.matches_preferred_company("Globex", ("Acme",))
+
+    def test_blank_and_missing_values_never_match(self):
+        # A blank preference must not match every employer in the country.
+        assert not matching.matches_preferred_company("Acme", ("",))
+        assert not matching.matches_preferred_company("", ("Acme",))
+        assert not matching.matches_preferred_company(None, ("Acme",))
+        assert not matching.matches_preferred_company("Acme", ())
+
+    def test_a_preferred_employer_is_reported_but_never_scored(self):
+        # The whole point of keeping it out of the weighted mean: naming a company must not
+        # be able to turn a poor match into a good-looking one.
+        data = matching.MatchInput(
+            student_skills=["python"],
+            student_role_family="software_engineering",
+            student_experience_level="fresher",
+            preferred_location=None,
+            preferred_work_mode=None,
+            preferred_employment_type=None,
+            job_title="Software Engineer",
+            job_skills=["python"],
+            job_location=None,
+            job_work_mode=None,
+            job_employment_type=None,
+            job_seniority=None,
+            job_posted_at=_NOW,
+            job_company="Acme Technologies",
+            preferred_companies=("Acme",),
+        )
+        with_company = matching.score_match(data, now=_NOW)
+        without = matching.score_match(
+            dataclasses.replace(data, preferred_companies=()), now=_NOW
+        )
+        assert with_company.preferred_company_match is True
+        assert without.preferred_company_match is False
+        assert with_company.total_score == without.total_score
+        assert any("targeting" in reason for reason in with_company.reasons)
+
+
+def test_the_score_version_advanced_with_the_relocation_change():
+    # Stored matches are recomputed when their version is older than this, so the constant
+    # moving is what stops a student seeing a v1 score today's engine would not produce.
+    assert matching.SCORE_VERSION == "v2"

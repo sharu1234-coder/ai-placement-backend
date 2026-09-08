@@ -15,6 +15,7 @@ from app.ai.provider import AIProvider
 from app.ai.schemas.resume import ParsedResume, ResumeExperience
 from app.core.config import settings
 from app.main import app
+from app.services.job_hunt import matching
 from app.services.job_hunt.providers.base import (
     JobProvider,
     JobProviderAuthError,
@@ -248,7 +249,10 @@ class TestSearch:
         assert body["total_available"] == 42
         assert body["provider"] == "fake"
         assert body["attribution_text"] == "Jobs by Fake"
-        assert body["score_version"] == "v1"
+        # Against the constant, not a literal. A deliberate engine change bumps the version
+        # and must not read as a regression; what matters is that the API reports the version
+        # today's engine produces rather than one stored from an older pass.
+        assert body["score_version"] == matching.SCORE_VERSION
 
         match = body["results"][0]["match"]
         assert 0.0 <= match["total_score"] <= 1.0
@@ -504,7 +508,7 @@ class TestSavedJobs:
         assert len(saved) == 1
         assert saved[0]["listing"]["id"] == listing_id
         # The stored match travels with the row so the tracker can show the score.
-        assert saved[0]["match"]["score_version"] == "v1"
+        assert saved[0]["match"]["score_version"] == matching.SCORE_VERSION
 
     def test_saving_twice_is_idempotent_rather_than_a_duplicate_pipeline_entry(self, client, auth_headers, use_provider):
         listing_id = seed_listing(client, auth_headers, use_provider)
@@ -784,3 +788,105 @@ class TestRankingLabels:
 
         detail = client.get(f"/job-hunt/jobs/{listing_id}", headers=auth_headers).json()
         assert detail["match"]["ranking_label"] != "best_match"
+
+
+class TestScoreVersioning:
+    def test_a_match_stored_by_an_older_engine_is_recomputed_before_it_is_shown(
+        self, client, auth_headers, use_provider
+    ):
+        """The point of the version constant, exercised rather than assumed.
+
+        Without this, a student who searched before an engine change would keep seeing the old
+        number on the detail screen indefinitely -- a score today's weights would not produce,
+        with today's explanation printed underneath it.
+        """
+        use_provider(FakeJobProvider())
+        client.put(
+            "/job-hunt/profile",
+            json={"target_role_title": "Software Engineer"},
+            headers=auth_headers,
+        )
+        listing_id = client.post("/job-hunt/search", json={}, headers=auth_headers).json()[
+            "results"
+        ][0]["listing"]["id"]
+
+        # Age the stored match by hand, exactly as a real engine change would leave it.
+        # Reached through the dependency override rather than a module-level session factory:
+        # the test database is an in-memory SQLite created per test, and only the override
+        # holds a handle to it.
+        from app.api.deps import get_db
+        from app.models.job_listing_match import JobListingMatch
+
+        session_gen = app.dependency_overrides[get_db]()
+        db = next(session_gen)
+        try:
+            row = db.query(JobListingMatch).filter(JobListingMatch.listing_id == listing_id).first()
+            assert row is not None
+            row.score_version = "v0-ancient"
+            row.total_score = 0.01
+            db.commit()
+        finally:
+            session_gen.close()
+
+        detail = client.get(f"/job-hunt/jobs/{listing_id}", headers=auth_headers).json()
+        assert detail["match"]["score_version"] == matching.SCORE_VERSION
+        assert detail["match"]["total_score"] != 0.01
+
+    def test_a_saved_job_scored_by_an_older_engine_is_rescored_for_the_tracker(
+        self, client, auth_headers, use_provider
+    ):
+        """Otherwise the tracker shows an old number beside jobs scored by the current engine,
+        and the two disagree with no way for a student to tell which is right."""
+        use_provider(FakeJobProvider())
+        client.put(
+            "/job-hunt/profile",
+            json={"target_role_title": "Software Engineer"},
+            headers=auth_headers,
+        )
+        listing_id = client.post("/job-hunt/search", json={}, headers=auth_headers).json()[
+            "results"
+        ][0]["listing"]["id"]
+        client.post("/job-hunt/saved", json={"listing_id": listing_id}, headers=auth_headers)
+
+        from app.api.deps import get_db
+        from app.models.job_listing_match import JobListingMatch
+
+        session_gen = app.dependency_overrides[get_db]()
+        db = next(session_gen)
+        try:
+            row = db.query(JobListingMatch).filter(JobListingMatch.listing_id == listing_id).first()
+            row.score_version = "v0-ancient"
+            row.total_score = 0.01
+            db.commit()
+        finally:
+            session_gen.close()
+
+        saved = client.get("/job-hunt/saved", headers=auth_headers).json()
+        assert saved[0]["match"]["score_version"] == matching.SCORE_VERSION
+        assert saved[0]["match"]["total_score"] != 0.01
+
+
+class TestPreferredCompanySurfacing:
+    def test_a_job_at_a_named_company_is_flagged_without_changing_the_score(
+        self, client, auth_headers, use_provider
+    ):
+        use_provider(FakeJobProvider(jobs=[provider_job(company="Acme Technologies Pvt Ltd")]))
+        client.put(
+            "/job-hunt/profile",
+            json={"target_role_title": "Software Engineer", "preferred_companies": ["Acme"]},
+            headers=auth_headers,
+        )
+        flagged = client.post("/job-hunt/search", json={}, headers=auth_headers).json()["results"][0][
+            "match"
+        ]
+        assert flagged["preferred_company_match"] is True
+
+    def test_an_unnamed_company_is_not_flagged(self, client, auth_headers, use_provider):
+        use_provider(FakeJobProvider(jobs=[provider_job(company="Globex")]))
+        client.put(
+            "/job-hunt/profile",
+            json={"target_role_title": "Software Engineer", "preferred_companies": ["Acme"]},
+            headers=auth_headers,
+        )
+        result = client.post("/job-hunt/search", json={}, headers=auth_headers).json()["results"][0]
+        assert result["match"]["preferred_company_match"] is False
