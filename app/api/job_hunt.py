@@ -24,8 +24,16 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_current_user, get_db
 from app.core.rate_limit import limiter
 from app.models.job_listing import JobListing
+from app.models.job_saved_search import JobSavedSearch
 from app.models.user import User
 from app.schemas.job_hunt import (
+    ApplicationReadinessRead,
+    JobAlertCreate,
+    JobAlertHistoryRead,
+    JobAlertQuotaRead,
+    JobAlertRead,
+    JobAlertUpdate,
+    JobHuntHomeRead,
     JobListingRead,
     JobMatchRead,
     JobResultRead,
@@ -33,15 +41,20 @@ from app.schemas.job_hunt import (
     JobSearchProfileUpdate,
     JobSearchRequest,
     JobSearchResponse,
+    ReadinessDimensionRead,
+    ReadinessGapRead,
     RoleSuggestionsRead,
     SavedJobRead,
     SavedSearchCreate,
     SavedSearchRead,
     SaveJobRequest,
+    SkillMatchAnalysisRead,
+    SkillMatchRowRead,
     SkillProvenanceRead,
     UpdateSavedJobRequest,
 )
-from app.services.job_hunt import matching, service
+from app.services.job_hunt import alerts as job_alerts
+from app.services.job_hunt import matching, readiness, service
 from app.services.job_hunt import provenance as job_provenance
 from app.services.job_hunt.providers.base import (
     JobProvider,
@@ -247,6 +260,7 @@ def search_jobs(
             max_days_old=payload.max_days_old,
             page=payload.page,
             page_size=payload.page_size,
+            sort=payload.sort,
             end_user_ip=end_user_ip,
             end_user_agent=end_user_agent,
         )
@@ -413,7 +427,14 @@ def save_job(
 ) -> SavedJobRead:
     profile = get_or_create_profile(db, current_user)
     try:
-        saved = service.save_job(db, profile.id, payload.listing_id, payload.status)
+        saved = service.save_job(
+            db,
+            profile.id,
+            payload.listing_id,
+            payload.status,
+            source=payload.source,
+            source_saved_search_id=payload.source_saved_search_id,
+        )
     except service.ListingNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
     except service.InvalidStatusError as exc:
@@ -430,6 +451,21 @@ def list_saved(
     profile = get_or_create_profile(db, current_user)
     rows = service.list_saved_jobs(db, profile.id, statuses=status_filter)
     matches = service.get_saved_job_matches(db, profile.id, [listing.id for _s, listing in rows])
+    # Saved-search names resolved in one query rather than one per row, and only for the rows
+    # that actually carry a provenance id.
+    wanted = {
+        saved.source_saved_search_id
+        for saved, _listing in rows
+        if saved.source_saved_search_id is not None
+    }
+    search_names = (
+        {
+            row.id: row.name
+            for row in db.query(JobSavedSearch).filter(JobSavedSearch.id.in_(wanted)).all()
+        }
+        if wanted
+        else {}
+    )
     return [
         SavedJobRead(
             id=saved.id,
@@ -439,6 +475,9 @@ def list_saved(
             applied_at=saved.applied_at,
             created_at=saved.created_at,
             updated_at=saved.updated_at,
+            source=saved.source,
+            source_saved_search_id=saved.source_saved_search_id,
+            source_saved_search_name=search_names.get(saved.source_saved_search_id),
             listing=_to_listing_read(listing),
             match=_stored_match_read(matches.get(listing.id)),
         )
@@ -494,6 +533,18 @@ def _to_saved_read(db: Session, profile_id: int, saved) -> SavedJobRead:
         applied_at=saved.applied_at,
         created_at=saved.created_at,
         updated_at=saved.updated_at,
+        source=saved.source,
+        source_saved_search_id=saved.source_saved_search_id,
+        # Resolved for display. Null when the saved search has since been deleted -- the row
+        # keeps its provenance rather than being rewritten to "manual", because the student
+        # really did find this job through a search, and a tracker that edits its own history
+        # to match the present is worse than one that admits the search is gone.
+        source_saved_search_name=(
+            search.name
+            if saved.source_saved_search_id
+            and (search := db.get(JobSavedSearch, saved.source_saved_search_id))
+            else None
+        ),
         listing=_to_listing_read(listing),
         match=_stored_match_read(matches.get(saved.listing_id)),
     )
@@ -547,9 +598,19 @@ def list_saved_searches(
     db: Session = Depends(get_db),
 ) -> List[SavedSearchRead]:
     profile = get_or_create_profile(db, current_user)
-    return [
-        SavedSearchRead.model_validate(row) for row in service.list_saved_searches(db, profile.id)
-    ]
+    rows = service.list_saved_searches(db, profile.id)
+    # One query for every alert, rather than one per search. The list is small, but the shape
+    # of the loop is what would make it an N+1 as soon as it is not.
+    alerted = {
+        alert.saved_search_id
+        for alert in job_alerts.list_alerts(db, profile.id)
+        if alert.saved_search_id is not None
+    }
+    out = []
+    for row in rows:
+        read = SavedSearchRead.model_validate(row)
+        out.append(read.model_copy(update={"has_alert": row.id in alerted}))
+    return out
 
 
 @router.delete("/saved-searches/{saved_search_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -562,4 +623,391 @@ def delete_saved_search(
     try:
         service.delete_saved_search(db, profile.id, saved_search_id)
     except service.SavedJobNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+
+
+# -- Home -----------------------------------------------------------------------------------
+
+
+@router.get("/home", response_model=JobHuntHomeRead)
+def job_hunt_home(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> JobHuntHomeRead:
+    """Counts and top recommendations, from what we have already fetched and scored.
+
+    Deliberately does NOT call the provider. Opening the app should not consume a quota unit
+    or take a network round trip's worth of latency before showing anything, and the counts
+    describe this student's own stored rows rather than the live market.
+    """
+    profile = get_or_create_profile(db, current_user)
+    search_profile = service.get_or_create_search_profile(db, profile.id)
+    counts = service.home_summary(db, profile.id)
+
+    listings, matches = service.top_matches(db, profile.id, limit=5)
+    evidence_states = service.evidence_states_for_skills(
+        db,
+        profile.id,
+        [
+            skill
+            for match in matches.values()
+            for skill in list(match.matched_skills or []) + list(match.missing_skills or [])
+        ],
+    )
+    saved_rows = {
+        saved.listing_id: saved
+        for saved, _listing in service.list_saved_jobs(db, profile.id, limit=500)
+    }
+    recommended = [
+        JobResultRead(
+            listing=_to_listing_read(listing),
+            match=_to_match_read(
+                matches[listing.id], listing, search_profile, evidence_states, rank=rank
+            ),
+            saved_job_id=saved_rows[listing.id].id if listing.id in saved_rows else None,
+            saved_status=saved_rows[listing.id].status if listing.id in saved_rows else None,
+        )
+        for rank, listing in enumerate(listings)
+    ]
+
+    return JobHuntHomeRead(
+        new_jobs=counts["new_jobs"],
+        best_matches=counts["best_matches"],
+        applied=counts["applied"],
+        saved=counts["saved"],
+        target_role_title=search_profile.target_role_title,
+        is_ready_to_search=bool(
+            search_profile.target_role_title or search_profile.resume_id is not None
+        ),
+        recommended=recommended,
+    )
+
+
+# -- Skill match analysis + application readiness --------------------------------------------
+
+
+@router.get("/jobs/{listing_id}/skill-analysis", response_model=SkillMatchAnalysisRead)
+def job_skill_analysis(
+    listing_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> SkillMatchAnalysisRead:
+    profile = get_or_create_profile(db, current_user)
+    try:
+        listing, match = service.get_listing_for_profile(db, profile.id, listing_id)
+    except service.ListingNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+
+    search_profile = service.get_or_create_search_profile(db, profile.id)
+    evidence_states = service.evidence_states_for_skills(
+        db, profile.id, list(match.matched_skills or []) + list(match.missing_skills or [])
+    )
+    items = service.build_skill_provenance(search_profile, match, evidence_states)
+
+    gaps = [item.skill for item in items if item.status == job_provenance.MISSING]
+    return SkillMatchAnalysisRead(
+        total_score=match.total_score,
+        score_version=match.score_version,
+        rows=[
+            SkillMatchRowRead(
+                skill=item.skill,
+                status=item.status,
+                strength=job_provenance.match_strength(item),
+                evidence_state=item.evidence_state,
+                detail=item.detail,
+            )
+            for item in items
+        ],
+        verified_skill_count=job_provenance.verified_count(items),
+        # The first real gap, or nothing. Never a filler value to keep the card populated.
+        biggest_gap_skill=gaps[0] if gaps else None,
+    )
+
+
+@router.get("/jobs/{listing_id}/readiness", response_model=ApplicationReadinessRead)
+def job_application_readiness(
+    listing_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ApplicationReadinessRead:
+    """Premium: the job-specific readiness breakdown.
+
+    Free students still get the match score, the four skill buckets and the gap list -- the
+    diagnosis is not paywalled. What Premium adds is the per-dimension breakdown and the
+    before-you-apply plan.
+    """
+    profile = get_or_create_profile(db, current_user)
+    if not is_premium(db, profile.id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Application readiness is a Premium feature. Your match score and skill gaps "
+                "stay free."
+            ),
+        )
+
+    try:
+        listing, match = service.get_listing_for_profile(db, profile.id, listing_id)
+    except service.ListingNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+
+    search_profile = service.get_or_create_search_profile(db, profile.id)
+    evidence_states = service.evidence_states_for_skills(
+        db, profile.id, list(match.matched_skills or []) + list(match.missing_skills or [])
+    )
+    items = service.build_skill_provenance(search_profile, match, evidence_states)
+    result = readiness.compute(
+        db, profile, listing, dict(match.component_scores or {}), items
+    )
+
+    return ApplicationReadinessRead(
+        listing_id=listing.id,
+        overall=result.overall,
+        band=result.band,
+        dimensions=[
+            ReadinessDimensionRead(
+                key=dim.key, label=dim.label, score=dim.score, detail=dim.detail
+            )
+            for dim in result.dimensions
+        ],
+        unknown_dimensions=result.unknown_dimensions,
+        biggest_gap=ReadinessGapRead(**result.biggest_gap) if result.biggest_gap else None,
+        tips=result.tips,
+    )
+
+
+# -- Saved-search execution ------------------------------------------------------------------
+
+
+@router.post("/saved-searches/{saved_search_id}/run", response_model=JobSearchResponse)
+@limiter.limit("20/hour")
+def run_saved_search(
+    request: Request,
+    saved_search_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    provider: JobProvider = Depends(get_job_provider),
+) -> JobSearchResponse:
+    """Re-run a stored search, and record that it ran.
+
+    Shares the search endpoint's rate-limit budget deliberately: a saved search is a search,
+    and a separate allowance would be a way around the limit rather than a second entitlement.
+    """
+    profile = get_or_create_profile(db, current_user)
+    end_user_ip, end_user_agent = _end_user_identity(request)
+
+    try:
+        saved_search, outcome = service.run_saved_search(
+            db,
+            profile,
+            provider,
+            saved_search_id,
+            end_user_ip=end_user_ip,
+            end_user_agent=end_user_agent,
+        )
+    except service.SavedSearchNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    except service.SearchProfileIncompleteError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+    except Exception as exc:
+        raise _provider_failure(exc, "saved search run")
+
+    search_profile = service.get_or_create_search_profile(db, profile.id)
+    saved_rows = {
+        saved.listing_id: saved
+        for saved, _listing in service.list_saved_jobs(db, profile.id, limit=500)
+    }
+    results = [
+        JobResultRead(
+            listing=_to_listing_read(listing),
+            match=_to_match_read(
+                outcome.matches[listing.id],
+                listing,
+                search_profile,
+                outcome.evidence_states,
+                rank=rank,
+            ),
+            saved_job_id=saved_rows[listing.id].id if listing.id in saved_rows else None,
+            saved_status=saved_rows[listing.id].status if listing.id in saved_rows else None,
+        )
+        for rank, listing in enumerate(outcome.listings)
+    ]
+    filters = dict(saved_search.filters or {})
+    return JobSearchResponse(
+        results=results,
+        total_available=outcome.total_available,
+        page=filters.get("page") or 1,
+        page_size=filters.get("page_size") or 20,
+        provider=outcome.provider_name,
+        attribution_text=outcome.attribution_text,
+        attribution_url=outcome.attribution_url,
+        fetched_at=outcome.fetched_at,
+        duplicates_removed=outcome.duplicates_removed,
+        score_version=matching.SCORE_VERSION,
+    )
+
+
+# -- Job alerts ------------------------------------------------------------------------------
+
+
+def _to_alert_read(db: Session, alert) -> JobAlertRead:
+    search = (
+        db.get(JobSavedSearch, alert.saved_search_id)
+        if alert.saved_search_id is not None
+        else None
+    )
+    # Filters are read live from the saved search when there is one, matching what the alert
+    # will actually run with -- see alerts._filters_for. Unknown keys are dropped rather than
+    # passed through: stored filters are data, and data written by an older version of the app
+    # must not be able to reach a field that did not exist when it was saved.
+    raw_filters = dict((search.filters if search else alert.filters) or {})
+    return JobAlertRead(
+        id=alert.id,
+        name=alert.name,
+        saved_search_id=alert.saved_search_id,
+        saved_search_name=search.name if search else None,
+        filters=JobSearchRequest(
+            **{
+                key: value
+                for key, value in raw_filters.items()
+                if key in JobSearchRequest.model_fields
+            }
+        ),
+        frequency=alert.frequency,
+        day_of_week=alert.day_of_week,
+        hour_local=alert.hour_local,
+        quiet_hours_start=alert.quiet_hours_start,
+        quiet_hours_end=alert.quiet_hours_end,
+        is_enabled=alert.is_enabled,
+        last_run_at=alert.last_run_at,
+        last_success_at=alert.last_success_at,
+        last_error_at=alert.last_error_at,
+        last_run_status=alert.last_run_status,
+        last_new_job_count=alert.last_new_job_count,
+        created_at=alert.created_at,
+    )
+
+
+@router.get("/alerts", response_model=List[JobAlertRead])
+def list_job_alerts(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> List[JobAlertRead]:
+    profile = get_or_create_profile(db, current_user)
+    return [_to_alert_read(db, alert) for alert in job_alerts.list_alerts(db, profile.id)]
+
+
+@router.get("/alerts/quota", response_model=JobAlertQuotaRead)
+def job_alert_quota(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> JobAlertQuotaRead:
+    """What the plan allows. Returned so the client can explain a refusal rather than showing
+    a disabled button with no reason attached."""
+    profile = get_or_create_profile(db, current_user)
+    return JobAlertQuotaRead(
+        used=len(job_alerts.list_alerts(db, profile.id)),
+        limit=job_alerts.max_alerts_for(db, profile.id),
+        is_premium=is_premium(db, profile.id),
+    )
+
+
+@router.get("/alerts/history", response_model=List[JobAlertHistoryRead])
+def job_alert_history(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> List[JobAlertHistoryRead]:
+    profile = get_or_create_profile(db, current_user)
+    rows = job_alerts.list_history(db, profile.id)
+    names = {alert.id: alert.name for alert in job_alerts.list_alerts(db, profile.id)}
+    out: List[JobAlertHistoryRead] = []
+    for row in rows:
+        listing = db.get(JobListing, row.listing_id)
+        if listing is None:
+            # The shared listing was pruned. The delivery still happened, but there is nothing
+            # to show, so the row is skipped rather than rendered as a blank card.
+            continue
+        out.append(
+            JobAlertHistoryRead(
+                id=row.id,
+                alert_id=row.alert_id,
+                alert_name=names.get(row.alert_id),
+                listing=_to_listing_read(listing),
+                notified_at=row.notified_at,
+            )
+        )
+    return out
+
+
+@router.post("/alerts", response_model=JobAlertRead, status_code=status.HTTP_201_CREATED)
+def create_job_alert(
+    payload: JobAlertCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> JobAlertRead:
+    profile = get_or_create_profile(db, current_user)
+    try:
+        alert = job_alerts.create_alert(
+            db,
+            profile.id,
+            name=payload.name,
+            saved_search_id=payload.saved_search_id,
+            filters=payload.filters.model_dump(exclude_none=True) if payload.filters else None,
+            frequency=payload.frequency,
+            day_of_week=payload.day_of_week,
+            hour_local=payload.hour_local,
+            quiet_hours_start=payload.quiet_hours_start,
+            quiet_hours_end=payload.quiet_hours_end,
+            is_enabled=payload.is_enabled,
+        )
+    except job_alerts.AlertNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    except job_alerts.AlertLimitReachedError as exc:
+        # 403 and not 409: this is an entitlement ceiling, and the client routes it to the
+        # upgrade prompt rather than to a retry.
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
+    except job_alerts.InvalidAlertError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+    return _to_alert_read(db, alert)
+
+
+@router.patch("/alerts/{alert_id}", response_model=JobAlertRead)
+def update_job_alert(
+    alert_id: int,
+    payload: JobAlertUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> JobAlertRead:
+    profile = get_or_create_profile(db, current_user)
+    try:
+        alert = job_alerts.update_alert(
+            db,
+            profile.id,
+            alert_id,
+            name=payload.name,
+            frequency=payload.frequency,
+            day_of_week=payload.day_of_week,
+            hour_local=payload.hour_local,
+            quiet_hours_start=payload.quiet_hours_start,
+            quiet_hours_end=payload.quiet_hours_end,
+            is_enabled=payload.is_enabled,
+            clear_quiet_hours=payload.clear_quiet_hours,
+        )
+    except job_alerts.AlertNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    except job_alerts.InvalidAlertError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+    return _to_alert_read(db, alert)
+
+
+@router.delete("/alerts/{alert_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_job_alert(
+    alert_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> None:
+    profile = get_or_create_profile(db, current_user)
+    try:
+        job_alerts.delete_alert(db, profile.id, alert_id)
+    except job_alerts.AlertNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))

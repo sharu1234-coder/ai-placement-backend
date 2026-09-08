@@ -94,3 +94,30 @@ class TestOrderingAndShape:
             ["a", "b"], ["c"], {"a": "verified", "b": "claimed"}, student_has_skills=True
         )
         assert all(item.status in provenance.SKILL_PROVENANCE_STATUSES for item in items)
+
+
+class TestMatchStrength:
+    """The badge shown beside each skill. Derived from the bucket so the two cannot disagree."""
+
+    def _one(self, status, state=None):
+        return provenance.SkillProvenance(skill="python", status=status, evidence_state=state)
+
+    def test_proven_evidence_reads_as_a_strong_match(self):
+        assert provenance.match_strength(self._one(provenance.VERIFIED_EVIDENCE)) == "strong_match"
+
+    def test_a_resume_claim_still_reads_as_a_match(self):
+        # Credible on a CV screen even though it is only a claim to us. Calling it "weak"
+        # would understate what a recruiter actually sees.
+        assert provenance.match_strength(self._one(provenance.ON_RESUME)) == "match"
+
+    def test_a_skill_the_student_lacks_reads_as_a_gap(self):
+        assert provenance.match_strength(self._one(provenance.MISSING)) == "skill_gap"
+
+    def test_an_unknown_skill_reads_as_unclear_not_as_a_gap(self):
+        assert provenance.match_strength(self._one(provenance.UNCLEAR)) == "unclear"
+
+    def test_every_bucket_has_a_badge(self):
+        # A new bucket must be a KeyError here, not a silent fall-through to a badge that
+        # flatters the student.
+        for status in provenance.SKILL_PROVENANCE_STATUSES:
+            assert provenance.match_strength(self._one(status)) in provenance.MATCH_STRENGTHS

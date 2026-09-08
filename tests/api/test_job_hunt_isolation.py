@@ -200,3 +200,56 @@ class TestAccountDeletion:
         assert bob_tracker[0]["listing"]["id"] == listing_id
         # And the listing is still fully readable, not a dangling reference.
         assert client.get(f"/job-hunt/jobs/{listing_id}", headers=bob).status_code == 200
+
+    def test_deleting_an_account_removes_alerts_and_their_delivery_history(
+        self, client, alice, use_provider
+    ):
+        """Alerts and their delivery rows are per-student data, and both reference tables that
+        outlive the student -- job_saved_searches and job_listings. Getting the delete order
+        wrong here fails on a real foreign key rather than leaving orphans quietly behind, so
+        this exercises the whole chain in one go: search -> saved search -> alert -> delete."""
+        seed_saved_job(client, alice, use_provider)
+        search_id = client.post(
+            "/job-hunt/saved-searches",
+            json={"name": "Watched", "filters": {"keywords": "sde"}},
+            headers=alice,
+        ).json()["id"]
+        alert = client.post(
+            "/job-hunt/alerts",
+            json={"name": "Watched", "saved_search_id": search_id, "is_enabled": True},
+            headers=alice,
+        )
+        assert alert.status_code == 201
+
+        resp = client.request(
+            "DELETE", "/users/me", json={"password": "supersecret123"}, headers=alice
+        )
+        assert resp.status_code == 204, resp.text
+        assert client.get("/job-hunt/alerts", headers=alice).status_code == 401
+
+    def test_deleting_an_account_removes_a_job_saved_with_search_provenance(
+        self, client, alice, use_provider
+    ):
+        """saved_jobs gained a foreign key to job_saved_searches for tracker provenance, which
+        means saved_jobs now has to be deleted before saved searches. This is the test that
+        fails if that order is ever reversed."""
+        listing_id, _saved_id = seed_saved_job(client, alice, use_provider)
+        search_id = client.post(
+            "/job-hunt/saved-searches",
+            json={"name": "Source", "filters": {"keywords": "sde"}},
+            headers=alice,
+        ).json()["id"]
+        client.post(
+            "/job-hunt/saved",
+            json={
+                "listing_id": listing_id,
+                "source": "saved_search",
+                "source_saved_search_id": search_id,
+            },
+            headers=alice,
+        )
+
+        resp = client.request(
+            "DELETE", "/users/me", json={"password": "supersecret123"}, headers=alice
+        )
+        assert resp.status_code == 204, resp.text

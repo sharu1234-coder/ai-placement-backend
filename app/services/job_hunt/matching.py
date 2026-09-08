@@ -378,7 +378,10 @@ RANKING_LABELS = ("best_match", "strong_fit", "stretch_opportunity", "skill_buil
 # A match at or above this is a genuine fit rather than a partial one. Shared by best_match
 # and strong_fit so the top card can never be labelled "Best Match" on a score the second card
 # would not even be called a strong fit for.
-_STRONG_FIT_THRESHOLD = 0.6
+STRONG_FIT_THRESHOLD = 0.6
+# Private alias kept so the rest of this module reads unchanged; the public name exists
+# because service.py's "best matches" count has to use the same bar the labels use.
+_STRONG_FIT_THRESHOLD = STRONG_FIT_THRESHOLD
 # Below this, the honest framing is "something to build towards", not "a stretch".
 _STRETCH_FLOOR = 0.35
 

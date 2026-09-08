@@ -18,6 +18,7 @@ from app.models.interview import Interview
 from app.models.interview_answer import InterviewAnswer
 from app.models.interview_evaluation import InterviewEvaluation
 from app.models.interview_question import InterviewQuestion
+from app.models.job_alert import JobAlert, JobAlertDelivery
 from app.models.job_description import JobDescription
 from app.models.job_listing_match import JobListingMatch
 from app.models.job_match import JobMatch
@@ -119,13 +120,23 @@ def delete_account(db: Session, user: User, storage: StorageProvider) -> None:
         db.query(EvidenceStateSnapshot).filter(EvidenceStateSnapshot.profile_id == pid).delete(
             synchronize_session=False
         )
-        # Job Hunt's three profile-owned leaves. All reference job_listings, which is
-        # deliberately NOT deleted here: a listing is public provider content shared across
-        # every student who searched, so removing it would delete another user's saved job.
-        # Nothing personal lives on that table -- the personal part is exactly these rows.
+        # Job Hunt's profile-owned rows. All reference job_listings, which is deliberately NOT
+        # deleted here: a listing is public provider content shared across every student who
+        # searched, so removing it would delete another user's saved job. Nothing personal
+        # lives on that table -- the personal part is exactly these rows.
+        #
+        # Order inside this block is a real foreign-key order, not alphabetical:
+        #   job_alert_deliveries -> job_alerts       (deliveries reference the alert)
+        #   job_alerts           -> job_saved_searches (an alert may reference a search)
+        #   saved_jobs           -> job_saved_searches (provenance FK added in a890ff066a0a)
+        # so job_saved_searches has to be last of the four.
         db.query(JobListingMatch).filter(JobListingMatch.profile_id == pid).delete(
             synchronize_session=False
         )
+        db.query(JobAlertDelivery).filter(JobAlertDelivery.profile_id == pid).delete(
+            synchronize_session=False
+        )
+        db.query(JobAlert).filter(JobAlert.profile_id == pid).delete(synchronize_session=False)
         db.query(SavedJob).filter(SavedJob.profile_id == pid).delete(synchronize_session=False)
         db.query(JobSavedSearch).filter(JobSavedSearch.profile_id == pid).delete(
             synchronize_session=False

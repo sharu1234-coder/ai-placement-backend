@@ -26,7 +26,7 @@ from app.models.profile import StudentProfile
 from app.models.resume import Resume
 from app.models.resume_analysis import ResumeAnalysis
 from app.models.role import Role
-from app.models.saved_job import SAVED_JOB_STATUSES, SavedJob
+from app.models.saved_job import SAVED_JOB_SOURCES, SAVED_JOB_STATUSES, SavedJob
 from app.services import evidence_engine
 from app.services.job_hunt import dedupe, matching, normalization, provenance
 from app.services.job_hunt.providers.base import (
@@ -41,6 +41,25 @@ logger = logging.getLogger(__name__)
 # default is 25 hits/minute) is burned by one student.
 MAX_PAGE_SIZE = 50
 
+# How recently a listing must have been fetched to count as "new" on the home screen. A week,
+# because that is roughly how often a student in an active search comes back, and a shorter
+# window would show zero to anyone who took a weekend off.
+NEW_JOB_WINDOW_DAYS = 7
+
+# The bar for the "best matches" tile. Deliberately the same constant the ranking labels use,
+# imported rather than re-declared, so the tile count and the "Strong fit" badges on the cards
+# can never tell the student two different stories.
+STRONG_FIT_THRESHOLD = matching.STRONG_FIT_THRESHOLD
+
+# Statuses that mean an application actually went out. "saved" and "dismissed" are not
+# applications, and counting them would inflate the one number a student uses to judge their
+# own progress.
+APPLIED_OR_BEYOND = ("applied", "assessment", "interview", "offer", "rejected", "closed")
+
+# How search results may be ordered. "best_match" is the ranked order the engine produces;
+# "newest" and "salary" re-order the same result set without re-scoring it.
+SORT_OPTIONS = ("best_match", "newest", "salary")
+
 
 class JobHuntError(Exception):
     """Base for errors this module raises that the API maps to 4xx."""
@@ -52,6 +71,10 @@ class SearchProfileIncompleteError(JobHuntError):
 
 
 class ListingNotFoundError(JobHuntError):
+    pass
+
+
+class SavedSearchNotFoundError(JobHuntError):
     pass
 
 
@@ -285,6 +308,7 @@ def search(
     max_days_old: Optional[int] = None,
     page: int = 1,
     page_size: int = 20,
+    sort: str = "best_match",
     end_user_ip: Optional[str] = None,
     end_user_agent: Optional[str] = None,
 ) -> SearchOutcome:
@@ -361,9 +385,14 @@ def search(
         for listing in listings
     }
 
-    # Highest score first, then a company the student named, then the job whose required
-    # skills they can actually prove, then the job we could evaluate on the most evidence,
-    # then id.
+    # Ordering. "best_match" is the engine's own ranking: highest score first, then a company
+    # the student named, then the job whose required skills they can actually prove, then the
+    # job we could evaluate on the most evidence, then id.
+    #
+    # The alternatives re-order this same scored set rather than re-scoring it, so switching
+    # sort never changes a single match percentage -- the student sees the same jobs with the
+    # same numbers in a different order, which is the only behaviour that keeps a sort control
+    # trustworthy.
     #
     # That middle term is not cosmetic; it fixes a real mis-ranking. Because an unknown factor
     # is excluded from the weighted mean rather than scored as zero (see matching.py), a job
@@ -376,15 +405,38 @@ def search(
     # unknown factor, which is what the honest alternative would have required. listing.id
     # remains the final tie-break so identical requests keep a stable order instead of
     # reshuffling on every refresh.
-    listings.sort(
-        key=lambda item: (
-            -matches[item.id].total_score,
-            -int(preferred_company.get(item.id, False)),
-            -verified_counts[item.id],
-            -len(matches[item.id].component_scores or {}),
-            item.id,
+    if sort == "newest":
+        # posted_at first, falling back to fetched_at for the adverts that carry no posted
+        # date -- ordering those last rather than treating a missing date as very old, which
+        # would bury every listing from a provider that omits the field.
+        listings.sort(
+            key=lambda item: (
+                item.posted_at is None,
+                -(item.posted_at or item.fetched_at).timestamp(),
+                item.id,
+            )
         )
-    )
+    elif sort == "salary":
+        # Highest advertised floor first. A listing with no salary is not "zero salary" -- the
+        # employer simply did not say -- so those sort after every priced one rather than
+        # bottoming the list as if they paid nothing.
+        listings.sort(
+            key=lambda item: (
+                item.salary_min is None and item.salary_max is None,
+                -(item.salary_min or item.salary_max or 0),
+                item.id,
+            )
+        )
+    else:
+        listings.sort(
+            key=lambda item: (
+                -matches[item.id].total_score,
+                -int(preferred_company.get(item.id, False)),
+                -verified_counts[item.id],
+                -len(matches[item.id].component_scores or {}),
+                item.id,
+            )
+        )
 
     return SearchOutcome(
         listings=listings,
@@ -656,10 +708,24 @@ def is_stale(listing: JobListing, now: Optional[datetime.datetime] = None) -> bo
 
 
 def save_job(
-    db: Session, profile_id: int, listing_id: int, status: str = "saved"
+    db: Session,
+    profile_id: int,
+    listing_id: int,
+    status: str = "saved",
+    source: str = "manual",
+    source_saved_search_id: Optional[int] = None,
 ) -> SavedJob:
+    """Save, or move an already-saved job to a new status.
+
+    `source` is recorded once, on the row that did not exist before, and never rewritten. A
+    student who found a job through a saved search and later changes its status to "interview"
+    still found it through that saved search; overwriting the provenance on every update would
+    make the tracker rewrite its own history to say whatever happened most recently.
+    """
     if status not in SAVED_JOB_STATUSES:
         raise InvalidStatusError(f"Unknown status {status!r}")
+    if source not in SAVED_JOB_SOURCES:
+        raise InvalidStatusError(f"Unknown source {source!r}")
     if db.get(JobListing, listing_id) is None:
         raise ListingNotFoundError(f"Job listing {listing_id} not found")
 
@@ -683,6 +749,10 @@ def save_job(
         profile_id=profile_id,
         listing_id=listing_id,
         status=status,
+        source=source,
+        # Only meaningful for source == "saved_search"; stored as NULL otherwise so a stale id
+        # cannot make an unrelated row claim a search it never came from.
+        source_saved_search_id=source_saved_search_id if source == "saved_search" else None,
         applied_at=_utcnow() if status == "applied" else None,
     )
     db.add(saved)
@@ -854,3 +924,195 @@ def delete_saved_search(db: Session, profile_id: int, saved_search_id: int) -> N
 def _utcnow() -> datetime.datetime:
     """Naive UTC, matching every other DateTime column in this schema."""
     return datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+
+
+# -- Saved-search execution -----------------------------------------------------------------
+
+
+def get_saved_search(db: Session, profile_id: int, saved_search_id: int) -> JobSavedSearch:
+    search = (
+        db.query(JobSavedSearch)
+        .filter(
+            JobSavedSearch.id == saved_search_id,
+            JobSavedSearch.profile_id == profile_id,
+        )
+        .first()
+    )
+    # 404 rather than 403: telling someone that another student's saved search exists is
+    # itself a leak, however small.
+    if search is None:
+        raise SavedSearchNotFoundError(f"Saved search {saved_search_id} not found")
+    return search
+
+
+def run_saved_search(
+    db: Session,
+    profile: StudentProfile,
+    provider: JobProvider,
+    saved_search_id: int,
+    *,
+    end_user_ip: Optional[str] = None,
+    end_user_agent: Optional[str] = None,
+) -> tuple[JobSavedSearch, SearchOutcome]:
+    """Re-run a stored search and record what happened.
+
+    Run metadata is written on both paths, and differently. A completed provider call sets
+    last_run_at, last_success_at and last_result_count together. A failure sets last_run_at and
+    last_error_at and leaves last_result_count untouched, because overwriting a real previous
+    count with a zero on a failed run would tell the student their search stopped matching
+    anything when what actually happened is that we could not ask.
+    """
+    search = get_saved_search(db, profile.id, saved_search_id)
+    filters = dict(search.filters or {})
+    now = _utcnow()
+
+    try:
+        outcome = search_jobs_with_filters(
+            db,
+            profile,
+            provider,
+            filters,
+            end_user_ip=end_user_ip,
+            end_user_agent=end_user_agent,
+        )
+    except Exception:
+        search.last_run_at = now
+        search.last_error_at = now
+        db.commit()
+        raise
+
+    search.last_run_at = now
+    search.last_success_at = now
+    search.last_result_count = len(outcome.listings)
+    db.commit()
+    db.refresh(search)
+    return search, outcome
+
+
+def search_jobs_with_filters(
+    db: Session,
+    profile: StudentProfile,
+    provider: JobProvider,
+    filters: dict,
+    *,
+    end_user_ip: Optional[str] = None,
+    end_user_agent: Optional[str] = None,
+) -> SearchOutcome:
+    """`search` called with a stored filter dict.
+
+    Unknown keys are ignored rather than passed through: a saved search written by an older
+    version of the app must not be able to reach a parameter that did not exist when it was
+    saved, and a filter dict is stored data, which is to say untrusted input.
+    """
+    return search(
+        db,
+        profile,
+        provider,
+        keywords=filters.get("keywords"),
+        location=filters.get("location"),
+        work_mode=filters.get("work_mode"),
+        employment_type=filters.get("employment_type"),
+        experience_level=filters.get("experience_level"),
+        salary_min=filters.get("salary_min"),
+        max_days_old=filters.get("max_days_old"),
+        page=filters.get("page") or 1,
+        page_size=filters.get("page_size") or 20,
+        sort=filters.get("sort") or "best_match",
+        end_user_ip=end_user_ip,
+        end_user_agent=end_user_agent,
+    )
+
+
+# -- Home summary ---------------------------------------------------------------------------
+
+
+def home_summary(db: Session, profile_id: int, now: Optional[datetime.datetime] = None) -> dict:
+    """The three counts on the Job Hunt home screen.
+
+    Every one is a real count over rows this student owns, and every one is honest about what
+    it counts:
+
+      new_jobs      listings fetched for anyone in the last 7 days that this student has a
+                    computed match for. Not "jobs in the market" -- we have no idea how many
+                    of those there are, and a number implying we did would be fabricated.
+      best_matches  matches at or above the strong-fit threshold the ranking labels already
+                    use, so the tile and the card badges cannot disagree.
+      applied       saved jobs that have actually reached the applied stage or beyond.
+
+    Returns zeros only when the underlying counts genuinely are zero; a student who has never
+    searched gets zeros and the UI is expected to show the empty state rather than the tiles.
+    """
+    now = now or _utcnow()
+    fresh_cutoff = now - datetime.timedelta(days=NEW_JOB_WINDOW_DAYS)
+
+    new_jobs = (
+        db.query(JobListingMatch)
+        .join(JobListing, JobListing.id == JobListingMatch.listing_id)
+        .filter(JobListingMatch.profile_id == profile_id)
+        .filter(JobListing.fetched_at >= fresh_cutoff)
+        .count()
+    )
+    best_matches = (
+        db.query(JobListingMatch)
+        .filter(JobListingMatch.profile_id == profile_id)
+        .filter(JobListingMatch.total_score >= STRONG_FIT_THRESHOLD)
+        .count()
+    )
+    applied = (
+        db.query(SavedJob)
+        .filter(SavedJob.profile_id == profile_id)
+        .filter(SavedJob.status.in_(APPLIED_OR_BEYOND))
+        .count()
+    )
+    saved = (
+        db.query(SavedJob)
+        .filter(SavedJob.profile_id == profile_id)
+        .filter(SavedJob.status == "saved")
+        .count()
+    )
+    return {
+        "new_jobs": new_jobs,
+        "best_matches": best_matches,
+        "applied": applied,
+        "saved": saved,
+    }
+
+
+def top_matches(
+    db: Session, profile_id: int, limit: int = 5
+) -> tuple[list[JobListing], dict[int, JobListingMatch]]:
+    """The student's best already-scored jobs, for the home screen.
+
+    Reads stored matches rather than searching, so opening the app costs no provider quota.
+    Dismissed jobs are excluded -- recommending back a job the student explicitly hid is the
+    fastest way to make a recommendation feel like it is not listening.
+
+    Stale-versioned matches are excluded rather than recomputed: this is a summary, and
+    silently rescoring a page of jobs on every app open would turn a cheap read into the most
+    expensive call in the product. They reappear the moment the student searches or opens one.
+    """
+    dismissed = {
+        row.listing_id
+        for row in db.query(SavedJob.listing_id)
+        .filter(SavedJob.profile_id == profile_id, SavedJob.status == "dismissed")
+        .all()
+    }
+    rows = (
+        db.query(JobListingMatch, JobListing)
+        .join(JobListing, JobListing.id == JobListingMatch.listing_id)
+        .filter(JobListingMatch.profile_id == profile_id)
+        .filter(JobListingMatch.score_version == matching.SCORE_VERSION)
+        .order_by(JobListingMatch.total_score.desc(), JobListing.id)
+        .limit(max(1, limit) + len(dismissed))
+        .all()
+    )
+    listings: list[JobListing] = []
+    matches: dict[int, JobListingMatch] = {}
+    for match, listing in rows:
+        if listing.id in dismissed:
+            continue
+        listings.append(listing)
+        matches[listing.id] = match
+        if len(listings) >= limit:
+            break
+    return listings, matches

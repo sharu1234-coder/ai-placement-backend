@@ -11,6 +11,12 @@ from app.database.base import Base
 # drift. "dismissed" is deliberately part of the same state machine rather than a separate
 # boolean: a student who dismisses a job and later saves it is one row changing status, which
 # keeps the unique constraint below meaningful.
+# Where a tracked job came from. Provenance is recorded at save time and never recomputed:
+# working it out later from what a job looks like now would give a different answer once the
+# student's profile or the saved search changed, and the tracker would quietly rewrite its own
+# history. "manual" is the honest default for a row saved before this column existed.
+SAVED_JOB_SOURCES = ("recommended", "saved_search", "job_alert", "manual")
+
 SAVED_JOB_STATUSES = (
     "saved",
     "applied",
@@ -42,6 +48,17 @@ class SavedJob(Base):
     listing_id: Mapped[int] = mapped_column(ForeignKey("job_listings.id"), nullable=False, index=True)
 
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="saved")
+
+    # How this job reached the student. See SAVED_JOB_SOURCES.
+    source: Mapped[str] = mapped_column(String(20), nullable=False, default="manual")
+    # Which saved search, when source == "saved_search". Lets the tracker name it ("Saved
+    # Search: Dubai Data Analyst") rather than showing an unhelpfully generic label. Nullable
+    # for every other source, and left dangling rather than cascading if the search is later
+    # deleted -- the fact that this job came from a search the student has since removed is
+    # still true, and rewriting it to "manual" would falsify their own history.
+    source_saved_search_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("job_saved_searches.id"), nullable=True, index=True
+    )
     notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     follow_up_date: Mapped[Optional[datetime.date]] = mapped_column(Date, nullable=True)
 

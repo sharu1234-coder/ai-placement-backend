@@ -115,3 +115,33 @@ def verified_count(provenance: List[SkillProvenance]) -> int:
     proof strength into it would let a well-evidenced poor fit outrank a genuine one.
     """
     return sum(1 for item in provenance if item.status == VERIFIED_EVIDENCE)
+
+
+# -- Display strength -----------------------------------------------------------------------
+# The badge beside each skill on the Skill Match Analysis screen. Derived from the bucket
+# rather than computed separately, so the badge and the group heading can never disagree --
+# a skill filed under "verified evidence" cannot also be badged "skill gap".
+#
+# Kept as its own vocabulary rather than reusing the bucket names because the two say different
+# things to a student: the bucket answers "where does this come from", the badge answers "how
+# does this look to a recruiter". A resume-only skill is a real, credible match on a CV screen
+# even though it is only a claim to us, which is why it reads "Match" and not "Weak".
+STRONG_MATCH = "strong_match"
+MATCH = "match"
+SKILL_GAP = "skill_gap"
+UNCLEAR_STRENGTH = "unclear"
+
+MATCH_STRENGTHS = (STRONG_MATCH, MATCH, SKILL_GAP, UNCLEAR_STRENGTH)
+
+_STRENGTH_BY_STATUS = {
+    VERIFIED_EVIDENCE: STRONG_MATCH,
+    ON_RESUME: MATCH,
+    MISSING: SKILL_GAP,
+    UNCLEAR: UNCLEAR_STRENGTH,
+}
+
+
+def match_strength(item: SkillProvenance) -> str:
+    """The badge for one skill. Total over the four buckets, so a new bucket cannot silently
+    fall through to a default that flatters the student."""
+    return _STRENGTH_BY_STATUS[item.status]

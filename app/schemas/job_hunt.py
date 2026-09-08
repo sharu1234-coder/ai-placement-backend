@@ -181,6 +181,9 @@ class JobSearchRequest(BaseModel):
     # Capped server-side too (job_hunt/service.MAX_PAGE_SIZE); the bound here gives the client
     # a clear 422 instead of a silently truncated page.
     page_size: int = Field(default=20, ge=1, le=50)
+    # Re-orders the same scored result set; never re-scores it, so switching sort cannot change
+    # a single match percentage.
+    sort: Literal["best_match", "newest", "salary"] = "best_match"
 
 
 class JobSearchResponse(BaseModel):
@@ -206,6 +209,11 @@ class JobSearchResponse(BaseModel):
 class SaveJobRequest(BaseModel):
     listing_id: int
     status: SavedJobStatus = "saved"
+    # Where the student was when they saved it. Client-supplied because only the client knows
+    # which screen the tap came from -- and harmless if wrong, since it is a display label,
+    # never an entitlement or an ownership claim. Recorded once and never rewritten.
+    source: Literal["recommended", "saved_search", "job_alert", "manual"] = "manual"
+    source_saved_search_id: Optional[int] = None
 
 
 class UpdateSavedJobRequest(BaseModel):
@@ -217,6 +225,13 @@ class UpdateSavedJobRequest(BaseModel):
 class SavedJobRead(BaseModel):
     id: int
     status: SavedJobStatus
+    # How this job reached the student, recorded at save time and never recomputed.
+    source: Literal["recommended", "saved_search", "job_alert", "manual"] = "manual"
+    source_saved_search_id: Optional[int] = None
+    # Resolved name of that saved search, so the tracker can say "Saved Search: Dubai Data
+    # Analyst" instead of an id. Null when the search has since been deleted -- the row keeps
+    # its provenance, and the client falls back to the generic label.
+    source_saved_search_name: Optional[str] = None
     notes: Optional[str] = None
     follow_up_date: Optional[datetime.date] = None
     applied_at: Optional[datetime.datetime] = None
@@ -246,8 +261,175 @@ class SavedSearchRead(BaseModel):
     # were themselves validated as a JobSearchRequest on the way in, so this round-trips.
     filters: JobSearchRequest = JobSearchRequest()
     notify_enabled: bool = False
+    # Null means never run -- never zero, which would read as "we searched and found nothing".
+    # last_error_at is separate so the client can distinguish a search that has gone quiet
+    # because the market is quiet from one that has gone quiet because we could not ask.
     last_run_at: Optional[datetime.datetime] = None
+    last_success_at: Optional[datetime.datetime] = None
+    last_error_at: Optional[datetime.datetime] = None
     last_result_count: Optional[int] = None
+    # True when this search has an alert attached, so the list can show it without a second
+    # round trip.
+    has_alert: bool = False
     created_at: datetime.datetime
 
     model_config = {"from_attributes": True}
+
+
+# -- Skill match analysis -------------------------------------------------------------------
+
+
+class SkillMatchRowRead(BaseModel):
+    """One row of the Skill Match Analysis screen.
+
+    `status` is the provenance bucket (where the claim comes from) and `strength` is the badge
+    (how it reads to a recruiter). Both are sent because they answer different questions and
+    the client must not derive one from the other -- deriving would put the rule in two places
+    and let them drift.
+    """
+
+    skill: str
+    status: Literal["verified_evidence", "on_resume", "missing", "unclear"]
+    strength: Literal["strong_match", "match", "skill_gap", "unclear"]
+    evidence_state: Optional[
+        Literal["claimed", "supported", "strong", "verified", "stale"]
+    ] = None
+    detail: Optional[str] = None
+
+
+class SkillMatchAnalysisRead(BaseModel):
+    total_score: float
+    score_version: str
+    rows: List[SkillMatchRowRead] = []
+    verified_skill_count: int = 0
+    # The single most improvable skill, or null when there is nothing actionable. Never
+    # invented to fill the section.
+    biggest_gap_skill: Optional[str] = None
+
+
+# -- Application readiness ------------------------------------------------------------------
+
+
+class ReadinessDimensionRead(BaseModel):
+    key: Literal["skills", "experience", "resume", "education", "interview"]
+    label: str
+    # Null when this dimension could not be judged. Never 0.0 standing in for "unknown" --
+    # the client renders null as "not enough information", not as an empty bar.
+    score: Optional[float] = None
+    detail: str
+
+
+class ReadinessGapRead(BaseModel):
+    kind: Literal["skill", "evidence", "dimension"]
+    skill: Optional[str] = None
+    title: str
+    detail: str
+    # Where "fix this" should send the student. The client maps these to its own routes.
+    action: Literal["roadmap", "skill_passport", "resume", "interview", "education"]
+
+
+class ApplicationReadinessRead(BaseModel):
+    listing_id: int
+    # Null when nothing at all could be judged.
+    overall: Optional[float] = None
+    band: Optional[
+        Literal["strong_candidate", "worth_applying", "stretch", "prepare_first"]
+    ] = None
+    dimensions: List[ReadinessDimensionRead] = []
+    # Named so the UI can say what it could not check, rather than silently showing four bars
+    # where a student expects five.
+    unknown_dimensions: List[str] = []
+    biggest_gap: Optional[ReadinessGapRead] = None
+    tips: List[str] = []
+
+
+# -- Home summary ---------------------------------------------------------------------------
+
+
+class JobHuntHomeRead(BaseModel):
+    """Counts over this student's own rows. Never a claim about the job market as a whole."""
+
+    new_jobs: int = 0
+    best_matches: int = 0
+    applied: int = 0
+    saved: int = 0
+    target_role_title: Optional[str] = None
+    is_ready_to_search: bool = False
+    # Top-ranked jobs already scored for this student, from what we last fetched. Empty before
+    # the first search, which the client shows as an empty state rather than as "no jobs".
+    recommended: List[JobResultRead] = []
+
+
+# -- Job alerts -----------------------------------------------------------------------------
+
+
+class JobAlertCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    saved_search_id: Optional[int] = None
+    filters: Optional[JobSearchRequest] = None
+    frequency: Literal["daily", "weekly"] = "daily"
+    # 0 = Monday. Required for a weekly alert; the service rejects the combination rather than
+    # silently picking a day the student never chose.
+    day_of_week: Optional[int] = Field(default=None, ge=0, le=6)
+    hour_local: int = Field(default=9, ge=0, le=23)
+    quiet_hours_start: Optional[int] = Field(default=None, ge=0, le=23)
+    quiet_hours_end: Optional[int] = Field(default=None, ge=0, le=23)
+    # Consent. Defaults to off: creating an alert and switching it on are two separate acts.
+    is_enabled: bool = False
+
+
+class JobAlertUpdate(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=1, max_length=120)
+    frequency: Optional[Literal["daily", "weekly"]] = None
+    day_of_week: Optional[int] = Field(default=None, ge=0, le=6)
+    hour_local: Optional[int] = Field(default=None, ge=0, le=23)
+    quiet_hours_start: Optional[int] = Field(default=None, ge=0, le=23)
+    quiet_hours_end: Optional[int] = Field(default=None, ge=0, le=23)
+    is_enabled: Optional[bool] = None
+    # Explicit, because None on the two fields above means "unchanged" and there would
+    # otherwise be no way to remove a quiet window once set.
+    clear_quiet_hours: bool = False
+
+
+class JobAlertRead(BaseModel):
+    id: int
+    name: str
+    saved_search_id: Optional[int] = None
+    saved_search_name: Optional[str] = None
+    filters: JobSearchRequest = JobSearchRequest()
+    frequency: Literal["daily", "weekly"]
+    day_of_week: Optional[int] = None
+    hour_local: int
+    quiet_hours_start: Optional[int] = None
+    quiet_hours_end: Optional[int] = None
+    is_enabled: bool
+    # Three timestamps, not one: "never run", "ran and found nothing" and "ran and failed" are
+    # three different things and the client says which.
+    last_run_at: Optional[datetime.datetime] = None
+    last_success_at: Optional[datetime.datetime] = None
+    last_error_at: Optional[datetime.datetime] = None
+    last_run_status: Optional[
+        Literal["success", "no_new_jobs", "provider_error", "not_configured", "skipped_quiet_hours"]
+    ] = None
+    # Null means never run. Never zero, which would read as "we looked and found nothing".
+    last_new_job_count: Optional[int] = None
+    created_at: datetime.datetime
+
+    model_config = {"from_attributes": True}
+
+
+class JobAlertHistoryRead(BaseModel):
+    id: int
+    alert_id: int
+    alert_name: Optional[str] = None
+    listing: JobListingRead
+    notified_at: datetime.datetime
+
+
+class JobAlertQuotaRead(BaseModel):
+    """What the student's plan allows, so the client can explain a refusal rather than just
+    disabling a button."""
+
+    used: int
+    limit: int
+    is_premium: bool

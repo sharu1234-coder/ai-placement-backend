@@ -26,6 +26,7 @@ from app.models.interview_answer import InterviewAnswer  # noqa: F401
 from app.models.interview_evaluation import InterviewEvaluation  # noqa: F401
 from app.models.interview_question import InterviewQuestion  # noqa: F401
 from app.models.job_description import JobDescription  # noqa: F401
+from app.models.job_alert import JobAlert, JobAlertDelivery  # noqa: F401
 from app.models.job_listing import JobListing  # noqa: F401
 from app.models.job_listing_match import JobListingMatch  # noqa: F401
 from app.models.job_match import JobMatch  # noqa: F401
