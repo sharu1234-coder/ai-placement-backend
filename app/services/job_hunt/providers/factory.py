@@ -13,6 +13,7 @@ from app.core.config import settings
 from app.services.job_hunt.providers.adzuna import AdzunaJobProvider
 from app.services.job_hunt.providers.base import JobProvider
 from app.services.job_hunt.providers.careerjet import CareerjetJobProvider
+from app.services.job_hunt.providers.jobvetta import JobvettaJobProvider
 from app.services.job_hunt.providers.null import NullJobProvider
 
 
@@ -36,6 +37,12 @@ def build_job_provider() -> JobProvider:
             affid=settings.careerjet_affid,
             locale_code=settings.careerjet_locale_code,
         )
+    if provider_name == "jobvetta":
+        # Constructed even with no key configured. The adapter raises
+        # JobProviderNotConfiguredError on first use, which is the same fail-loudly-on-use
+        # shape Careerjet and Adzuna already have -- and it keeps a missing key from taking
+        # the whole API down at import time, when every other feature is unaffected by it.
+        return JobvettaJobProvider(api_key=settings.jobvetta_api_key)
     return NullJobProvider()
 
 

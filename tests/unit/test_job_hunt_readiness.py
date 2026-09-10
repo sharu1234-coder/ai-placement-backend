@@ -6,7 +6,22 @@ something they have simply not attempted yet, which is both false and discouragi
 the place a student is most likely to give up.
 """
 
+import datetime
+import uuid
+
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+import app.main  # noqa: F401  -- imports every model so create_all sees the full schema
+from app.database.base import Base
+from app.models.interview import Interview
+from app.models.interview_evaluation import InterviewEvaluation
 from app.models.job_listing import JobListing
+from app.models.profile import StudentProfile
+from app.models.resume import Resume
+from app.models.resume_ats_check import ResumeAtsCheck
+from app.models.user import User
 from app.services.job_hunt import provenance, readiness
 
 
@@ -179,3 +194,156 @@ class TestTips:
         # skip a section that always says the same thing.
         tips = readiness._tips(listing(company=None), [prov("python", provenance.VERIFIED_EVIDENCE)])
         assert tips == []
+
+
+@pytest.fixture()
+def db(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'readiness.db'}")
+    Base.metadata.create_all(bind=engine)
+    session = sessionmaker(autocommit=False, autoflush=False, bind=engine)()
+    try:
+        yield session
+    finally:
+        session.close()
+        engine.dispose()
+
+
+def make_profile(db) -> StudentProfile:
+    user = User(email=f"{uuid.uuid4().hex}@example.com", password_hash="x")
+    db.add(user)
+    db.commit()
+    profile = StudentProfile(user_id=user.id)
+    db.add(profile)
+    db.commit()
+    return profile
+
+
+def make_ats_check(db, profile_id: int, score: int) -> None:
+    """An ATS check needs a resume behind it -- resume_ats_checks.resume_id is NOT NULL."""
+    resume = Resume(
+        profile_id=profile_id,
+        file_path="cv.pdf",
+        original_filename="cv.pdf",
+        raw_text="Python SQL",
+    )
+    db.add(resume)
+    db.commit()
+    # Only overall_score is read by the dimension; the rest are NOT NULL columns the ATS
+    # module fills in and this test has no opinion about.
+    db.add(
+        ResumeAtsCheck(
+            profile_id=profile_id,
+            resume_id=resume.id,
+            overall_score=score,
+            score_category="good",
+            parsing_score=score,
+            structure_score=score,
+            content_score=score,
+            skills_score=score,
+            experience_score=score,
+            projects_score=score,
+            contact_score=score,
+            readability_score=score,
+            category_breakdown=[],
+            section_analysis=[],
+            issues=[],
+            recommendations=[],
+            ai_summary="Reads well.",
+        )
+    )
+    db.commit()
+
+
+# The scored dimensions are NOT NULL on interview_evaluations. Their values are irrelevant
+# here -- only overall_score is read -- so one fixed set stands in for all of them.
+EVALUATION_DIMENSIONS = dict(
+    technical_correctness=0.8,
+    relevance=0.8,
+    completeness=0.8,
+    reasoning=0.8,
+    structure=0.8,
+    clarity=0.8,
+    role_jd_coverage=0.8,
+    feedback_text="Solid answers throughout.",
+)
+
+
+def make_interview(db, profile_id: int) -> "Interview":
+    interview = Interview(profile_id=profile_id, type="technical", mode="text", status="completed")
+    db.add(interview)
+    db.commit()
+    return interview
+
+
+class TestTheTwoBorrowedScoresAreReadInTheirOwnUnits:
+    """Both dimensions reuse a score another feature already owns, and the two features store
+    them on different scales. Reading either in the other's unit is silent and catastrophic:
+    the number still renders, still sits between 0 and 100, and is simply wrong by 100x in one
+    direction or the other. That has happened once already -- the interview score was divided
+    by 100, which reported every student as under 1% ready for an interview they had actually
+    done well in. These pin both scales so the next edit has to notice."""
+
+    def test_the_ats_score_is_a_percentage_and_is_divided_down(self, db):
+        # ResumeAtsCheck.overall_score is an Integer 0-100 (see ats_scoring/engine.clamp_score).
+        profile = make_profile(db)
+        make_ats_check(db, profile.id, 82)
+
+        dimension = readiness._resume_dimension(db, profile.id)
+
+        assert dimension.score == pytest.approx(0.82)
+        assert "82" in dimension.detail
+
+    def test_the_interview_score_is_already_a_unit_score_and_is_used_as_is(self, db):
+        # InterviewEvaluation.overall_score is a Float clamped to 0.0-1.0 by
+        # interview_service._clamped before it is ever persisted.
+        profile = make_profile(db)
+        interview = make_interview(db, profile.id)
+        db.add(
+            InterviewEvaluation(
+                interview_id=interview.id,
+                **EVALUATION_DIMENSIONS,
+                overall_score=0.82,
+                created_at=datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None),
+            )
+        )
+        db.commit()
+
+        dimension = readiness._interview_dimension(db, profile.id)
+
+        assert dimension.score == pytest.approx(0.82), "dividing by 100 here reports 0.8%"
+
+    def test_an_interview_older_than_the_recency_window_does_not_count(self, db):
+        """A strong showing six months ago is not what a student walks in with tomorrow, and
+        the dimension says "not checked yet" rather than borrowing the old number."""
+        profile = make_profile(db)
+        interview = make_interview(db, profile.id)
+        stale = datetime.datetime.now(datetime.timezone.utc).replace(
+            tzinfo=None
+        ) - datetime.timedelta(days=readiness._INTERVIEW_RECENCY_DAYS + 1)
+        db.add(
+            InterviewEvaluation(
+                interview_id=interview.id,
+                **EVALUATION_DIMENSIONS, overall_score=0.95, created_at=stale
+            )
+        )
+        db.commit()
+
+        assert readiness._interview_dimension(db, profile.id).score is None
+
+    def test_another_students_scores_are_never_borrowed(self, db):
+        mine = make_profile(db)
+        theirs = make_profile(db)
+        make_ats_check(db, theirs.id, 95)
+        interview = make_interview(db, theirs.id)
+        db.add(
+            InterviewEvaluation(
+                interview_id=interview.id,
+                **EVALUATION_DIMENSIONS,
+                overall_score=0.95,
+                created_at=datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None),
+            )
+        )
+        db.commit()
+
+        assert readiness._resume_dimension(db, mine.id).score is None
+        assert readiness._interview_dimension(db, mine.id).score is None

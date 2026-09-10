@@ -14,6 +14,13 @@ inserting is a race that loses the moment two runs overlap -- which is exactly w
 one run is slow and the scheduler starts the next. So we attempt the insert and treat the
 IntegrityError as "already told them".
 
+*Background runs are for subscribers.* Not because notifications are a premium feature -- the
+free tier still gets an alert it can create, see and understand -- but because a scheduled
+search that runs by itself is a way to have unlimited Job Hunt on a plan that grants one search.
+The check is in run_alert rather than in create_alert deliberately: the entitlement is read at
+the moment work would happen, so a subscription that starts or lapses takes effect on the very
+next run instead of being grandfathered in by whenever the alert was set up.
+
 *A failed run is recorded as a failure, not as silence.* If the provider is down we write
 last_error_at and a status, and the student is shown "we couldn't check" rather than being left
 to conclude there are no jobs. An alert that goes quiet because of an outage looks identical to
@@ -320,6 +327,23 @@ def run_alert(
     now = now or _utcnow()
     alert.last_run_at = now
 
+    if not is_premium(db, alert.profile_id):
+        # An alert is a standing search that runs on its own. For a student whose plan is one
+        # search in total, that would not be a notification feature -- it would be an unlimited
+        # Job Hunt with a schedule attached, reached by saving a search and enabling an alert
+        # on it. So background runs require an active subscription.
+        #
+        # Recorded as a status rather than silently skipped, for the same reason a provider
+        # outage is: an alert that simply goes quiet is indistinguishable from an empty job
+        # market, and the student would draw the wrong conclusion from our silence.
+        #
+        # Note what this does NOT do: it does not consume the free search, and it does not
+        # delete or disable the alert. A free student may still create one (FREE_MAX_ALERTS)
+        # and see exactly what it would do; it starts running the moment they subscribe.
+        alert.last_run_status = "requires_premium"
+        db.commit()
+        return "requires_premium", 0
+
     if in_quiet_hours(alert, now.hour):
         # Deliberately not "run it and hold the notification": running would consume provider
         # quota and mark the jobs as already-seen, so the student would never hear about them.
@@ -357,15 +381,26 @@ def run_alert(
 
     new_listings = []
     for listing in outcome.listings:
-        delivery = JobAlertDelivery(
-            alert_id=alert.id, profile_id=alert.profile_id, listing_id=listing.id
-        )
-        db.add(delivery)
+        # SAVEPOINT, not a plain rollback -- and here it is the whole feature working or not.
+        #
+        # Duplicate suppression relies on this loop recording a delivery row per new advert.
+        # A bare `db.rollback()` on the first duplicate would discard every delivery already
+        # flushed in this run, so those adverts would be announced again on the next run --
+        # the exact "same job every morning for a week" failure job_alert_deliveries exists to
+        # prevent, reintroduced by the recovery path of the mechanism meant to prevent it.
+        # `begin_nested` undoes only the duplicate INSERT.
         try:
-            db.flush()
+            with db.begin_nested():
+                db.add(
+                    JobAlertDelivery(
+                        alert_id=alert.id,
+                        profile_id=alert.profile_id,
+                        listing_id=listing.id,
+                    )
+                )
+                db.flush()
         except IntegrityError:
             # Already announced. The constraint is the check -- see the module docstring.
-            db.rollback()
             continue
         new_listings.append(listing)
 
@@ -401,7 +436,18 @@ def _filters_for(db: Session, alert: JobAlert) -> dict:
     way to see which set the alert was actually using.
     """
     if alert.saved_search_id is not None:
-        search = db.get(JobSavedSearch, alert.saved_search_id)
+        # Scoped to the alert's own profile, not fetched by primary key. create_alert refuses
+        # a saved search the student does not own, so this cannot currently reach a foreign
+        # row -- but an alert running with someone else's filters is a bad enough outcome that
+        # the check belongs here too, rather than resting on a validation in another function.
+        search = (
+            db.query(JobSavedSearch)
+            .filter(
+                JobSavedSearch.id == alert.saved_search_id,
+                JobSavedSearch.profile_id == alert.profile_id,
+            )
+            .first()
+        )
         if search is not None:
             return dict(search.filters or {})
     return dict(alert.filters or {})

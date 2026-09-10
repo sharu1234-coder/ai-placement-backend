@@ -129,6 +129,17 @@ class JobProvider(ABC):
     #: per provider because retention is a terms question, not a performance one.
     cache_ttl: datetime.timedelta = datetime.timedelta(hours=6)
 
+    #: Outbound calls this provider's key may make per UTC day, when the provider documents
+    #: such a ceiling. None means "no documented per-day limit", which is not the same as
+    #: "unlimited" -- it means we have no number to enforce, so nothing is metered rather than
+    #: a limit being invented. Jobvetta publishes 50/key/day; Adzuna and Careerjet publish
+    #: per-minute rates instead, which the deployment's own rate limiting already bounds.
+    #:
+    #: Enforced by app/services/job_hunt/provider_budget.py, in the service layer rather than
+    #: here, because the count has to be shared across workers and so has to live in the
+    #: database -- and an adapter that took a Session would stop being a pure HTTP client.
+    daily_call_budget: Optional[int] = None
+
     @abstractmethod
     def search(self, query: ProviderSearchQuery) -> ProviderSearchResult:
         """Return real adverts, or raise a JobProviderError subclass.

@@ -18,7 +18,7 @@ answer 404, never 403, so an id cannot be confirmed by probing.
 import logging
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_db
@@ -33,7 +33,9 @@ from app.schemas.job_hunt import (
     JobAlertQuotaRead,
     JobAlertRead,
     JobAlertUpdate,
+    JobHuntEntitlementRead,
     JobHuntHomeRead,
+    JobHuntLimitDetail,
     JobListingRead,
     JobMatchRead,
     JobResultRead,
@@ -45,6 +47,7 @@ from app.schemas.job_hunt import (
     ReadinessGapRead,
     RoleSuggestionsRead,
     SavedJobRead,
+    SavedJobStatus,
     SavedSearchCreate,
     SavedSearchRead,
     SaveJobRequest,
@@ -54,7 +57,7 @@ from app.schemas.job_hunt import (
     UpdateSavedJobRequest,
 )
 from app.services.job_hunt import alerts as job_alerts
-from app.services.job_hunt import matching, readiness, service
+from app.services.job_hunt import entitlement, matching, readiness, service
 from app.services.job_hunt import provenance as job_provenance
 from app.services.job_hunt.providers.base import (
     JobProvider,
@@ -77,6 +80,80 @@ router = APIRouter(prefix="/job-hunt", tags=["job-hunt"])
 # work mode stay free, so the free tier remains genuinely useful rather than a teaser. Any
 # broader paywall is a business decision that has not been made and is not inferred here.
 _PREMIUM_FILTER_FIELDS = ("salary_min", "employment_type", "experience_level", "max_days_old")
+
+
+def _refuse_premium_filters(db: Session, profile_id: int, values: dict) -> None:
+    """Raise 403 if `values` uses an advanced filter this student is not entitled to.
+
+    Applied at every point a filter set can reach the provider, not just POST /search.
+    Saved searches store a filter set and replay it, so checking only the direct search path
+    left the paywall bypassable in two ordinary requests: store the filters once, then run the
+    saved search as often as you like.
+
+    Checked against the plan at the moment of use rather than at the moment of storing, so a
+    subscription that lapses stops working immediately instead of grandfathering premium
+    filtering in forever.
+    """
+    requested = [
+        field
+        for field in _PREMIUM_FILTER_FIELDS
+        if values.get(field) is not None
+    ]
+    if requested and not is_premium(db, profile_id):
+        # Refused rather than silently ignored: quietly dropping a filter would show the
+        # student unfiltered results while their UI claimed the filter was applied.
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Advanced filters are a Premium feature. Search is free without them.",
+        )
+
+
+def _claim_job_hunt_use(
+    db: Session,
+    profile_id: int,
+    *,
+    usage_type: str,
+    idempotency_key: Optional[str],
+    params: dict,
+):
+    """Reserve this student's right to run one Job Hunt operation, or refuse in HTTP terms.
+
+    Three refusals, three status codes, because the client has to do three different things.
+
+    402 Payment Required is the free-limit refusal. Not 403: this endpoint already answers 403
+    for "you used a Premium-only filter", and a client that had to tell those apart by reading
+    the message text would be one copy edit away from opening the wrong screen. 402 is
+    unambiguous, and it carries a structured body (see JobHuntLimitDetail) so the upgrade
+    prompt is driven by a stable `code` rather than by prose.
+
+    409 Conflict is an idempotency key that names a different operation -- a different search
+    under a key already spent, or a key replayed long after its operation finished. Both are
+    "this is not the request you say it is", and neither is a reason to quietly charge the
+    student for a search they did not ask for.
+
+    400 is a malformed key. The client sends a UUID; anything else is a bug on its side, and
+    inventing a substitute would mean silently not deduplicating a request that expected to be.
+    """
+    try:
+        key = entitlement.normalise_key(idempotency_key)
+    except entitlement.InvalidIdempotencyKeyError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+
+    try:
+        return entitlement.claim(
+            db,
+            profile_id,
+            usage_type=usage_type,
+            idempotency_key=key,
+            request_fingerprint=entitlement.fingerprint(usage_type, params),
+        )
+    except entitlement.FreeLimitReachedError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail=JobHuntLimitDetail(message=str(exc)).model_dump(),
+        )
+    except entitlement.IdempotencyConflictError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
 
 
 def _provider_failure(exc: Exception, context: str) -> HTTPException:
@@ -230,22 +307,34 @@ def search_jobs(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
     provider: JobProvider = Depends(get_job_provider),
+    # Optional. When Android sends one, a retry of the same tap -- after a dropped connection,
+    # a recreated activity, a killed process -- is recognised as the same operation and does
+    # not cost a second search. It can never do the opposite: see entitlement.normalise_key.
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
 ) -> JobSearchResponse:
     profile = get_or_create_profile(db, current_user)
 
-    requested_premium_filters = [
-        field for field in _PREMIUM_FILTER_FIELDS if getattr(payload, field) is not None
-    ]
-    if requested_premium_filters and not is_premium(db, profile.id):
-        # Refused rather than silently ignored: quietly dropping a filter would show the
-        # student unfiltered results while their UI claimed the filter was applied.
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Advanced filters are a Premium feature. Search is free without them.",
-        )
+    # Before the claim, deliberately. A search refused for using a Premium-only filter never
+    # happened, and charging a free student their one search for a request the server declined
+    # to run would be indefensible.
+    _refuse_premium_filters(db, profile.id, payload.model_dump())
+
+    usage = _claim_job_hunt_use(
+        db,
+        profile.id,
+        usage_type="search",
+        idempotency_key=idempotency_key,
+        params=payload.model_dump(mode="json"),
+    )
 
     end_user_ip, end_user_agent = _end_user_identity(request)
 
+    # Everything from here to the settle() is inside the claim. Whatever happens -- a provider
+    # outage, an incomplete profile, an unexpected failure while assembling the response -- the
+    # allowance goes back unless a real result was produced. The one exception is a claim that
+    # had already succeeded on an earlier attempt with this key: release() only ever moves a
+    # row out of "claimed", so a replayed request that fails cannot refund a search that
+    # genuinely worked.
     try:
         outcome = service.search(
             db,
@@ -264,44 +353,71 @@ def search_jobs(
             end_user_ip=end_user_ip,
             end_user_agent=end_user_agent,
         )
-    except service.SearchProfileIncompleteError as exc:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
-    except Exception as exc:
-        raise _provider_failure(exc, "search")
 
-    saved_rows = {
-        saved.listing_id: saved
-        for saved, _listing in service.list_saved_jobs(db, profile.id, limit=500)
-    }
-
-    search_profile = service.get_or_create_search_profile(db, profile.id)
-    results = []
-    for rank, listing in enumerate(outcome.listings):
-        match = outcome.matches[listing.id]
-        saved = saved_rows.get(listing.id)
-        results.append(
-            JobResultRead(
-                listing=_to_listing_read(listing),
-                match=_to_match_read(
-                    match, listing, search_profile, outcome.evidence_states, rank=rank
-                ),
-                saved_job_id=saved.id if saved else None,
-                saved_status=saved.status if saved else None,
-            )
+        saved_rows = service.saved_jobs_for_listings(
+            db, profile.id, [listing.id for listing in outcome.listings]
         )
 
-    return JobSearchResponse(
-        results=results,
-        total_available=outcome.total_available,
-        page=payload.page,
-        page_size=payload.page_size,
-        provider=outcome.provider_name,
-        attribution_text=outcome.attribution_text,
-        attribution_url=outcome.attribution_url,
-        fetched_at=outcome.fetched_at,
-        duplicates_removed=outcome.duplicates_removed,
-        score_version=matching.SCORE_VERSION,
-    )
+        search_profile = service.get_or_create_search_profile(db, profile.id)
+        results = []
+        for rank, listing in enumerate(outcome.listings):
+            match = outcome.matches[listing.id]
+            saved = saved_rows.get(listing.id)
+            results.append(
+                JobResultRead(
+                    listing=_to_listing_read(listing),
+                    match=_to_match_read(
+                        match, listing, search_profile, outcome.evidence_states, rank=rank
+                    ),
+                    saved_job_id=saved.id if saved else None,
+                    saved_status=saved.status if saved else None,
+                )
+            )
+
+        response = JobSearchResponse(
+            results=results,
+            total_available=outcome.total_available,
+            page=payload.page,
+            page_size=payload.page_size,
+            provider=outcome.provider_name,
+            attribution_text=outcome.attribution_text,
+            attribution_url=outcome.attribution_url,
+            fetched_at=outcome.fetched_at,
+            duplicates_removed=outcome.duplicates_removed,
+            score_version=matching.SCORE_VERSION,
+        )
+    except service.SearchProfileIncompleteError as exc:
+        entitlement.release(db, usage)
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+    except HTTPException:
+        entitlement.release(db, usage)
+        raise
+    except Exception as exc:
+        entitlement.release(db, usage)
+        raise _provider_failure(exc, "search")
+
+    # A real result set, from a real provider call. This is the moment the free search is
+    # spent -- not when the screen was opened, not when filters were edited, and not once per
+    # provider request, page or job inside the operation that produced it.
+    entitlement.settle(db, usage)
+    return response
+
+
+@router.get("/entitlement", response_model=JobHuntEntitlementRead)
+def job_hunt_entitlement(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> JobHuntEntitlementRead:
+    """Whether this student may run a search, so the client can say so before they tap.
+
+    Purely so the screen can be honest up front -- "try Job Hunt once, free" before the search,
+    an upgrade prompt after -- rather than presenting a button that turns out to be refused.
+    Reading this grants nothing and consumes nothing; POST /search re-derives every one of
+    these facts for itself, so a client that skips this call, caches a stale copy of it, or
+    edits the response in memory is in exactly the same position either way.
+    """
+    profile = get_or_create_profile(db, current_user)
+    return JobHuntEntitlementRead(**entitlement.status_for(db, profile.id))
 
 
 @router.get("/jobs/{listing_id}", response_model=JobResultRead)
@@ -316,14 +432,7 @@ def get_job(
     except service.ListingNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
 
-    saved = next(
-        (
-            saved
-            for saved, _listing in service.list_saved_jobs(db, profile.id, limit=500)
-            if saved.listing_id == listing_id
-        ),
-        None,
-    )
+    saved = service.saved_jobs_for_listings(db, profile.id, [listing_id]).get(listing_id)
     # rank stays None: one job viewed on its own has no position in a ranked set, so it can
     # never be labelled "Best Match" off the back of a comparison that was never made.
     search_profile = service.get_or_create_search_profile(db, profile.id)
@@ -435,7 +544,7 @@ def save_job(
             source=payload.source,
             source_saved_search_id=payload.source_saved_search_id,
         )
-    except service.ListingNotFoundError as exc:
+    except (service.ListingNotFoundError, service.SavedSearchNotFoundError) as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
     except service.InvalidStatusError as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
@@ -444,7 +553,10 @@ def save_job(
 
 @router.get("/saved", response_model=List[SavedJobRead])
 def list_saved(
-    status_filter: Optional[List[str]] = Query(default=None, alias="status"),
+    # Typed rather than a bare str: an unrecognised status used to filter to nothing and
+    # render as "you have no applications", which reads as data loss rather than as a bad
+    # request. It is now a 422 that names the valid values.
+    status_filter: Optional[List[SavedJobStatus]] = Query(default=None, alias="status"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> List[SavedJobRead]:
@@ -458,10 +570,19 @@ def list_saved(
         for saved, _listing in rows
         if saved.source_saved_search_id is not None
     }
+    # Scoped to this student as well as to the wanted ids. Defence in depth behind
+    # service.save_job's ownership check, and the part that protects rows written before that
+    # check existed: a foreign id already sitting in the column must still not resolve to a
+    # name here.
     search_names = (
         {
             row.id: row.name
-            for row in db.query(JobSavedSearch).filter(JobSavedSearch.id.in_(wanted)).all()
+            for row in db.query(JobSavedSearch)
+            .filter(
+                JobSavedSearch.id.in_(wanted),
+                JobSavedSearch.profile_id == profile.id,
+            )
+            .all()
         }
         if wanted
         else {}
@@ -539,10 +660,19 @@ def _to_saved_read(db: Session, profile_id: int, saved) -> SavedJobRead:
         # keeps its provenance rather than being rewritten to "manual", because the student
         # really did find this job through a search, and a tracker that edits its own history
         # to match the present is worse than one that admits the search is gone.
+        # Looked up by (id, profile_id), never by primary key alone -- see the note on the
+        # batch lookup in list_saved.
         source_saved_search_name=(
             search.name
             if saved.source_saved_search_id
-            and (search := db.get(JobSavedSearch, saved.source_saved_search_id))
+            and (
+                search := db.query(JobSavedSearch)
+                .filter(
+                    JobSavedSearch.id == saved.source_saved_search_id,
+                    JobSavedSearch.profile_id == profile_id,
+                )
+                .first()
+            )
             else None
         ),
         listing=_to_listing_read(listing),
@@ -582,11 +712,15 @@ def create_saved_search(
     db: Session = Depends(get_db),
 ) -> SavedSearchRead:
     profile = get_or_create_profile(db, current_user)
+    filters = payload.filters.model_dump(exclude_none=True)
+    # Refused at the point of storing as well as at the point of running, so a free student is
+    # told now rather than handed a saved search that fails every time they tap it.
+    _refuse_premium_filters(db, profile.id, filters)
     saved_search = service.create_saved_search(
         db,
         profile.id,
         name=payload.name,
-        filters=payload.filters.model_dump(exclude_none=True),
+        filters=filters,
         notify_enabled=payload.notify_enabled,
     )
     return SavedSearchRead.model_validate(saved_search)
@@ -654,10 +788,9 @@ def job_hunt_home(
             for skill in list(match.matched_skills or []) + list(match.missing_skills or [])
         ],
     )
-    saved_rows = {
-        saved.listing_id: saved
-        for saved, _listing in service.list_saved_jobs(db, profile.id, limit=500)
-    }
+    saved_rows = service.saved_jobs_for_listings(
+        db, profile.id, [listing.id for listing in listings]
+    )
     recommended = [
         JobResultRead(
             listing=_to_listing_read(listing),
@@ -787,13 +920,37 @@ def run_saved_search(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
     provider: JobProvider = Depends(get_job_provider),
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
 ) -> JobSearchResponse:
     """Re-run a stored search, and record that it ran.
 
-    Shares the search endpoint's rate-limit budget deliberately: a saved search is a search,
-    and a separate allowance would be a way around the limit rather than a second entitlement.
+    Spends the same allowance as POST /search, for the same reason it shares that endpoint's
+    rate limit: a saved search *is* a search. Giving it its own budget would turn "save this,
+    then run it" into an unlimited free tier reached in two ordinary requests -- the same
+    paywall bypass that already had to be closed for advanced filters, one endpoint over.
+
+    Storing a saved search is free, and so is listing or deleting one. Only running it reaches
+    a provider, and only reaching a provider costs anything.
     """
     profile = get_or_create_profile(db, current_user)
+    try:
+        stored = service.get_saved_search(db, profile.id, saved_search_id)
+    except service.SavedSearchNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    # Against the stored filter set, before any provider call is made.
+    _refuse_premium_filters(db, profile.id, dict(stored.filters or {}))
+
+    usage = _claim_job_hunt_use(
+        db,
+        profile.id,
+        usage_type="saved_search_run",
+        idempotency_key=idempotency_key,
+        # The saved search's id is part of the identity of the operation: running search A and
+        # running search B are two different things even in the rare case their stored filters
+        # happen to match.
+        params={"saved_search_id": saved_search_id, **dict(stored.filters or {})},
+    )
+
     end_user_ip, end_user_agent = _end_user_identity(request)
 
     try:
@@ -805,57 +962,80 @@ def run_saved_search(
             end_user_ip=end_user_ip,
             end_user_agent=end_user_agent,
         )
+
+        search_profile = service.get_or_create_search_profile(db, profile.id)
+        saved_rows = service.saved_jobs_for_listings(
+            db, profile.id, [listing.id for listing in outcome.listings]
+        )
+        results = [
+            JobResultRead(
+                listing=_to_listing_read(listing),
+                match=_to_match_read(
+                    outcome.matches[listing.id],
+                    listing,
+                    search_profile,
+                    outcome.evidence_states,
+                    rank=rank,
+                ),
+                saved_job_id=saved_rows[listing.id].id if listing.id in saved_rows else None,
+                saved_status=saved_rows[listing.id].status if listing.id in saved_rows else None,
+            )
+            for rank, listing in enumerate(outcome.listings)
+        ]
+        filters = dict(saved_search.filters or {})
+        response = JobSearchResponse(
+            results=results,
+            total_available=outcome.total_available,
+            page=filters.get("page") or 1,
+            page_size=filters.get("page_size") or 20,
+            provider=outcome.provider_name,
+            attribution_text=outcome.attribution_text,
+            attribution_url=outcome.attribution_url,
+            fetched_at=outcome.fetched_at,
+            duplicates_removed=outcome.duplicates_removed,
+            score_version=matching.SCORE_VERSION,
+        )
     except service.SavedSearchNotFoundError as exc:
+        entitlement.release(db, usage)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
     except service.SearchProfileIncompleteError as exc:
+        entitlement.release(db, usage)
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+    except HTTPException:
+        entitlement.release(db, usage)
+        raise
     except Exception as exc:
+        entitlement.release(db, usage)
         raise _provider_failure(exc, "saved search run")
 
-    search_profile = service.get_or_create_search_profile(db, profile.id)
-    saved_rows = {
-        saved.listing_id: saved
-        for saved, _listing in service.list_saved_jobs(db, profile.id, limit=500)
-    }
-    results = [
-        JobResultRead(
-            listing=_to_listing_read(listing),
-            match=_to_match_read(
-                outcome.matches[listing.id],
-                listing,
-                search_profile,
-                outcome.evidence_states,
-                rank=rank,
-            ),
-            saved_job_id=saved_rows[listing.id].id if listing.id in saved_rows else None,
-            saved_status=saved_rows[listing.id].status if listing.id in saved_rows else None,
-        )
-        for rank, listing in enumerate(outcome.listings)
-    ]
-    filters = dict(saved_search.filters or {})
-    return JobSearchResponse(
-        results=results,
-        total_available=outcome.total_available,
-        page=filters.get("page") or 1,
-        page_size=filters.get("page_size") or 20,
-        provider=outcome.provider_name,
-        attribution_text=outcome.attribution_text,
-        attribution_url=outcome.attribution_url,
-        fetched_at=outcome.fetched_at,
-        duplicates_removed=outcome.duplicates_removed,
-        score_version=matching.SCORE_VERSION,
-    )
+    entitlement.settle(db, usage)
+    return response
 
 
 # -- Job alerts ------------------------------------------------------------------------------
 
 
-def _to_alert_read(db: Session, alert) -> JobAlertRead:
-    search = (
-        db.get(JobSavedSearch, alert.saved_search_id)
-        if alert.saved_search_id is not None
-        else None
-    )
+def _to_alert_read(db: Session, alert, searches: Optional[dict] = None) -> JobAlertRead:
+    """`searches` lets a list caller prefetch every saved search in one query. Without it this
+    falls back to a single lookup, which is right for the create/update paths that hold one
+    alert and wrong for the list path that holds ten."""
+    if alert.saved_search_id is None:
+        search = None
+    elif searches is not None:
+        search = searches.get(alert.saved_search_id)
+    else:
+        # Scoped to the alert's own profile rather than fetched by primary key. create_alert
+        # already refuses a saved search the student does not own, so this cannot currently
+        # resolve a foreign row -- but keeping the check local means the guarantee does not
+        # depend on a validation three files away staying correct.
+        search = (
+            db.query(JobSavedSearch)
+            .filter(
+                JobSavedSearch.id == alert.saved_search_id,
+                JobSavedSearch.profile_id == alert.profile_id,
+            )
+            .first()
+        )
     # Filters are read live from the saved search when there is one, matching what the alert
     # will actually run with -- see alerts._filters_for. Unknown keys are dropped rather than
     # passed through: stored filters are data, and data written by an older version of the app
@@ -894,7 +1074,22 @@ def list_job_alerts(
     db: Session = Depends(get_db),
 ) -> List[JobAlertRead]:
     profile = get_or_create_profile(db, current_user)
-    return [_to_alert_read(db, alert) for alert in job_alerts.list_alerts(db, profile.id)]
+    alerts = job_alerts.list_alerts(db, profile.id)
+    wanted = {alert.saved_search_id for alert in alerts if alert.saved_search_id is not None}
+    searches = (
+        {
+            row.id: row
+            for row in db.query(JobSavedSearch)
+            .filter(
+                JobSavedSearch.id.in_(wanted),
+                JobSavedSearch.profile_id == profile.id,
+            )
+            .all()
+        }
+        if wanted
+        else {}
+    )
+    return [_to_alert_read(db, alert, searches) for alert in alerts]
 
 
 @router.get("/alerts/quota", response_model=JobAlertQuotaRead)
@@ -920,9 +1115,17 @@ def job_alert_history(
     profile = get_or_create_profile(db, current_user)
     rows = job_alerts.list_history(db, profile.id)
     names = {alert.id: alert.name for alert in job_alerts.list_alerts(db, profile.id)}
+    # One query for every listing in the history rather than one per row. db.get looks like a
+    # cheap identity-map read, but on a first pass over fifty deliveries it is fifty selects.
+    listings = {
+        listing.id: listing
+        for listing in db.query(JobListing)
+        .filter(JobListing.id.in_({row.listing_id for row in rows}))
+        .all()
+    } if rows else {}
     out: List[JobAlertHistoryRead] = []
     for row in rows:
-        listing = db.get(JobListing, row.listing_id)
+        listing = listings.get(row.listing_id)
         if listing is None:
             # The shared listing was pruned. The delivery still happened, but there is nothing
             # to show, so the row is skipped rather than rendered as a blank card.
@@ -946,6 +1149,12 @@ def create_job_alert(
     db: Session = Depends(get_db),
 ) -> JobAlertRead:
     profile = get_or_create_profile(db, current_user)
+    # A standalone alert carries its own filter set and run_alert replays it, so it is a third
+    # way a filter set reaches the provider and is gated like the other two. (An alert bound to
+    # a saved search reads that search's filters instead, and those were gated when the search
+    # was stored.)
+    if payload.filters is not None:
+        _refuse_premium_filters(db, profile.id, payload.filters.model_dump(exclude_none=True))
     try:
         alert = job_alerts.create_alert(
             db,

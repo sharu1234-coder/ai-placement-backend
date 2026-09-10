@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from app.ai.input_guard import render_prompt
 from app.ai.provider import AIGenerationError, AIProvider
 from app.ai.schemas.resume import ParsedResume
+from app.models.job_search_profile import JobSearchProfile
 from app.models.placement_path import PlacementPath
 from app.models.resume import Resume
 from app.models.resume_analysis import ResumeAnalysis
@@ -162,7 +163,14 @@ def delete_resume(db: Session, resume_id: int, profile_id: int, storage: Storage
     nullable and is only this resume's provenance, not the roadmap's data -- deleting a whole
     PlacementPath (and the topics/progress it carries) just because its source resume was
     cleaned up would be a worse bug than the one being fixed, so that FK is nulled out
-    instead of the row being deleted."""
+    instead of the row being deleted.
+
+    job_search_profiles.resume_id is a third FK into this table, added later by Job Hunt and
+    missed here at the time. It is nulled for the same reason as PlacementPath: the student's
+    Job Hunt setup -- target role, location, work mode, declared skills -- is their own data
+    and has nothing to do with which resume it was once linked to. The `resume_skills`
+    provenance key goes with it, exactly as update_search_profile(clear_resume=True) does, so
+    the profile never claims a signal came from a resume that no longer exists."""
     resume = db.get(Resume, resume_id)
     if resume is None or resume.profile_id != profile_id:
         return False
@@ -172,6 +180,13 @@ def delete_resume(db: Session, resume_id: int, profile_id: int, storage: Storage
     db.query(PlacementPath).filter(PlacementPath.source_resume_id == resume.id).update(
         {PlacementPath.source_resume_id: None}
     )
+    for search_profile in (
+        db.query(JobSearchProfile).filter(JobSearchProfile.resume_id == resume.id).all()
+    ):
+        search_profile.resume_id = None
+        provenance = dict(search_profile.signal_provenance or {})
+        provenance.pop("resume_skills", None)
+        search_profile.signal_provenance = provenance
 
     try:
         storage.delete(resume.file_path)

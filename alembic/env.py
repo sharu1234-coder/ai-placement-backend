@@ -26,6 +26,7 @@ from app.models.interview_answer import InterviewAnswer  # noqa: F401
 from app.models.interview_evaluation import InterviewEvaluation  # noqa: F401
 from app.models.interview_question import InterviewQuestion  # noqa: F401
 from app.models.job_description import JobDescription  # noqa: F401
+from app.models.job_hunt_usage import JobHuntUsage  # noqa: F401
 from app.models.job_alert import JobAlert, JobAlertDelivery  # noqa: F401
 from app.models.job_listing import JobListing  # noqa: F401
 from app.models.job_listing_match import JobListingMatch  # noqa: F401
@@ -41,6 +42,7 @@ from app.models.placement_alarm_question_attempt import PlacementAlarmQuestionAt
 from app.models.placement_path import PlacementPath  # noqa: F401
 from app.models.placement_path_topic import PlacementPathTopic  # noqa: F401
 from app.models.profile import StudentProfile  # noqa: F401
+from app.models.provider_call_budget import ProviderCallBudget  # noqa: F401
 from app.models.project import Project  # noqa: F401
 from app.models.project_build import ProjectBuild  # noqa: F401
 from app.models.project_build_stage import ProjectBuildStage  # noqa: F401

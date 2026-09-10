@@ -12,6 +12,7 @@ import pytest
 from app.main import app
 from app.services.job_hunt.providers.factory import get_job_provider
 from tests.api.test_job_hunt import FakeJobProvider, provider_job
+from tests.fixtures.premium_helpers import grant_premium
 
 
 @pytest.fixture()
@@ -55,6 +56,18 @@ def premium(monkeypatch):
 
     monkeypatch.setattr(job_hunt_api, "is_premium", lambda db, profile_id: True)
     monkeypatch.setattr(alerts_service, "is_premium", lambda db, profile_id: True)
+
+
+@pytest.fixture()
+def subscribed(client):
+    """A real paid subscription for the test account, for tests that legitimately run more
+    than one Job Hunt operation. See tests/fixtures/premium_helpers.py for why this writes a
+    row instead of patching is_premium."""
+    from app.api.deps import get_db
+
+    session = next(app.dependency_overrides[get_db]())
+    grant_premium(session, "alerts@example.com")
+    return session
 
 
 def seed_search(client, headers, name="Dubai Data Analyst", **filters):
@@ -293,10 +306,13 @@ class TestSavedSearchRun:
         assert after["last_result_count"] == 1
 
     def test_a_failed_run_records_the_failure_and_keeps_the_previous_count(
-        self, client, auth_headers, use_provider
+        self, client, auth_headers, use_provider, subscribed
     ):
         """Overwriting a real previous count with a zero on a failed run would tell the student
-        their search stopped matching anything, when what happened is that we could not ask."""
+        their search stopped matching anything, when what happened is that we could not ask.
+
+        A subscriber, because it runs the saved search twice; what is under test is the run
+        metadata, not who is allowed to run it."""
         from app.services.job_hunt.providers.base import JobProviderUnavailableError
 
         use_provider(FakeJobProvider())
@@ -632,9 +648,11 @@ class TestApplicationReadiness:
 
 class TestSortOptions:
     def test_sorting_reorders_without_changing_a_single_score(
-        self, client, auth_headers, use_provider
+        self, client, auth_headers, use_provider, subscribed
     ):
-        """A sort control that quietly changed the numbers would be untrustworthy."""
+        """A sort control that quietly changed the numbers would be untrustworthy.
+
+        Two searches -- one per sort order -- so this runs as a subscriber."""
         old = datetime.datetime(2026, 8, 1, 12, 0, 0)
         new = datetime.datetime(2026, 9, 7, 12, 0, 0)
         use_provider(
@@ -701,6 +719,45 @@ class TestSortOptions:
             "/job-hunt/search", json={"sort": "whatever"}, headers=auth_headers
         )
         assert resp.status_code == 422
+
+
+class TestAlertFiltersAreGatedLikeEveryOtherFilterSet:
+    """A standalone alert carries its own filter set, and run_alert replays it through the same
+    search path. That makes alert creation a third route by which an advanced filter can reach
+    the provider, alongside POST /search and a saved search -- and it has to be gated at all
+    three or it is gated at none."""
+
+    def test_a_free_student_cannot_store_advanced_filters_on_an_alert(self, client, auth_headers):
+        response = client.post(
+            "/job-hunt/alerts",
+            json={"name": "Well paid", "filters": {"salary_min": 500000}},
+            headers=auth_headers,
+        )
+
+        assert response.status_code == 403
+        assert "Premium" in response.json()["detail"]
+
+    def test_a_free_student_can_still_create_an_ordinary_alert(self, client, auth_headers):
+        """Keywords, location and work mode stay free, here as everywhere else."""
+        response = client.post(
+            "/job-hunt/alerts",
+            json={
+                "name": "Remote engineer",
+                "filters": {"keywords": "engineer", "work_mode": "remote"},
+            },
+            headers=auth_headers,
+        )
+
+        assert response.status_code == 201
+
+    def test_a_premium_student_may_store_advanced_filters(self, client, auth_headers, premium):
+        response = client.post(
+            "/job-hunt/alerts",
+            json={"name": "Well paid", "filters": {"salary_min": 500000}},
+            headers=auth_headers,
+        )
+
+        assert response.status_code == 201
 
 
 class TestAlertAuthentication:

@@ -1,6 +1,6 @@
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -19,6 +19,22 @@ def client():
         connect_args={"check_same_thread": False},
         poolclass=StaticPool,
     )
+    # SQLite ignores foreign keys unless asked, per connection. Production is PostgreSQL,
+    # which enforces them on every statement -- so without this the suite is structurally
+    # unable to see a whole class of bug: deleting a row something still points at.
+    #
+    # It was hiding two, both of which produced a 500 in production and a pass here: deleting
+    # a saved search that had an alert or a tracked job attached, and the placement-alarm
+    # recovery path that deletes a challenge whose question-attempt rows were already
+    # committed. Turning the pragma on was measured before being adopted -- those two were the
+    # only failures across the whole suite, and both were real defects rather than fixture
+    # artefacts.
+    @event.listens_for(engine, "connect")
+    def _enforce_foreign_keys(dbapi_connection, _record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
     testing_session_local = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     Base.metadata.create_all(bind=engine)
 

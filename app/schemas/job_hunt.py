@@ -409,7 +409,14 @@ class JobAlertRead(BaseModel):
     last_success_at: Optional[datetime.datetime] = None
     last_error_at: Optional[datetime.datetime] = None
     last_run_status: Optional[
-        Literal["success", "no_new_jobs", "provider_error", "not_configured", "skipped_quiet_hours"]
+        Literal[
+            "success",
+            "no_new_jobs",
+            "provider_error",
+            "not_configured",
+            "skipped_quiet_hours",
+            "requires_premium",
+        ]
     ] = None
     # Null means never run. Never zero, which would read as "we looked and found nothing".
     last_new_job_count: Optional[int] = None
@@ -433,3 +440,41 @@ class JobAlertQuotaRead(BaseModel):
     used: int
     limit: int
     is_premium: bool
+
+
+class JobHuntEntitlementRead(BaseModel):
+    """What the student is allowed to do next, decided server-side.
+
+    Exists so the client can show the right screen -- "try one free search" before, an upgrade
+    prompt after -- instead of discovering the answer by being refused. It is a UX aid and
+    nothing more: every field is re-derived on the request that actually runs a search, so a
+    client that ignores this, caches it, or edits it in memory changes nothing about what the
+    server permits. See app/services/job_hunt/entitlement.py.
+    """
+
+    tier: Literal["free", "premium"]
+    # True when an active subscription lifts the free-tier ceiling. Named for what it means to
+    # the student rather than "is_premium", so the client renders an entitlement, not a plan.
+    unlimited: bool
+    free_uses_total: int
+    free_uses_remaining: int
+    has_used_free_search: bool
+    # True only when the *next* search would be refused. A premium student who used their free
+    # search long ago is not "requires_premium" -- they already have it.
+    requires_premium: bool
+    # When the free search was actually spent. None while it is still available, and None for
+    # a student who has only ever searched with a subscription.
+    last_free_use_at: Optional[datetime.datetime] = None
+
+
+class JobHuntLimitDetail(BaseModel):
+    """The body returned with 402 when a free student's one search is gone.
+
+    Structured rather than a bare sentence because the client has to *act* on it (open the
+    upgrade flow), and branching on prose is how a copy edit becomes a bug. `code` is the
+    stable contract; `message` is what a person reads and may be reworded freely.
+    """
+
+    code: Literal["JOB_HUNT_FREE_LIMIT_REACHED"] = "JOB_HUNT_FREE_LIMIT_REACHED"
+    message: str
+    requires_premium: bool = True

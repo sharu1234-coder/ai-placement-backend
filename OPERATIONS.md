@@ -227,3 +227,92 @@ specifically. For a different endpoint being hammered, or an attacker rotating I
 around the per-IP limit, the immediate mitigation is at the infrastructure layer (the hosting
 platform's/reverse proxy's own request throttling or IP blocking — not something this app-level
 code can fully solve alone) — flagged as a real limitation, not solved here.
+
+## Job Hunt: two limits, and telling them apart
+
+Job Hunt refuses a search for two completely unrelated reasons, and an operator looking at a
+support ticket needs to know which one it was before doing anything else. They have different
+status codes precisely so that this never requires reading a message.
+
+| Code | What it means | What fixes it |
+|---|---|---|
+| `402` | The student has no subscription and has already run their one free search. | The student buying Premium. Nothing operational. |
+| `429` | Either the deployment's daily provider budget is spent, or the provider itself answered 429. | Waiting for the UTC day to roll over, or a larger provider plan. |
+| `403` | An advanced filter (salary / employment type / experience level / date posted) was used without Premium. | The student removing the filter, or buying Premium. |
+| `503` | No provider is configured, or the provider rejected our credentials. | An operator. See below. |
+
+A premium subscription buys unlimited *Job Hunt*. It does not buy unlimited *provider calls* —
+that ceiling belongs to the API key and is shared by everyone on the deployment. A paying
+student can therefore still see a 429, and the message says so rather than implying they should
+buy something they already have.
+
+### Where each limit lives
+
+* Per-student entitlement: `job_hunt_usages`, one row per operation.
+  `free_use_slot` holds 1 for the row that spent the free search and NULL for every other row,
+  under `UNIQUE (profile_id, free_use_slot)`. That constraint *is* the enforcement — there is no
+  check-then-act step to lose under concurrency. Service: `app/services/job_hunt/entitlement.py`.
+* Per-deployment provider budget: `provider_call_budgets`, one row per (provider, UTC day),
+  incremented by a conditional UPDATE. Service: `app/services/job_hunt/provider_budget.py`.
+
+### Answering "did this student really use their search?"
+
+```sql
+SELECT usage_type, status, was_premium, created_at, consumed_at
+FROM job_hunt_usages
+WHERE profile_id = :profile_id
+ORDER BY created_at;
+```
+
+`status = 'succeeded'` with a non-null `consumed_at` is a search that produced real results.
+`failed` is an attempt that was released because nothing was produced — the provider was down,
+timed out, or answered with something unusable — and it does not count against the student.
+`abandoned` means a worker died between claiming and settling; the allowance was reclaimed
+automatically after ten minutes.
+
+Rows are never edited to grant a search back. If a student genuinely needs another one, that is
+a product decision, not an operational one.
+
+### How much of today's provider budget is left
+
+```sql
+SELECT provider, usage_date, call_count
+FROM provider_call_budgets
+WHERE usage_date = CURRENT_DATE;
+```
+
+Jobvetta's documented ceiling is 50 per key per UTC day. The count is incremented *before* the
+outbound request, so a call that dies in the socket still counts — this errs toward under-using
+the key, which is the correct direction when the other mistake is a terms violation.
+
+### Configuring the Jobvetta provider
+
+```
+JOB_PROVIDER=jobvetta
+JOBVETTA_API_KEY=<from the environment's secret store, never committed>
+```
+
+Both are read from the environment only. With the key unset or blank, Job Hunt answers 503 and
+the app shows "Job Hunt isn't available yet" — a real, honest state, not a broken one. It must
+never be made to return an empty result list instead, because that would be a claim about the
+job market rather than about our configuration.
+
+Before trusting a newly configured key, run one authenticated search and check the log for
+`Jobvetta: skipped N of M results that could not be parsed`. Jobvetta's *response* schema was
+never supplied to us, so the adapter's field names (`_FIELD_ALIASES` in
+`app/services/job_hunt/providers/jobvetta.py`) are educated guesses. A wrong guess shows up as
+an empty results page plus that warning — never as an invented job — and correcting it is a
+one-table edit.
+
+Coverage is India only. Do not describe Job Hunt as covering any other market while this is the
+configured provider.
+
+### Alerts do not run for free students
+
+`run_alert` requires an active subscription and records `last_run_status = "requires_premium"`
+otherwise. This is not a paywall on notifications: a free student may still create an alert and
+see what it would do. It is there because an alert is a search that runs on its own, which on a
+one-search plan would be unlimited Job Hunt with a timer attached.
+
+Note also that nothing in this repository calls `run_alert` on a schedule yet — there is no
+cron, worker or queue. Alerts are configurable and do not fire.

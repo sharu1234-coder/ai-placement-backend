@@ -18,6 +18,7 @@ from typing import Optional
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.models.job_alert import JobAlert, JobAlertDelivery
 from app.models.job_listing import JobListing
 from app.models.job_listing_match import JobListingMatch
 from app.models.job_saved_search import JobSavedSearch
@@ -28,7 +29,7 @@ from app.models.resume_analysis import ResumeAnalysis
 from app.models.role import Role
 from app.models.saved_job import SAVED_JOB_SOURCES, SAVED_JOB_STATUSES, SavedJob
 from app.services import evidence_engine
-from app.services.job_hunt import dedupe, matching, normalization, provenance
+from app.services.job_hunt import dedupe, matching, normalization, provenance, provider_budget
 from app.services.job_hunt.providers.base import (
     JobProvider,
     ProviderJob,
@@ -40,6 +41,13 @@ logger = logging.getLogger(__name__)
 # Applied to a single search request. Above this the provider quota (Adzuna's documented
 # default is 25 hits/minute) is burned by one student.
 MAX_PAGE_SIZE = 50
+
+# Clamped here as well as in the request schema, for the same reason MAX_PAGE_SIZE is: the
+# schema only guards the HTTP path, and search() is also reached from a stored filter set (a
+# saved search, an alert). Careerjet refuses pages past 10 outright and Adzuna would simply
+# serve an empty page, so an unclamped value turns into a silent no-results rather than an
+# error.
+MAX_PAGE = 10
 
 # How recently a listing must have been fetched to count as "new" on the home screen. A week,
 # because that is roughly how often a student in an active search comes back, and a shorter
@@ -59,6 +67,20 @@ APPLIED_OR_BEYOND = ("applied", "assessment", "interview", "offer", "rejected", 
 # How search results may be ordered. "best_match" is the ranked order the engine produces;
 # "newest" and "salary" re-order the same result set without re-scoring it.
 SORT_OPTIONS = ("best_match", "newest", "salary")
+
+# The most tracked applications one student's tracker will return in a single read. High
+# enough that no real student hits it, low enough that a runaway or scripted account cannot
+# make the endpoint read an unbounded number of rows.
+MAX_TRACKER_ROWS = 500
+
+# The same, for saved searches. Generous rather than tight for the same reason: there is no
+# pagination on that screen, so anything this cap hides is hidden silently.
+MAX_SAVED_SEARCHES = 200
+
+# Stored column widths for the two listing fields that cannot survive truncation. Kept beside
+# the model rather than read from it so a widening of the column is a deliberate edit here too.
+_MAX_URL_LENGTH = 1000
+_MAX_PROVIDER_ID_LENGTH = 255
 
 
 class JobHuntError(Exception):
@@ -334,10 +356,24 @@ def search(
         experience_level=experience_level or search_profile.experience_level,
         salary_min=salary_min if salary_min is not None else search_profile.salary_min_expected,
         max_days_old=max_days_old,
-        page=max(page, 1),
+        page=min(max(page, 1), MAX_PAGE),
         page_size=min(max(page_size, 1), MAX_PAGE_SIZE),
         end_user_ip=end_user_ip,
         end_user_agent=end_user_agent,
+    )
+
+    # The deployment's own budget for this provider's key, checked before the call rather
+    # than discovered from a 429 afterwards. It is a separate limit from the student's
+    # entitlement and answers a different question -- see provider_budget's module docstring --
+    # and it is why a premium subscription can be genuinely unlimited without implying the
+    # provider's key is. Providers that publish no per-day ceiling are not metered at all.
+    #
+    # getattr rather than a direct attribute read: the provider arrives through a FastAPI
+    # dependency and may legitimately be a duck-typed object that predates this attribute.
+    # Absent means the same thing the base class's default means -- no documented per-day
+    # ceiling, so nothing to meter -- rather than an AttributeError mid-search.
+    provider_budget.reserve_call(
+        db, provider.name, getattr(provider, "daily_call_budget", None)
     )
 
     # Deliberately not wrapped: every JobProviderError subclass propagates to the API layer,
@@ -469,33 +505,56 @@ def _upsert_listing(
         )
         return None
 
-    existing = (
-        db.query(JobListing)
-        .filter(
-            JobListing.provider == job.provider,
-            JobListing.provider_job_id == job.provider_job_id,
+    # Column widths are enforced here for the same reason the URL is: this is the one point
+    # every listing passes through.
+    #
+    # SQLite ignores String(n) entirely; PostgreSQL raises StringDataRightTruncation. So a
+    # provider returning one over-long field would pass every test in this repository and then
+    # 500 the whole search page in production -- and the values are provider-controlled, not
+    # ours. A malformed Careerjet response carrying salary_currency_code="RUPEES-INDIAN" (13
+    # characters into a String(3) column) is enough.
+    if len(safe_url) > _MAX_URL_LENGTH or len(job.provider_job_id or "") > _MAX_PROVIDER_ID_LENGTH:
+        # Identity and link, both unusable if truncated: a clipped URL points somewhere else,
+        # and a clipped id would collide with a different advert under the uniqueness
+        # constraint. Dropped whole, like a listing with an invalid URL.
+        logger.warning(
+            "Job Hunt: dropped a %s listing whose url/id exceeds the stored column width (id=%s)",
+            job.provider,
+            (job.provider_job_id or "")[:60],
         )
-        .first()
-    )
+        return None
+
+    existing = _find_listing(db, job.provider, job.provider_job_id)
     # Work mode is the one attribute neither provider exposes as a field, so it is derived from
     # the advert's own title and description -- provider-supplied text, not an invention -- and
     # stays None when the text does not say.
-    work_mode = job.work_mode or normalization.work_mode_from_text(job.title, job.description)
-    seniority = job.seniority or normalization.seniority_from_title(job.title)
+    work_mode = _fit(job.work_mode or normalization.work_mode_from_text(job.title, job.description), 20)
+    seniority = _fit(job.seniority or normalization.seniority_from_title(job.title), 30)
     expires_at = fetched_at + provider.cache_ttl
+
+    # Display text is truncated rather than dropped -- no real advert comes near these limits,
+    # and losing a job over a long title would be the worse trade. A currency code that does
+    # not fit becomes None, because a clipped code would be a *different* currency and this
+    # module never guesses at a value it does not have.
+    title = _fit(job.title, 500)
+    company = _fit(job.company, 300)
+    location = _fit(job.location, 300)
+    employment_type = _fit(job.employment_type, 30)
+    salary_currency = _exact_or_none(job.salary_currency, 3)
+    salary_period = _exact_or_none(job.salary_period, 10)
 
     if existing is not None:
         existing.url = safe_url
-        existing.title = job.title
-        existing.company = job.company
-        existing.location = job.location
+        existing.title = title
+        existing.company = company
+        existing.location = location
         existing.work_mode = work_mode
-        existing.employment_type = job.employment_type
+        existing.employment_type = employment_type
         existing.seniority = seniority
         existing.salary_min = job.salary_min
         existing.salary_max = job.salary_max
-        existing.salary_currency = job.salary_currency
-        existing.salary_period = job.salary_period
+        existing.salary_currency = salary_currency
+        existing.salary_period = salary_period
         existing.salary_is_predicted = job.salary_is_predicted
         existing.description = job.description
         existing.posted_at = job.posted_at
@@ -507,39 +566,75 @@ def _upsert_listing(
         provider=job.provider,
         provider_job_id=job.provider_job_id,
         url=safe_url,
-        title=job.title,
-        company=job.company,
-        location=job.location,
+        title=title,
+        company=company,
+        location=location,
         work_mode=work_mode,
-        employment_type=job.employment_type,
+        employment_type=employment_type,
         seniority=seniority,
         salary_min=job.salary_min,
         salary_max=job.salary_max,
-        salary_currency=job.salary_currency,
-        salary_period=job.salary_period,
+        salary_currency=salary_currency,
+        salary_period=salary_period,
         salary_is_predicted=job.salary_is_predicted,
         description=job.description,
         posted_at=job.posted_at,
         fetched_at=fetched_at,
         expires_at=expires_at,
     )
-    db.add(listing)
+    # SAVEPOINT, not a plain flush-and-rollback.
+    #
+    # This runs in a LOOP over every advert in one search, and the loop commits once at the
+    # end. A bare `db.rollback()` in the except branch would therefore not undo just the
+    # duplicate -- it would undo the whole transaction, discarding every listing already
+    # flushed earlier in the same loop. Two students searching the same keywords at the same
+    # moment is enough to trigger it, and the result was a page that silently lost most of its
+    # jobs. `begin_nested` scopes the undo to this one INSERT.
+    #
+    # `db.add` goes inside the block on purpose: an object added outside it survives the
+    # savepoint rollback as a pending insert and would be retried -- and fail again -- at the
+    # next commit.
     try:
-        db.flush()
+        with db.begin_nested():
+            db.add(listing)
+            db.flush()
     except IntegrityError:
         # Another request inserted the same advert between the SELECT and the INSERT. The
         # unique constraint is the authority; adopt the row that won.
-        db.rollback()
-        existing = (
-            db.query(JobListing)
-            .filter(
-                JobListing.provider == job.provider,
-                JobListing.provider_job_id == job.provider_job_id,
-            )
-            .first()
-        )
-        return existing
+        return _find_listing(db, job.provider, job.provider_job_id)
     return listing
+
+
+def _fit(value: Optional[str], limit: int) -> Optional[str]:
+    """Display text clipped to what the column holds. None stays None."""
+    if value is None:
+        return None
+    return value[:limit]
+
+
+def _exact_or_none(value: Optional[str], limit: int) -> Optional[str]:
+    """A coded value, or nothing. Unlike _fit this never clips: half of "RUPEES-INDIAN" is
+    "RUP", which is not a shorter way of saying the same thing -- it is a different claim."""
+    if value is None or len(value) > limit:
+        return None
+    return value
+
+
+def _find_listing(db: Session, provider_name: str, provider_job_id: str) -> Optional[JobListing]:
+    """The stored copy of one advert, or None.
+
+    Its own function because _upsert_listing asks the same question twice -- once before
+    inserting and once after losing the race to insert -- and the two must stay the same
+    question.
+    """
+    return (
+        db.query(JobListing)
+        .filter(
+            JobListing.provider == provider_name,
+            JobListing.provider_job_id == provider_job_id,
+        )
+        .first()
+    )
 
 
 def build_match_input(
@@ -575,14 +670,7 @@ def _upsert_match(
 ) -> JobListingMatch:
     result = matching.score_match(build_match_input(search_profile, listing))
 
-    existing = (
-        db.query(JobListingMatch)
-        .filter(
-            JobListingMatch.profile_id == search_profile.profile_id,
-            JobListingMatch.listing_id == listing.id,
-        )
-        .first()
-    )
+    existing = _find_match(db, search_profile.profile_id, listing.id)
     if existing is not None:
         existing.total_score = result.total_score
         existing.score_version = result.score_version
@@ -605,23 +693,32 @@ def _upsert_match(
         unknown_factors=result.unknown_factors,
         rationale=result.rationale,
     )
-    db.add(match)
+    # Scoped to a savepoint for the same reason as _upsert_listing above: this is also called
+    # in a loop that commits once at the end, so a plain rollback here would throw away every
+    # match already computed for this page.
     try:
-        db.flush()
+        with db.begin_nested():
+            db.add(match)
+            db.flush()
     except IntegrityError:
-        db.rollback()
-        existing = (
-            db.query(JobListingMatch)
-            .filter(
-                JobListingMatch.profile_id == search_profile.profile_id,
-                JobListingMatch.listing_id == listing.id,
-            )
-            .first()
-        )
+        existing = _find_match(db, search_profile.profile_id, listing.id)
         if existing is None:
             raise
         return existing
     return match
+
+
+def _find_match(db: Session, profile_id: int, listing_id: int) -> Optional[JobListingMatch]:
+    """This student's stored match for one listing, or None. Asked both before inserting and
+    after losing the race to insert -- see _find_listing."""
+    return (
+        db.query(JobListingMatch)
+        .filter(
+            JobListingMatch.profile_id == profile_id,
+            JobListingMatch.listing_id == listing_id,
+        )
+        .first()
+    )
 
 
 # -- Evidence provenance --------------------------------------------------------------------
@@ -729,6 +826,28 @@ def save_job(
     if db.get(JobListing, listing_id) is None:
         raise ListingNotFoundError(f"Job listing {listing_id} not found")
 
+    # `source_saved_search_id` arrives in a request body, unlike every other Job Hunt id,
+    # which arrives in a path and is scoped by the handler. Stored unchecked it was a
+    # cross-user reference: a student could tag their own saved job with someone else's
+    # saved-search id and read that student's saved-search *name* back out of their own
+    # tracker. Names are user-authored text, so that is a real disclosure, not a bare id.
+    #
+    # 404 rather than 403, the same choice create_alert makes for the same field: confirming
+    # that another student's saved search exists is itself the leak.
+    if source == "saved_search" and source_saved_search_id is not None:
+        owned = (
+            db.query(JobSavedSearch.id)
+            .filter(
+                JobSavedSearch.id == source_saved_search_id,
+                JobSavedSearch.profile_id == profile_id,
+            )
+            .first()
+        )
+        if owned is None:
+            raise SavedSearchNotFoundError(
+                f"Saved search {source_saved_search_id} not found"
+            )
+
     existing = (
         db.query(SavedJob)
         .filter(SavedJob.profile_id == profile_id, SavedJob.listing_id == listing_id)
@@ -821,13 +940,22 @@ def delete_saved_job(db: Session, profile_id: int, saved_job_id: int) -> None:
 
 
 def list_saved_jobs(
-    db: Session, profile_id: int, statuses: Optional[list[str]] = None, limit: int = 100
+    db: Session,
+    profile_id: int,
+    statuses: Optional[list[str]] = None,
+    limit: int = MAX_TRACKER_ROWS,
 ) -> list[tuple[SavedJob, JobListing]]:
     """Saved rows joined to their listings, newest first.
 
     An explicit join rather than a lazy relationship walk: the tracker screen renders every
     row's title and company, so a per-row lazy load would be a guaranteed N+1 (spec section 15
     calls out exactly this).
+
+    The default used to be 100, which is what the tracker endpoint got by not passing one. A
+    student with more than a hundred tracked applications simply stopped seeing the oldest of
+    them, with nothing on screen to say so -- and the tracker is the one place in the product
+    where a missing row means a forgotten application. The default is now the documented
+    ceiling, and the ceiling is clamped here rather than trusted from the caller.
     """
     query = (
         db.query(SavedJob, JobListing)
@@ -836,7 +964,38 @@ def list_saved_jobs(
     )
     if statuses:
         query = query.filter(SavedJob.status.in_(statuses))
-    return query.order_by(SavedJob.updated_at.desc()).limit(limit).all()
+    return (
+        query.order_by(SavedJob.updated_at.desc())
+        .limit(max(1, min(limit, MAX_TRACKER_ROWS)))
+        .all()
+    )
+
+
+def saved_jobs_for_listings(
+    db: Session, profile_id: int, listing_ids: list[int]
+) -> dict[int, SavedJob]:
+    """This student's saved rows for exactly these listings, keyed by listing id.
+
+    Search, home and saved-search-run all need to know which of the ~20 jobs on the page the
+    student has already saved. Each of them previously answered that by loading the student's
+    most recent 500 saved rows joined to their listings and building a dict from it -- three or
+    four hundred rows of joined data read to annotate twenty, and wrong past the cap: a student
+    with more than 500 saved jobs would see an older save reported as unsaved, and saving it
+    again would silently reopen a row that was already in their tracker at a different status.
+
+    Asking for the listings actually on the page is both smaller and exact at any tracker size.
+    """
+    if not listing_ids:
+        return {}
+    rows = (
+        db.query(SavedJob)
+        .filter(
+            SavedJob.profile_id == profile_id,
+            SavedJob.listing_id.in_(listing_ids),
+        )
+        .all()
+    )
+    return {row.listing_id: row for row in rows}
 
 
 def get_saved_job_matches(
@@ -865,9 +1024,18 @@ def get_saved_job_matches(
     stale = [row for row in rows if row.score_version != matching.SCORE_VERSION]
     if stale:
         search_profile = get_or_create_search_profile(db, profile_id)
+        # One query for every stale row's listing rather than one per row. Normally there are
+        # no stale rows at all, but the run right after a SCORE_VERSION bump has every tracked
+        # row stale at once -- up to MAX_TRACKER_ROWS single-row reads on one tracker open.
+        listings = {
+            listing.id: listing
+            for listing in db.query(JobListing)
+            .filter(JobListing.id.in_({row.listing_id for row in stale}))
+            .all()
+        }
         refreshed = []
         for row in stale:
-            listing = db.get(JobListing, row.listing_id)
+            listing = listings.get(row.listing_id)
             if listing is None:
                 # The shared listing was pruned out from under a saved row. Nothing to
                 # rescore against, so the old row is left as-is rather than guessed at.
@@ -898,16 +1066,46 @@ def create_saved_search(
 
 
 def list_saved_searches(db: Session, profile_id: int) -> list[JobSavedSearch]:
+    """Every saved search this student has, newest first.
+
+    The cap was 50, which is the same silent-truncation shape the tracker had: there is no
+    "load more" on the saved-searches screen, so the 51st search would simply not be there and
+    nothing would say so. Raised to the documented ceiling below, which no realistic student
+    reaches -- saved searches are created one at a time, by hand.
+
+    Note what this is *not*: a limit on how many a student may create. Nothing caps that today,
+    and inventing a number would be setting a product policy rather than fixing a defect.
+    """
     return (
         db.query(JobSavedSearch)
         .filter(JobSavedSearch.profile_id == profile_id)
         .order_by(JobSavedSearch.created_at.desc())
-        .limit(50)
+        .limit(MAX_SAVED_SEARCHES)
         .all()
     )
 
 
 def delete_saved_search(db: Session, profile_id: int, saved_search_id: int) -> None:
+    """Delete a saved search, and settle the two things that point at it first.
+
+    Both `saved_jobs.source_saved_search_id` and `job_alerts.saved_search_id` are real foreign
+    keys. Deleting the parent without clearing them raises an IntegrityError on PostgreSQL --
+    a 500 on an ordinary "remove this search" tap. It did not show up in tests because SQLite
+    does not enforce foreign keys unless `PRAGMA foreign_keys=ON` is set, which nothing here
+    sets; tests/api/test_job_hunt_fk_integrity.py turns it on for exactly this reason.
+
+    The two dependants are settled differently, because they mean different things:
+
+    * A tracked job keeps its row and its `source="saved_search"`, losing only the id. The
+      student really did find that job through a search, and rewriting the provenance to
+      "manual" would make the tracker falsify its own history. The display already handles a
+      missing name (see _to_saved_read), so this is the behaviour the tracker was written for.
+
+    * An alert bound to the search is deleted with it. Its filters were read live from the
+      search, so a surviving alert would have nothing to search on -- it would sit in the
+      student's list reporting "not configured" forever, which is worse than it being gone.
+      Deliveries go first, since they reference the alert.
+    """
     saved_search = (
         db.query(JobSavedSearch)
         .filter(
@@ -917,6 +1115,29 @@ def delete_saved_search(db: Session, profile_id: int, saved_search_id: int) -> N
     )
     if saved_search is None:
         raise SavedJobNotFoundError(f"Saved search {saved_search_id} not found")
+
+    db.query(SavedJob).filter(
+        SavedJob.profile_id == profile_id,
+        SavedJob.source_saved_search_id == saved_search.id,
+    ).update({SavedJob.source_saved_search_id: None}, synchronize_session=False)
+
+    orphaned_alert_ids = [
+        row.id
+        for row in db.query(JobAlert.id)
+        .filter(
+            JobAlert.profile_id == profile_id,
+            JobAlert.saved_search_id == saved_search.id,
+        )
+        .all()
+    ]
+    if orphaned_alert_ids:
+        db.query(JobAlertDelivery).filter(
+            JobAlertDelivery.alert_id.in_(orphaned_alert_ids)
+        ).delete(synchronize_session=False)
+        db.query(JobAlert).filter(JobAlert.id.in_(orphaned_alert_ids)).delete(
+            synchronize_session=False
+        )
+
     db.delete(saved_search)
     db.commit()
 
@@ -1091,28 +1312,25 @@ def top_matches(
     silently rescoring a page of jobs on every app open would turn a cheap read into the most
     expensive call in the product. They reappear the moment the student searches or opens one.
     """
-    dismissed = {
-        row.listing_id
-        for row in db.query(SavedJob.listing_id)
+    # Dismissed jobs are excluded in SQL rather than fetched and filtered out afterwards.
+    # Over-fetching by the number of dismissals meant the home screen's query grew with every
+    # job the student ever hid -- an account that had dismissed five hundred jobs read five
+    # hundred and five rows to show five.
+    dismissed = (
+        db.query(SavedJob.listing_id)
         .filter(SavedJob.profile_id == profile_id, SavedJob.status == "dismissed")
-        .all()
-    }
+        .scalar_subquery()
+    )
     rows = (
         db.query(JobListingMatch, JobListing)
         .join(JobListing, JobListing.id == JobListingMatch.listing_id)
         .filter(JobListingMatch.profile_id == profile_id)
         .filter(JobListingMatch.score_version == matching.SCORE_VERSION)
+        .filter(JobListingMatch.listing_id.notin_(dismissed))
         .order_by(JobListingMatch.total_score.desc(), JobListing.id)
-        .limit(max(1, limit) + len(dismissed))
+        .limit(max(1, limit))
         .all()
     )
-    listings: list[JobListing] = []
-    matches: dict[int, JobListingMatch] = {}
-    for match, listing in rows:
-        if listing.id in dismissed:
-            continue
-        listings.append(listing)
-        matches[listing.id] = match
-        if len(listings) >= limit:
-            break
+    listings = [listing for _match, listing in rows]
+    matches = {listing.id: match for match, listing in rows}
     return listings, matches

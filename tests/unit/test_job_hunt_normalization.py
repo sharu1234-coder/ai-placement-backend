@@ -198,10 +198,81 @@ class TestSafeExternalUrl:
         metadata endpoint -- the highest-value SSRF target there is."""
         assert safe_external_url(internal) is None
 
+    @pytest.mark.parametrize(
+        "obfuscated",
+        [
+            "http://2130706433/admin",          # 127.0.0.1 as one decimal integer
+            "http://0x7f000001/admin",          # the same address in hex
+            "http://0177.0.0.1/admin",          # octal first octet
+            "http://[::1]/admin",               # IPv6 loopback
+            "http://[::ffff:127.0.0.1]/admin",  # IPv4-mapped IPv6 loopback
+            "http://[fd00::1]/admin",           # IPv6 unique-local, the v6 RFC1918
+            "http://[fe80::1]/admin",           # IPv6 link-local
+        ],
+    )
+    def test_rejects_the_same_internal_addresses_written_a_different_way(self, obfuscated):
+        """Every one of these reached the same places the dotted-quad forms above do, and every
+        one of them was accepted before.
+
+        The first check matched on string prefixes ("127.", "10.", "192.168."), which is a test
+        of how an address is *spelled* rather than where it points. All seven spellings here
+        resolve to loopback or to a private range, and a prefix check cannot see any of them --
+        including the entire IPv6 family, of which only the literal "::1" was listed by name.
+        """
+        assert safe_external_url(obfuscated) is None
+
     def test_a_public_address_in_the_same_shape_as_a_private_one_is_still_allowed(self):
         """172.32.x is outside the RFC1918 172.16-172.31 range, so the regex must not be a
         loose "172." prefix check."""
         assert safe_external_url("http://172.32.0.1/jobs") is not None
+
+    @pytest.mark.parametrize(
+        "special",
+        [
+            "http://224.0.0.1/admin",          # IPv4 multicast, "all hosts on this subnet"
+            "http://239.255.255.250/admin",    # SSDP -- every UPnP device on the LAN
+            "http://[ff02::1]/admin",          # IPv6 all-nodes multicast
+            "http://255.255.255.255/admin",    # IPv4 broadcast
+            "http://[::]/admin",               # unspecified
+            "http://100.64.0.1/admin",         # CGNAT shared address space
+        ],
+    )
+    def test_rejects_multicast_broadcast_and_other_non_unicast_addresses(self, special):
+        """`ipaddress.is_global` is not sufficient on its own: it reports 224.0.0.1 as global,
+        and an address meaning "every device on this network" is plainly not where a job advert
+        lives. Multicast is therefore checked separately from the global test."""
+        assert safe_external_url(special) is None
+
+    def test_a_public_ip_literal_is_still_allowed(self):
+        """Rejecting every numeric host would be the easy over-correction. Some job boards do
+        serve adverts from a bare public address, and that is not our business to block."""
+        assert safe_external_url("https://8.8.8.8/jobs/1") is not None
+
+    @pytest.mark.parametrize(
+        "real",
+        [
+            "https://www.adzuna.co.uk/land/ad/1234567890",
+            "https://www.careerjet.co.in/jobad/inabcdef",
+            "http://jobs.example.co.in/vacancy?id=7#apply",
+            "https://sub.domain.example.museum/a",
+        ],
+    )
+    def test_the_shapes_real_job_adverts_actually_take_are_untouched(self, real):
+        """The guard against over-blocking. The new check requires a dotted host whose last
+        label contains a letter, and this is the evidence that no real advert URL fails it."""
+        assert safe_external_url(real) == real
+
+    def test_a_hostname_is_accepted_on_its_name_and_that_limit_is_deliberate(self):
+        """Pins the exact contract so nobody mistakes this for a complete SSRF defence.
+
+        DNS is not resolved. "internal.corp.example" may point at 10.0.0.5 and is accepted.
+        Resolving here would prove nothing about where a later request goes -- the name can
+        resolve differently a second later, which is DNS rebinding, and a storage-time check
+        is the shape it defeats. The guarantee is exact and narrower than it looks: an address
+        *literal* cannot name a non-public host. A server-side fetch, if one is ever added,
+        must check at connect time against the address actually connected to.
+        """
+        assert safe_external_url("http://internal.corp.example/jobs") is not None
 
     def test_none_and_empty_are_rejected_without_raising(self):
         assert safe_external_url(None) is None

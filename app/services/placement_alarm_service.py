@@ -228,7 +228,19 @@ def start_challenge(
         # retry starts clean, and surface a clear error instead of an opaque 500. Any Question
         # rows already committed in earlier loop iterations are left in place -- harmless,
         # unreferenced catalog rows -- rather than risk deleting shared data.
+        #
+        # The attempt rows are a different matter and must go first. The loop commits once per
+        # question, and that commit also persists the *previous* iteration's attempt row, so a
+        # failure part-way through leaves committed attempts pointing at this challenge. The
+        # rollback does not touch those, and placement_alarm_question_attempts.challenge_id is
+        # a real foreign key -- so on PostgreSQL the delete below raised instead of running,
+        # leaving exactly the permanently-stuck challenge this handler exists to prevent.
+        # SQLite does not enforce foreign keys unless asked, which is why the suite never saw
+        # it (see tests/api/test_job_hunt_fk_integrity.py for where that gap is closed).
         db.rollback()
+        db.query(PlacementAlarmQuestionAttempt).filter(
+            PlacementAlarmQuestionAttempt.challenge_id == challenge.id
+        ).delete(synchronize_session=False)
         db.delete(challenge)
         db.commit()
         raise ChallengeGenerationError("Couldn't generate challenge questions -- please try again")

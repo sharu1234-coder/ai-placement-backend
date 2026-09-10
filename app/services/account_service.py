@@ -20,6 +20,7 @@ from app.models.interview_evaluation import InterviewEvaluation
 from app.models.interview_question import InterviewQuestion
 from app.models.job_alert import JobAlert, JobAlertDelivery
 from app.models.job_description import JobDescription
+from app.models.job_hunt_usage import JobHuntUsage
 from app.models.job_listing_match import JobListingMatch
 from app.models.job_match import JobMatch
 from app.models.job_preparation_plan import JobPreparationPlan
@@ -139,6 +140,16 @@ def delete_account(db: Session, user: User, storage: StorageProvider) -> None:
         db.query(JobAlert).filter(JobAlert.profile_id == pid).delete(synchronize_session=False)
         db.query(SavedJob).filter(SavedJob.profile_id == pid).delete(synchronize_session=False)
         db.query(JobSavedSearch).filter(JobSavedSearch.profile_id == pid).delete(
+            synchronize_session=False
+        )
+        # The Job Hunt entitlement ledger. A pure leaf -- it references student_profiles and
+        # nothing references it -- so its position here is only about being before the profile
+        # row itself. Deleting it is correct and is not a way around the one free search: the
+        # only route to this code is the owner erasing their whole account, which takes their
+        # resumes, interviews and tracker with it. (What it does mean is that the free search
+        # is per account, so a new signup gets a new one; closing that would need identity
+        # beyond an email address, and is flagged in the report rather than assumed.)
+        db.query(JobHuntUsage).filter(JobHuntUsage.profile_id == pid).delete(
             synchronize_session=False
         )
         db.query(NotificationEvent).filter(NotificationEvent.profile_id == pid).delete(synchronize_session=False)

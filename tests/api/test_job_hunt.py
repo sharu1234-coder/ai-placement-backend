@@ -28,6 +28,7 @@ from app.services.job_hunt.providers.base import (
 )
 from app.services.job_hunt.providers.factory import get_job_provider
 from tests.fixtures.pdf_helpers import make_pdf_with_text
+from tests.fixtures.premium_helpers import grant_premium
 
 _NOW = datetime.datetime(2026, 9, 7, 12, 0, 0)
 
@@ -117,12 +118,35 @@ def isolated_upload_dir(tmp_path, monkeypatch):
 
 @pytest.fixture()
 def premium(monkeypatch):
-    """Flip the server-side entitlement check the search route consults."""
+    """Flip the server-side entitlement check the search route consults.
+
+    Scoped to the advanced-filter gate only (app.api.job_hunt.is_premium). It deliberately
+    does NOT touch the Job Hunt usage ledger, which reads its own entitlement -- those are
+    separate questions ("may you filter by salary" versus "may you search again"), and a
+    fixture that answered both would make it impossible to test either alone. A test that
+    needs unlimited searches uses `subscribed` below.
+    """
 
     def _set(value: bool):
         monkeypatch.setattr("app.api.job_hunt.is_premium", lambda db, profile_id: value)
 
     return _set
+
+
+@pytest.fixture()
+def subscribed(client):
+    """A real, paid, unexpired subscription for the test account.
+
+    A row rather than a patched predicate, so what is being exercised is the actual
+    subscription_service.is_premium the entitlement ledger calls. Used by the handful of tests
+    that legitimately run more than one Job Hunt operation -- unlimited searching is what a
+    subscription buys, so a test that searches twice is a test about a subscriber.
+    """
+    from app.api.deps import get_db
+
+    session = next(app.dependency_overrides[get_db]())
+    grant_premium(session, "hunt@example.com")
+    return session
 
 
 def upload_resume(client, auth_headers) -> int:
@@ -400,6 +424,70 @@ class TestSearch:
         assert client.post("/job-hunt/search", json={"page": 0}, headers=auth_headers).status_code == 422
 
 
+class TestPaginationBoundaries:
+    """Both bounds are enforced twice on purpose: once by the request schema, which only sees
+    the HTTP path, and once in the service, which is also reached from a stored filter set."""
+
+    def test_a_page_past_the_ceiling_is_rejected_rather_than_silently_emptied(
+        self, client, auth_headers, use_provider
+    ):
+        use_provider(FakeJobProvider())
+        client.put(
+            "/job-hunt/profile",
+            json={"target_role_title": "Software Engineer"},
+            headers=auth_headers,
+        )
+
+        assert client.post(
+            "/job-hunt/search", json={"page": 11}, headers=auth_headers
+        ).status_code == 422
+        assert client.post(
+            "/job-hunt/search", json={"page": 0}, headers=auth_headers
+        ).status_code == 422
+        assert client.post(
+            "/job-hunt/search", json={"page_size": 51}, headers=auth_headers
+        ).status_code == 422
+
+    def test_the_service_clamps_a_page_the_schema_never_saw(
+        self, client, auth_headers, use_provider
+    ):
+        """A stored filter set reaches search() without passing through the request schema.
+        Careerjet refuses a page past 10 outright, so an unclamped value would come back as a
+        silent empty result -- indistinguishable, to a student, from an empty job market."""
+        from app.api.deps import get_db
+        from app.models.user import User
+        from app.services.job_hunt import service as job_hunt_service
+        from app.services.profile_service import get_or_create_profile
+
+        provider = use_provider(FakeJobProvider())
+        client.put(
+            "/job-hunt/profile",
+            json={"target_role_title": "Software Engineer"},
+            headers=auth_headers,
+        )
+
+        session = next(app.dependency_overrides[get_db]())
+        profile = get_or_create_profile(session, session.query(User).first())
+        job_hunt_service.search_jobs_with_filters(
+            session, profile, provider, {"page": 9999, "keywords": "engineer"}
+        )
+
+        assert provider.last_query.page == job_hunt_service.MAX_PAGE
+
+    def test_the_last_page_is_reachable(self, client, auth_headers, use_provider):
+        provider = use_provider(FakeJobProvider())
+        client.put(
+            "/job-hunt/profile",
+            json={"target_role_title": "Software Engineer"},
+            headers=auth_headers,
+        )
+
+        resp = client.post("/job-hunt/search", json={"page": 10}, headers=auth_headers)
+
+        assert resp.status_code == 200
+        assert provider.last_query.page == 10
+
+
 class TestProviderFailuresAreDistinguishable:
     """Each failure class gets its own status code, because the client has to tell them apart
     and must never parse an error string to do it."""
@@ -419,6 +507,74 @@ class TestProviderFailuresAreDistinguishable:
         client.put("/job-hunt/profile", json={"target_role_title": "Software Engineer"}, headers=auth_headers)
         resp = client.post("/job-hunt/search", json={}, headers=auth_headers)
         assert resp.status_code == expected_status
+
+    def test_a_quiet_job_market_is_a_200_and_an_outage_is_not(
+        self, client, auth_headers, use_provider, subscribed
+    ):
+        """The distinction the whole error taxonomy exists for.
+
+        "No jobs match you" is a claim about the labour market. "We could not look" is a claim
+        about us. A student shown the first when the second is true concludes there is no work
+        for them -- so an empty result and an unavailable provider must never arrive looking
+        alike, and the client must be able to tell them apart from the status code alone,
+        without parsing any message.
+
+        Runs as a subscriber because it makes two searches, and one free search cannot pay for
+        two. The distinction being checked here is about provider outcomes, not entitlement.
+        """
+        client.put(
+            "/job-hunt/profile",
+            json={"target_role_title": "Software Engineer"},
+            headers=auth_headers,
+        )
+
+        use_provider(FakeJobProvider(jobs=[], total=0))
+        empty = client.post("/job-hunt/search", json={}, headers=auth_headers)
+        assert empty.status_code == 200
+        assert empty.json()["results"] == []
+        assert empty.json()["total_available"] == 0
+
+        use_provider(FakeJobProvider(error=JobProviderNotConfiguredError("no key")))
+        unavailable = client.post("/job-hunt/search", json={}, headers=auth_headers)
+        assert unavailable.status_code == 503
+        assert unavailable.status_code != empty.status_code
+
+    def test_a_provider_that_reports_no_total_is_not_read_as_zero_jobs(
+        self, client, auth_headers, use_provider
+    ):
+        """A missing total means "the provider did not say", which is a third thing again --
+        it must not be flattened into 0, which would read as an empty market."""
+        use_provider(FakeJobProvider(jobs=[provider_job()], total=None))
+        client.put(
+            "/job-hunt/profile",
+            json={"target_role_title": "Software Engineer"},
+            headers=auth_headers,
+        )
+
+        body = client.post("/job-hunt/search", json={}, headers=auth_headers).json()
+
+        assert body["total_available"] is None
+        assert len(body["results"]) == 1
+
+    def test_a_malformed_provider_payload_is_an_outage_not_an_empty_result(
+        self, client, auth_headers, use_provider
+    ):
+        """A body we cannot parse tells us nothing about the job market. Reading it as "no
+        results" would turn every provider-side format change into a silent, product-wide
+        claim that there are no jobs."""
+        use_provider(
+            FakeJobProvider(error=JobProviderUnavailableError("Adzuna returned a non-JSON body"))
+        )
+        client.put(
+            "/job-hunt/profile",
+            json={"target_role_title": "Software Engineer"},
+            headers=auth_headers,
+        )
+
+        resp = client.post("/job-hunt/search", json={}, headers=auth_headers)
+
+        assert resp.status_code == 502
+        assert "results" not in resp.json()
 
     def test_no_failure_ever_returns_fabricated_jobs(self, client, auth_headers, use_provider):
         """The single most important guarantee in the feature."""
@@ -477,6 +633,88 @@ class TestPremiumGating:
         resp = client.post("/job-hunt/search", json=advanced_filter, headers=auth_headers)
         assert resp.status_code == 403
         assert "Premium" in resp.json()["detail"]
+
+    def test_a_saved_search_cannot_be_used_to_run_advanced_filters_for_free(
+        self, client, auth_headers, use_provider, premium
+    ):
+        """The paywall has to hold on every path that reaches the provider, not just /search.
+
+        POST /saved-searches stores whatever filter set it is given, and
+        POST /saved-searches/{id}/run replays it. Checking entitlement only on /search left
+        the whole advanced-filter paywall bypassable in two ordinary requests -- store the
+        filters once, run the search as often as you like.
+        """
+        premium(False)
+        provider = use_provider(FakeJobProvider())
+        client.put(
+            "/job-hunt/profile",
+            json={"target_role_title": "Software Engineer"},
+            headers=auth_headers,
+        )
+
+        created = client.post(
+            "/job-hunt/saved-searches",
+            json={"name": "Well paid", "filters": {"salary_min": 500000}},
+            headers=auth_headers,
+        )
+        # Refused at the point of storing, so the student is told now rather than being handed
+        # a saved search that fails every time they tap it.
+        assert created.status_code == 403
+        assert "Premium" in created.json()["detail"]
+        assert provider.last_query is None, "no provider call may have been made"
+
+    def test_a_saved_search_stored_while_premium_stops_running_once_it_lapses(
+        self, client, auth_headers, use_provider, premium
+    ):
+        """Entitlement is checked against the plan at run time, not at creation time. A
+        subscription that lapses must not leave premium filtering switched on forever."""
+        premium(True)
+        provider = use_provider(FakeJobProvider())
+        client.put(
+            "/job-hunt/profile",
+            json={"target_role_title": "Software Engineer"},
+            headers=auth_headers,
+        )
+        search_id = client.post(
+            "/job-hunt/saved-searches",
+            json={"name": "Well paid", "filters": {"salary_min": 500000}},
+            headers=auth_headers,
+        ).json()["id"]
+        assert client.post(
+            f"/job-hunt/saved-searches/{search_id}/run", headers=auth_headers
+        ).status_code == 200
+
+        premium(False)
+        provider.last_query = None
+        lapsed = client.post(
+            f"/job-hunt/saved-searches/{search_id}/run", headers=auth_headers
+        )
+
+        assert lapsed.status_code == 403
+        assert provider.last_query is None
+
+    def test_a_free_saved_search_still_runs(self, client, auth_headers, use_provider, premium):
+        """The guard against over-blocking: keywords, location and work mode stay free, so an
+        ordinary saved search must be unaffected by any of the above."""
+        premium(False)
+        use_provider(FakeJobProvider())
+        client.put(
+            "/job-hunt/profile",
+            json={"target_role_title": "Software Engineer"},
+            headers=auth_headers,
+        )
+        search_id = client.post(
+            "/job-hunt/saved-searches",
+            json={
+                "name": "Remote engineer",
+                "filters": {"keywords": "engineer", "location": "Bengaluru", "work_mode": "remote"},
+            },
+            headers=auth_headers,
+        ).json()["id"]
+
+        assert client.post(
+            f"/job-hunt/saved-searches/{search_id}/run", headers=auth_headers
+        ).status_code == 200
 
     def test_advanced_filters_work_for_premium_users(self, client, auth_headers, use_provider, premium):
         premium(True)
@@ -582,14 +820,49 @@ class TestSavedJobs:
         assert client.delete(f"/job-hunt/saved/{saved_id}", headers=auth_headers).status_code == 204
         assert client.get("/job-hunt/saved", headers=auth_headers).json() == []
 
-    def test_a_search_reports_which_results_are_already_saved(self, client, auth_headers, use_provider):
-        """So the card renders the right control without a second round trip."""
+    def test_a_search_reports_which_results_are_already_saved(
+        self, client, auth_headers, use_provider, subscribed
+    ):
+        """So the card renders the right control without a second round trip.
+
+        Two searches -- one to produce a listing worth saving, one to see it reported back --
+        so this runs as a subscriber."""
         listing_id = seed_listing(client, auth_headers, use_provider)
         client.post("/job-hunt/saved", json={"listing_id": listing_id}, headers=auth_headers)
 
         results = client.post("/job-hunt/search", json={}, headers=auth_headers).json()["results"]
         assert results[0]["saved_job_id"] is not None
         assert results[0]["saved_status"] == "saved"
+
+
+class TestTrackerStatusFilter:
+    def test_a_known_status_filters(self, client, auth_headers, use_provider):
+        listing_id = seed_listing(client, auth_headers, use_provider)
+        client.post(
+            "/job-hunt/saved",
+            json={"listing_id": listing_id, "status": "applied"},
+            headers=auth_headers,
+        )
+
+        applied = client.get("/job-hunt/saved?status=applied", headers=auth_headers)
+        saved = client.get("/job-hunt/saved?status=saved", headers=auth_headers)
+
+        assert len(applied.json()) == 1
+        assert saved.json() == []
+
+    def test_an_unknown_status_is_a_bad_request_not_an_empty_tracker(
+        self, client, auth_headers, use_provider
+    ):
+        """An unrecognised value used to filter to nothing and render as "you have no
+        applications" -- which reads as data loss, in the screen where data loss matters most.
+        It is a 422 that names the valid values instead."""
+        listing_id = seed_listing(client, auth_headers, use_provider)
+        client.post("/job-hunt/saved", json={"listing_id": listing_id}, headers=auth_headers)
+
+        resp = client.get("/job-hunt/saved?status=aplied", headers=auth_headers)
+
+        assert resp.status_code == 422
+        assert "applied" in resp.text, "the error should name what is allowed"
 
 
 class TestJobDetail:

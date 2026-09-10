@@ -27,7 +27,17 @@ ALERT_FREQUENCIES = ("daily", "weekly")
 
 # Terminal-ish states an alert run can end in, recorded so the student can be told the truth
 # about why an alert has gone quiet rather than being left to assume there are no jobs.
-ALERT_RUN_STATUSES = ("success", "no_new_jobs", "provider_error", "not_configured", "skipped_quiet_hours")
+ALERT_RUN_STATUSES = (
+    "success",
+    "no_new_jobs",
+    "provider_error",
+    "not_configured",
+    "skipped_quiet_hours",
+    # The alert is configured and due, but background runs need an active subscription --
+    # see the reasoning in job_hunt/alerts.run_alert. Its own state rather than folded into
+    # "not_configured", because nothing about the alert needs fixing.
+    "requires_premium",
+)
 
 
 class JobAlert(Base):

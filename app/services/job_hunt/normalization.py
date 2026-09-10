@@ -11,6 +11,7 @@ Skill comparison reuses skill_matching's token-subset rule rather than reimpleme
 future fix to that rule fixes every feature at once.
 """
 
+import ipaddress
 import re
 from typing import Iterable, Optional
 from urllib.parse import urlparse
@@ -300,9 +301,61 @@ def safe_external_url(url: Optional[str]) -> Optional[str]:
     host = (parsed.hostname or "").lower().strip("[]")
     if not host or host in _BLOCKED_URL_HOSTS:
         return None
-    # 127.0.0.0/8 in full, plus the RFC1918 ranges and link-local metadata addresses.
-    if host.startswith("127.") or host.startswith("10.") or host.startswith("192.168.") or host.startswith("169.254."):
-        return None
-    if re.match(r"^172\.(1[6-9]|2\d|3[01])\.", host):
+    if _is_non_public_address(host):
         return None
     return candidate
+
+
+def _is_non_public_address(host: str) -> bool:
+    """True for anything that is not a public DNS name.
+
+    Prefix matching on the dotted-quad form (the first version of this check) let six things
+    through, each of which resolves to somewhere it should not:
+
+        http://2130706433/          127.0.0.1 written as a single decimal
+        http://0x7f000001/          the same address in hex
+        http://0177.0.0.1/          the same address with an octal first octet
+        http://[::1]/               IPv6 loopback -- caught by name, but only by name
+        http://[::ffff:127.0.0.1]/  IPv4-mapped loopback
+        http://[fd00::1]/           IPv6 unique-local, the v6 equivalent of 10.0.0.0/8
+
+    `ipaddress` parses the canonical forms and answers the question properly, which covers
+    loopback, private, link-local, reserved and unspecified in both families at once.
+
+    What this deliberately does NOT do is resolve DNS. `http://internal.corp.example/` may
+    well point at 10.0.0.5, and this function accepts it. That is a considered limit, not an
+    oversight:
+
+      * Resolving here would prove nothing about where a later request actually goes. The name
+        can resolve differently a second later -- that is DNS rebinding, and a check at storage
+        time is precisely the shape it defeats. A validator that looks thorough and is not is
+        worse than one whose limits are written down.
+      * It would put a DNS lookup in the hot path of every listing on every search page.
+
+    The guarantee this function offers is therefore exact: *an address literal* cannot name a
+    non-public host. If a server-side fetch of listing URLs is ever added, the check it needs
+    is at connect time against the address actually connected to, not here.
+
+    What `ipaddress` will not parse is the deliberately obfuscated forms: it rejects a leading
+    zero as ambiguous and does not accept hex at all, so `0177.0.0.1` and `0x7f000001` would
+    fall through as if they were hostnames. So anything that is not a parseable address must
+    still look like a real DNS name to pass, and the test for that is the one property every
+    public domain has and every numeric-obfuscated address lacks: a dotted name whose last
+    label contains a letter. No real job advert URL fails it -- every public TLD is alphabetic.
+    """
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        # `is_global` already covers loopback, private, link-local, reserved, unspecified and
+        # the CGNAT range, in both families. Multicast is checked separately because it does
+        # not: ipaddress reports 224.0.0.1 -- "all hosts on this subnet" -- as global, and it
+        # is plainly not somewhere a job advert lives.
+        return not address.is_global or address.is_multicast
+    labels = host.split(".")
+    if len(labels) < 2:
+        # A single label is either an intranet name or an obfuscated address; neither is a
+        # public job advert.
+        return True
+    return not any(character.isalpha() for character in labels[-1])

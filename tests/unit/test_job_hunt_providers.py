@@ -156,6 +156,30 @@ class TestAdzunaAdapter:
         with pytest.raises(JobProviderNotConfiguredError):
             AdzunaJobProvider(None, None).search(QUERY)
 
+    @pytest.mark.parametrize("country,expected", [("in", "INR"), ("gb", "GBP"), ("us", "USD")])
+    def test_the_currency_follows_the_country_endpoint_that_was_queried(self, country, expected):
+        """Adzuna's API is one endpoint per country and the response carries no currency code,
+        so the country is the only thing that says what the numbers mean.
+
+        Only "in" was mapped before, so licensing any other market would have produced a
+        salary with no currency beside it -- a six-figure number that every reader would take
+        to be in their own money."""
+        job = AdzunaJobProvider("id", "key", country)._parse_job(ADZUNA_PAYLOAD["results"][0])
+        assert job.salary_currency == expected
+
+    def test_a_country_adzuna_has_not_launched_yields_no_currency_rather_than_a_guess(self):
+        job = AdzunaJobProvider("id", "key", "zz")._parse_job(ADZUNA_PAYLOAD["results"][0])
+        assert job.salary_currency is None
+
+    @pytest.mark.parametrize("country", ["", "india", "IN/../", "i", None])
+    def test_a_malformed_country_is_a_configuration_error_not_an_outage(self, country):
+        """It goes straight into the URL path, so a bad value produces a 404 that the API
+        layer would report to students as "the job service isn't responding" -- an outage
+        message for a setting the operator can fix in one line. The two are deliberately
+        different error classes everywhere else in this module, and this is no exception."""
+        with pytest.raises(JobProviderNotConfiguredError):
+            AdzunaJobProvider("id", "key", country).search(QUERY)
+
     @pytest.mark.parametrize(
         "status_code,expected",
         [

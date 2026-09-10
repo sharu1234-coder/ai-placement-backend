@@ -21,6 +21,7 @@ the same adapter serves whichever market the owner licenses.
 
 import datetime
 import logging
+import re
 from typing import Any, Optional
 
 from app.services.job_hunt.providers.base import (
@@ -41,6 +42,20 @@ logger = logging.getLogger(__name__)
 _ROOT_URL = "https://api.adzuna.com/v1/api"
 # Adzuna caps results_per_page; 50 is the documented maximum for the search endpoint.
 _MAX_PAGE_SIZE = 50
+# Two lowercase letters, matching Adzuna's documented country codes.
+_COUNTRY_RE = re.compile(r"[a-z]{2}")
+
+# Adzuna's API is one endpoint per country, and the response carries no currency code -- the
+# country determines it. Every country Adzuna documents is listed, so a salary is never shown
+# as a bare number with no unit: the Android side prints the code it is given and nothing at
+# all when it is given None, which for a 6-figure salary reads as an amount in the reader's
+# own currency. Sourced from Adzuna's country list, not inferred.
+_CURRENCY_BY_COUNTRY = {
+    "at": "EUR", "au": "AUD", "be": "EUR", "br": "BRL", "ca": "CAD", "ch": "CHF",
+    "de": "EUR", "es": "EUR", "fr": "EUR", "gb": "GBP", "in": "INR", "it": "EUR",
+    "mx": "MXN", "nl": "EUR", "nz": "NZD", "pl": "PLN", "sg": "SGD", "us": "USD",
+    "za": "ZAR",
+}
 
 
 class AdzunaJobProvider(JobProvider):
@@ -67,6 +82,14 @@ class AdzunaJobProvider(JobProvider):
         if not self._app_id or not self._app_key:
             raise JobProviderNotConfiguredError(
                 "Adzuna is selected as JOB_PROVIDER but ADZUNA_APP_ID/ADZUNA_APP_KEY are unset"
+            )
+        # The country goes into the URL path. A malformed one would produce a 404 that reads
+        # as "the job service isn't responding" -- an outage message for what is actually a
+        # deployment setting nobody has checked. Distinguishing the two is the whole point of
+        # having a NotConfigured error separate from an Unavailable one.
+        if not _COUNTRY_RE.fullmatch(self._country or ""):
+            raise JobProviderNotConfiguredError(
+                f"ADZUNA_COUNTRY must be a two-letter country code, not {self._country!r}"
             )
 
         params: dict[str, Any] = {
@@ -181,7 +204,10 @@ class AdzunaJobProvider(JobProvider):
             salary_max=_as_int(raw.get("salary_max")),
             # The API is per-country and this deployment's country determines the currency;
             # Adzuna does not return a currency code per advert.
-            salary_currency="INR" if self._country == "in" else None,
+            # None for a country Adzuna adds later: an unknown currency is shown as no
+            # currency rather than guessed at, which is the same rule every other field here
+            # follows.
+            salary_currency=_CURRENCY_BY_COUNTRY.get(self._country),
             salary_period="year",
             salary_is_predicted=salary_is_predicted,
             description=raw.get("description") if isinstance(raw.get("description"), str) else None,

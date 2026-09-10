@@ -102,6 +102,11 @@ class Settings(BaseSettings):
     #   * "careerjet" -- requires a partner account for the affiliate id, and contractually
     #                    requires sending each END USER's IP and user agent on every query,
     #                    which is a real privacy disclosure to a third party.
+    #   * "jobvetta"  -- India-only coverage, and a hard ceiling of 50 requests per key per
+    #                    UTC day shared by the whole deployment. That ceiling is a property of
+    #                    the key, not of any student's plan: a premium subscription is
+    #                    unlimited Job Hunt, and is still subject to it. See
+    #                    app/services/job_hunt/provider_budget.py.
     job_provider: str = "none"
     adzuna_app_id: Optional[str] = None
     adzuna_app_key: Optional[str] = None
@@ -109,6 +114,11 @@ class Settings(BaseSettings):
     adzuna_country: str = "in"
     careerjet_affid: Optional[str] = None
     careerjet_locale_code: str = "en_IN"
+    # Bearer token for https://api.jobvetta.com/v1. Supplied through the environment only --
+    # never committed, never logged, never returned to the client, and never given a
+    # placeholder default here: a fake default would make an unconfigured deployment look
+    # configured and turn "not set up" into a stream of 401s from the provider.
+    jobvetta_api_key: Optional[str] = None
 
     # Comma-separated Host header allowlist (TrustedHostMiddleware, app/main.py). "*" (dev
     # default) accepts any Host -- fine locally, but a production deployment should set

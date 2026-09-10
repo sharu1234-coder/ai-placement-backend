@@ -18,6 +18,7 @@ from one that does not exist, so 404, never 403.
 
 import pytest
 
+from app.api.deps import get_db
 from app.main import app
 from app.services.job_hunt.providers.factory import get_job_provider
 from tests.api.test_job_hunt import FakeJobProvider, provider_job
@@ -135,6 +136,105 @@ class TestSavedSearchIsolation:
             f"DELETE /job-hunt/saved-searches/{search_id}",
         )
         assert len(client.get("/job-hunt/saved-searches", headers=alice).json()) == 1
+
+
+class TestSavedJobProvenanceIsolation:
+    """`source_saved_search_id` is a cross-user id supplied in a request body.
+
+    Every *path* id in Job Hunt is scoped to the caller's profile, but this one arrives in the
+    body of POST /job-hunt/saved and was stored unchecked, then resolved for display with a
+    bare primary-key lookup. Two unscoped steps in a row: a student could tag their own saved
+    job with another student's saved-search id and read that student's saved-search *name*
+    back out of their own tracker. Saved-search names are user-authored text -- "Dubai Data
+    Analyst - Priya referral" is a plausible one.
+    """
+
+    def test_tagging_a_saved_job_with_another_students_search_is_refused(
+        self, client, alice, bob, use_provider
+    ):
+        bob_search_id = client.post(
+            "/job-hunt/saved-searches",
+            json={"name": "Bob's private search", "filters": {"keywords": "data"}},
+            headers=bob,
+        ).json()["id"]
+        listing_id, _saved = seed_saved_job(client, alice, use_provider)
+
+        response = client.post(
+            "/job-hunt/saved",
+            json={
+                "listing_id": listing_id,
+                "source": "saved_search",
+                "source_saved_search_id": bob_search_id,
+            },
+            headers=alice,
+        )
+
+        _assert_denied(response, "POST /job-hunt/saved with another student's saved_search_id")
+
+    def test_the_tracker_never_names_another_students_saved_search(
+        self, client, alice, bob, use_provider
+    ):
+        """Defence in depth, and the part that matters for rows written before the check
+        above existed: even holding a foreign id, the read path must not resolve its name."""
+        bob_search_id = client.post(
+            "/job-hunt/saved-searches",
+            json={"name": "Bob's private search", "filters": {"keywords": "data"}},
+            headers=bob,
+        ).json()["id"]
+        listing_id, saved_id = seed_saved_job(client, alice, use_provider)
+
+        # Written straight to the database, bypassing the API check, to stand for a row saved
+        # before it was added.
+        from app.models.saved_job import SavedJob
+
+        session = next(app.dependency_overrides[get_db]())
+        row = session.get(SavedJob, saved_id)
+        row.source = "saved_search"
+        row.source_saved_search_id = bob_search_id
+        session.commit()
+
+        listed = client.get("/job-hunt/saved", headers=alice).json()
+        assert listed[0]["source_saved_search_name"] is None, (
+            "another student's saved-search name must never be resolved for display"
+        )
+
+        detail = client.patch(
+            f"/job-hunt/saved/{saved_id}", json={"notes": "x"}, headers=alice
+        ).json()
+        assert detail["source_saved_search_name"] is None
+
+    def test_a_students_own_saved_search_is_still_named(self, client, alice, use_provider):
+        """The guard against over-correcting: legitimate provenance must survive.
+
+        Saved once, not twice -- save_job is idempotent and deliberately never rewrites the
+        source of an existing row, so seeding a saved job first would leave it "manual".
+        """
+        search_id = client.post(
+            "/job-hunt/saved-searches",
+            json={"name": "Dubai Data Analyst", "filters": {"keywords": "data"}},
+            headers=alice,
+        ).json()["id"]
+        use_provider(FakeJobProvider(jobs=[provider_job()]))
+        client.put(
+            "/job-hunt/profile",
+            json={"target_role_title": "Software Engineer"},
+            headers=alice,
+        )
+        listing_id = client.post("/job-hunt/search", json={}, headers=alice).json()[
+            "results"
+        ][0]["listing"]["id"]
+
+        saved = client.post(
+            "/job-hunt/saved",
+            json={
+                "listing_id": listing_id,
+                "source": "saved_search",
+                "source_saved_search_id": search_id,
+            },
+            headers=alice,
+        ).json()
+
+        assert saved["source_saved_search_name"] == "Dubai Data Analyst"
 
 
 class TestMatchIsolation:
