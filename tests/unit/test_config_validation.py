@@ -33,6 +33,8 @@ def test_validate_for_production_passes_with_a_real_secret(monkeypatch) -> None:
     monkeypatch.setattr(settings, "debug", False)
     monkeypatch.setattr(settings, "allowed_hosts", "api.aiplacementos.com")
     _production_ready_ai(monkeypatch)
+    monkeypatch.setattr(settings, "storage_provider", "s3")
+    monkeypatch.setattr(settings, "database_url", "postgresql+psycopg2://u:p@db.example.com:5432/app")
     # This dev checkout's .env ships a real rzp_test_ key (needed for the Razorpay-flow
     # tests elsewhere) -- explicitly override it here so this "everything else is production-
     # ready" test isn't coupled to that unrelated local dev value.
@@ -42,6 +44,38 @@ def test_validate_for_production_passes_with_a_real_secret(monkeypatch) -> None:
     monkeypatch.setattr(settings, "razorpay_webhook_secret", "a-real-webhook-secret")
 
     validate_for_production()  # must not raise
+
+
+def test_validate_for_production_rejects_the_env_example_placeholder(monkeypatch) -> None:
+    """The likeliest real-world mistake, and the one the original guard let through.
+
+    `.env.example` ships JWT_SECRET_KEY=change-me-in-production. Copying that file to `.env`,
+    filling in the database URL and deploying is the obvious path -- and it used to pass,
+    because the guard only compared against the *code* default, a different string. The result
+    was a signing key published in the repository: anyone who could read it could forge a token
+    for any user.
+    """
+    monkeypatch.setattr(settings, "environment", "production")
+    monkeypatch.setattr(settings, "jwt_secret_key", "change-me-in-production")
+    with pytest.raises(RuntimeError, match="placeholder or too short"):
+        validate_for_production()
+
+
+@pytest.mark.parametrize("weak", ["changeme", "secret", "test", "short"])
+def test_validate_for_production_rejects_obvious_placeholders(monkeypatch, weak) -> None:
+    monkeypatch.setattr(settings, "environment", "production")
+    monkeypatch.setattr(settings, "jwt_secret_key", weak)
+    with pytest.raises(RuntimeError):
+        validate_for_production()
+
+
+def test_validate_for_production_rejects_a_secret_too_short_to_be_random(monkeypatch) -> None:
+    """A floor, not a strength test: it cannot tell a good secret from a bad one, only catch a
+    value nobody could have generated randomly and meant."""
+    monkeypatch.setattr(settings, "environment", "production")
+    monkeypatch.setattr(settings, "jwt_secret_key", "a" * 31)
+    with pytest.raises(RuntimeError, match="placeholder or too short"):
+        validate_for_production()
 
 
 def test_validate_for_production_raises_with_console_email_provider(monkeypatch) -> None:
@@ -87,6 +121,8 @@ def test_validate_for_production_raises_with_a_test_mode_razorpay_key(monkeypatc
     monkeypatch.setattr(settings, "debug", False)
     monkeypatch.setattr(settings, "allowed_hosts", "api.aiplacementos.com")
     _production_ready_ai(monkeypatch)
+    monkeypatch.setattr(settings, "storage_provider", "s3")
+    monkeypatch.setattr(settings, "database_url", "postgresql+psycopg2://u:p@db.example.com:5432/app")
     monkeypatch.setattr(settings, "razorpay_key_id", "rzp_test_abc123")
 
     with pytest.raises(RuntimeError, match="RAZORPAY_KEY_ID"):
@@ -100,6 +136,8 @@ def test_validate_for_production_passes_with_a_live_razorpay_key(monkeypatch) ->
     monkeypatch.setattr(settings, "debug", False)
     monkeypatch.setattr(settings, "allowed_hosts", "api.aiplacementos.com")
     _production_ready_ai(monkeypatch)
+    monkeypatch.setattr(settings, "storage_provider", "s3")
+    monkeypatch.setattr(settings, "database_url", "postgresql+psycopg2://u:p@db.example.com:5432/app")
     monkeypatch.setattr(settings, "razorpay_key_id", "rzp_live_abc123")
     # Required alongside a configured key since the webhook-secret check was added: without
     # it the webhook endpoint fails closed and paid users would never be activated.
@@ -119,6 +157,8 @@ def test_validate_for_production_does_not_require_razorpay_to_be_configured(monk
     monkeypatch.setattr(settings, "debug", False)
     monkeypatch.setattr(settings, "allowed_hosts", "api.aiplacementos.com")
     _production_ready_ai(monkeypatch)
+    monkeypatch.setattr(settings, "storage_provider", "s3")
+    monkeypatch.setattr(settings, "database_url", "postgresql+psycopg2://u:p@db.example.com:5432/app")
     monkeypatch.setattr(settings, "razorpay_key_id", None)
 
     validate_for_production()  # must not raise
@@ -139,6 +179,12 @@ def test_validate_for_production_still_validates_a_typoed_environment_value(monk
 
 
 def _production_base(monkeypatch) -> None:
+    # DATABASE_URL defaults to a SQLite file, which the guard now rejects in production.
+    monkeypatch.setattr(settings, "database_url", "postgresql+psycopg2://u:p@db.example.com:5432/app")
+    # STORAGE_PROVIDER defaults to "local", which the guard now rejects in production -- the
+    # same treatment _production_ready_ai gives AI_PROVIDER, and for the same reason: tests
+    # about other settings should not be coupled to this unrelated default.
+    monkeypatch.setattr(settings, "storage_provider", "s3")
     monkeypatch.setattr(settings, "environment", "production")
     monkeypatch.setattr(settings, "jwt_secret_key", "a-real-random-64-char-secret-not-the-dev-default")
     monkeypatch.setattr(settings, "email_provider", "smtp")
@@ -225,6 +271,8 @@ def test_validate_for_production_requires_a_webhook_secret_when_razorpay_is_conf
     monkeypatch.setattr(settings, "debug", False)
     monkeypatch.setattr(settings, "allowed_hosts", "api.aiplacementos.com")
     _production_ready_ai(monkeypatch)
+    monkeypatch.setattr(settings, "storage_provider", "s3")
+    monkeypatch.setattr(settings, "database_url", "postgresql+psycopg2://u:p@db.example.com:5432/app")
     monkeypatch.setattr(settings, "razorpay_key_id", "rzp_live_abc123")
     monkeypatch.setattr(settings, "razorpay_webhook_secret", None)
 
@@ -243,7 +291,145 @@ def test_validate_for_production_does_not_require_a_webhook_secret_when_razorpay
     monkeypatch.setattr(settings, "debug", False)
     monkeypatch.setattr(settings, "allowed_hosts", "api.aiplacementos.com")
     _production_ready_ai(monkeypatch)
+    monkeypatch.setattr(settings, "storage_provider", "s3")
+    monkeypatch.setattr(settings, "database_url", "postgresql+psycopg2://u:p@db.example.com:5432/app")
     monkeypatch.setattr(settings, "razorpay_key_id", None)
     monkeypatch.setattr(settings, "razorpay_webhook_secret", None)
 
     validate_for_production()  # must not raise
+
+
+def test_validate_for_production_rejects_local_file_storage(monkeypatch) -> None:
+    """The costliest default to discover late, and the one nothing else complains about.
+
+    LocalStorageProvider's own docstring already called itself unsuitable for production --
+    "files vanish on redeploy/container restart" -- but STORAGE_PROVIDER defaults to "local"
+    and nothing enforced it. A deployment that never set it starts cleanly and keeps accepting
+    uploads for as long as the container happens to live.
+
+    The loss is silent and one-directional, which is what makes it worth failing startup over.
+    `save()` creates the directory, writes the file and returns; the Resume row commits with a
+    key and the API answers 200. The next deploy destroys the file while the row survives
+    pointing at it -- so it surfaces later, to a student, as a resume that can no longer be
+    opened or re-analysed, with the original upload gone for good. ATS checks, JD matching and
+    every resume-derived evidence signal rest on that file still being there.
+    """
+    _production_base(monkeypatch)
+    monkeypatch.setattr(settings, "ai_provider", "anthropic")
+    monkeypatch.setattr(settings, "storage_provider", "local")
+
+    with pytest.raises(RuntimeError, match="STORAGE_PROVIDER"):
+        validate_for_production()
+
+
+def test_local_file_storage_is_fine_in_development(monkeypatch) -> None:
+    """Every dev checkout runs exactly this and must not be blocked."""
+    monkeypatch.setattr(settings, "environment", "development")
+    monkeypatch.setattr(settings, "storage_provider", "local")
+
+    validate_for_production()  # must not raise
+
+
+def test_validate_for_production_accepts_s3_storage(monkeypatch) -> None:
+    """S3StorageProvider raises on construction when its bucket/credentials are missing, so
+    the guard deliberately does not re-check them here -- that is the "fails loudly on first
+    real use" treatment this function's docstring describes, and a second copy of the rule
+    would be free to disagree with the first."""
+    _production_base(monkeypatch)
+    monkeypatch.setattr(settings, "ai_provider", "anthropic")
+    monkeypatch.setattr(settings, "storage_provider", "s3")
+
+    validate_for_production()  # must not raise
+
+
+def test_validate_for_production_rejects_a_sqlite_database_url(monkeypatch) -> None:
+    """The most destructive default in the file, and the quietest.
+
+    DATABASE_URL defaults to a local SQLite file. A deployment where the variable is unset,
+    misspelled, or attached to the wrong environment group therefore does not fail -- it starts
+    perfectly, creates app.db inside the container, and serves real traffic from it.
+
+    Nothing downstream notices, which is what makes a startup guard the only place this can be
+    caught. `/health/ready` reports the database as reachable and the schema as current, because
+    SQLite genuinely is reachable and alembic genuinely did migrate it. Signups, logins and
+    resume uploads all succeed. The next deploy then replaces the container, and every account
+    created since the previous one is gone -- with no error at any point, no backup to restore
+    from, and a managed PostgreSQL sitting alongside that was simply never connected to.
+    """
+    _production_base(monkeypatch)
+    monkeypatch.setattr(settings, "ai_provider", "anthropic")
+    monkeypatch.setattr(settings, "database_url", "sqlite:///./app.db")
+
+    with pytest.raises(RuntimeError, match="DATABASE_URL"):
+        validate_for_production()
+
+
+def test_a_sqlite_database_url_is_fine_in_development(monkeypatch) -> None:
+    """The default dev checkout and the whole test suite run on exactly this."""
+    monkeypatch.setattr(settings, "environment", "development")
+    monkeypatch.setattr(settings, "database_url", "sqlite:///./app.db")
+
+    validate_for_production()  # must not raise
+
+
+def test_validate_for_production_accepts_a_postgresql_database_url(monkeypatch) -> None:
+    _production_base(monkeypatch)
+    monkeypatch.setattr(settings, "ai_provider", "anthropic")
+    monkeypatch.setattr(settings, "database_url", "postgresql+psycopg2://u:p@db.example.com:5432/app")
+
+    validate_for_production()  # must not raise
+
+
+def test_the_sqlite_check_does_not_depend_on_the_file_path(monkeypatch) -> None:
+    """An absolute path, a named file or a bare :memory: URL are all the same mistake -- the
+    guard keys on the driver, not on what comes after it."""
+    _production_base(monkeypatch)
+    monkeypatch.setattr(settings, "ai_provider", "anthropic")
+    for url in ("sqlite:///:memory:", "sqlite:////var/data/app.db", "sqlite+pysqlite:///./x.db"):
+        monkeypatch.setattr(settings, "database_url", url)
+        with pytest.raises(RuntimeError, match="DATABASE_URL"):
+            validate_for_production()
+
+
+class TestDatabaseUrlSchemeNormalisation:
+    """`postgres://` is the exact string Render's dashboard offers as the connection URL, and
+    SQLAlchemy has refused it since 1.4 -- `NoSuchModuleError: Can't load plugin:
+    sqlalchemy.dialects:postgres`, an error that names a plugin and never mentions the URL.
+
+    Pasting the value the provider gives you is the obvious thing to do, so the obvious thing
+    has to work. These pin that it does, and that nothing else was quietly rewritten with it.
+    """
+
+    def test_a_render_style_postgres_url_is_accepted(self) -> None:
+        s = Settings(database_url="postgres://u:p@dpg-abc.oregon-postgres.render.com:5432/app")
+        assert s.database_url == "postgresql+psycopg2://u:p@dpg-abc.oregon-postgres.render.com:5432/app"
+
+    def test_the_rewritten_url_is_one_sqlalchemy_can_actually_open(self) -> None:
+        """The whole point -- asserting on the string alone would pass even if the replacement
+        produced something SQLAlchemy still refused."""
+        from sqlalchemy import create_engine
+
+        s = Settings(database_url="postgres://u:p@h:5432/db")
+        engine = create_engine(s.database_url)  # no connection is made until first use
+        assert engine.dialect.name == "postgresql"
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "postgresql://u:p@h:5432/db",
+            "postgresql+psycopg2://u:p@h:5432/db",
+            "sqlite:///./app.db",
+        ],
+    )
+    def test_every_other_scheme_is_left_exactly_as_it_was(self, url) -> None:
+        assert Settings(database_url=url).database_url == url
+
+    def test_normalisation_does_not_smuggle_sqlite_past_the_production_guard(self, monkeypatch) -> None:
+        """A rewrite that accidentally matched more than it should could turn the SQLite guard
+        into a no-op. It stays a guard."""
+        _production_base(monkeypatch)
+        monkeypatch.setattr(settings, "ai_provider", "anthropic")
+        monkeypatch.setattr(settings, "database_url", Settings(database_url="sqlite:///./app.db").database_url)
+
+        with pytest.raises(RuntimeError, match="DATABASE_URL"):
+            validate_for_production()

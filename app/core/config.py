@@ -1,6 +1,7 @@
 from typing import Optional
 from urllib.parse import urlparse
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -140,6 +141,28 @@ class Settings(BaseSettings):
     # credentials, and duplicating it here would just be another place it could drift.
     firebase_app_check_enabled: bool = False
 
+    @field_validator("database_url")
+    @classmethod
+    def _normalise_postgres_scheme(cls, value: str) -> str:
+        """Accept the `postgres://` URL every managed provider hands out.
+
+        SQLAlchemy dropped that alias in 1.4 and answers it with
+        `NoSuchModuleError: Can't load plugin: sqlalchemy.dialects:postgres` -- verified against
+        the pinned 2.0.52. Render, Heroku and several others still present exactly that form as
+        the connection string to copy, so pasting the value the dashboard gives you takes the
+        application down at import with an error that names a SQLAlchemy plugin and says nothing
+        about the URL being the problem.
+
+        Rewriting the scheme is safe because `postgres://` has no other meaning: it is the same
+        database, the same driver and the same credentials, spelled the way the provider spells
+        it. Doing it here rather than in the deployment notes means it cannot be forgotten under
+        pressure, and it happens before validate_for_production() reads the value, so the
+        SQLite guard still sees the real scheme.
+        """
+        if value.startswith("postgres://"):
+            return "postgresql+psycopg2://" + value[len("postgres://"):]
+        return value
+
 
 settings = Settings()
 
@@ -156,6 +179,30 @@ def _is_loopback_url(url: str) -> bool:
     host = host.strip("[]").lower()
     # 127.0.0.0/8 as a whole, not just 127.0.0.1 -- 127.1 and 127.0.1.5 are equally loopback.
     return host in _LOOPBACK_HOSTS or host.startswith("127.")
+
+
+# Every value of JWT_SECRET_KEY that appears somewhere public in this repository.
+#
+# Checking only against the code default was not enough, and the gap was the *likeliest*
+# production mistake rather than an exotic one: `.env.example` ships its own placeholder, so
+# copying that file to `.env`, filling in the database URL and deploying produced a signing key
+# that is readable by anyone who can see the repo -- and that sailed past a guard comparing
+# against a different string. Anyone could then mint a token for any user.
+#
+# Any new placeholder written into a committed file belongs in this set.
+_PUBLISHED_JWT_SECRETS = frozenset(
+    {
+        "dev-only-insecure-secret-change-in-production",  # Settings default
+        "change-me-in-production",  # .env.example
+        "changeme",
+        "secret",
+        "test",
+    }
+)
+
+# A floor, not a strength test. It cannot tell a good secret from a bad one -- it only catches
+# a value nobody could have generated randomly and meant.
+_MIN_JWT_SECRET_LENGTH = 32
 
 
 def validate_for_production() -> None:
@@ -176,10 +223,10 @@ def validate_for_production() -> None:
     explicit exemption added here too."""
     if settings.environment == "development":
         return
-    if settings.jwt_secret_key == Settings.model_fields["jwt_secret_key"].default:
+    if settings.jwt_secret_key in _PUBLISHED_JWT_SECRETS or len(settings.jwt_secret_key) < _MIN_JWT_SECRET_LENGTH:
         raise RuntimeError(
-            "JWT_SECRET_KEY is still the insecure development default -- set a real, "
-            "random secret before running in production, e.g.: "
+            "JWT_SECRET_KEY is a published placeholder or too short to be a real secret -- "
+            "set a real, random secret before running in production, e.g.: "
             'python -c "import secrets; print(secrets.token_urlsafe(64))"'
         )
     if settings.email_provider == "console":
@@ -205,6 +252,55 @@ def validate_for_production() -> None:
         raise RuntimeError(
             "ALLOWED_HOSTS is still '*' -- set it to your real production domain(s) "
             '(comma-separated, e.g. "api.aiplacementos.com") before running in production.'
+        )
+    if settings.database_url.startswith("sqlite"):
+        # The most destructive default in this file, and the quietest. DATABASE_URL defaults to
+        # a local SQLite file, so a deployment where the variable is unset, misspelled, or
+        # attached to the wrong environment group does not fail -- it starts perfectly, creates
+        # app.db inside the container, and serves real traffic from it.
+        #
+        # Nothing downstream notices. /health/ready reports "database": "reachable" and
+        # "schema": "current", because SQLite genuinely is reachable and alembic genuinely did
+        # migrate it. Signups succeed, logins succeed, resumes upload. Then the next deploy
+        # replaces the container and every account created since the last one is gone, with no
+        # error at any point and no backup to restore from -- the managed PostgreSQL sitting
+        # alongside was simply never connected to.
+        #
+        # Grouped with the storage check below: both are dev defaults that silently destroy
+        # production data rather than failing, which is what makes them worth a startup guard
+        # at all. This is the more severe of the two -- it loses the accounts themselves.
+        raise RuntimeError(
+            f"DATABASE_URL is still SQLite ({settings.database_url!r}) -- production data would "
+            "be written to a file inside the container and destroyed by the next deploy, while "
+            "/health/ready still reports the database as reachable. Set DATABASE_URL to the "
+            "PostgreSQL connection string, e.g. "
+            "postgresql+psycopg2://USER:PASSWORD@HOST:5432/DBNAME"
+        )
+    if settings.storage_provider == "local":
+        # The same class as the checks above, and the most expensive one to discover late.
+        # LocalStorageProvider's own docstring already says it is unsuitable for production --
+        # "files vanish on redeploy/container restart and aren't shared across multiple app
+        # instances" -- but nothing enforced it, and STORAGE_PROVIDER defaults to "local", so a
+        # deployment that simply never set it starts cleanly and accepts uploads for as long as
+        # the container lives.
+        #
+        # What makes it worth failing startup over rather than logging: the loss is silent and
+        # one-directional. `save()` mkdirs and writes happily, the Resume row is committed with
+        # a key, and the API returns 200. The file is then destroyed by the next deploy while
+        # the row survives pointing at it -- so the failure surfaces later, to a student, as a
+        # resume that cannot be opened or re-analysed, with the original upload gone for good.
+        # Every ATS check, JD match and evidence signal derived from resumes rests on this.
+        #
+        # STORAGE_PROVIDER=s3 needs no check here: S3StorageProvider raises on construction
+        # when its bucket/credentials are missing, which is the "fails loudly on first real
+        # use" treatment this function's docstring describes.
+        raise RuntimeError(
+            "STORAGE_PROVIDER is still 'local' (files are written to the container filesystem) "
+            "-- uploaded resumes would be destroyed by the next deploy or restart while their "
+            "database rows survive pointing at them. Set STORAGE_PROVIDER=s3 with "
+            "STORAGE_S3_BUCKET / STORAGE_S3_REGION / STORAGE_S3_ACCESS_KEY_ID / "
+            "STORAGE_S3_SECRET_ACCESS_KEY (any S3-compatible service works; set "
+            "STORAGE_S3_ENDPOINT_URL for a non-AWS one) before running in production."
         )
     if settings.ai_provider == "ollama" and _is_loopback_url(settings.ollama_base_url):
         # Same failure class as the test-mode Razorpay key below, and the same reason it needs
