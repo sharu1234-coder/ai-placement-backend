@@ -17,6 +17,7 @@ from app.api.assessments import router as assessments_router
 from app.api.auth import router as auth_router
 from app.api.career_decisions import router as career_decisions_router
 from app.api.career_path import router as career_path_router
+from app.api.career_strategy import router as career_strategy_router
 from app.api.career_twin import router as career_twin_router
 from app.api.deps import get_db
 from app.api.interviews import router as interviews_router
@@ -98,6 +99,7 @@ app.include_router(placement_alarm_router, dependencies=_app_check_dep)
 app.include_router(placement_path_router, dependencies=_app_check_dep)
 app.include_router(career_path_router, dependencies=_app_check_dep)
 app.include_router(career_twin_router, dependencies=_app_check_dep)
+app.include_router(career_strategy_router, dependencies=_app_check_dep)
 app.include_router(career_decisions_router, dependencies=_app_check_dep)
 app.include_router(skill_passport_router, dependencies=_app_check_dep)
 app.include_router(next_best_action_router, dependencies=_app_check_dep)

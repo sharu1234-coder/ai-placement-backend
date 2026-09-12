@@ -17,6 +17,7 @@ from app.models.career_path import CareerPath  # noqa: F401
 from app.models.career_path_phase import CareerPathPhase  # noqa: F401
 from app.models.career_path_project import CareerPathProject  # noqa: F401
 from app.models.career_path_skill_item import CareerPathSkillItem  # noqa: F401
+from app.models.career_strategy_target import CareerStrategyTarget  # noqa: F401
 from app.models.certification import Certification  # noqa: F401
 from app.models.education import Education  # noqa: F401
 from app.models.evidence_state_snapshot import EvidenceStateSnapshot  # noqa: F401
@@ -41,6 +42,7 @@ from app.models.placement_alarm_challenge import PlacementAlarmChallenge  # noqa
 from app.models.placement_alarm_question_attempt import PlacementAlarmQuestionAttempt  # noqa: F401
 from app.models.placement_path import PlacementPath  # noqa: F401
 from app.models.placement_path_topic import PlacementPathTopic  # noqa: F401
+from app.models.placement_strategy_snapshot import PlacementStrategySnapshot  # noqa: F401
 from app.models.profile import StudentProfile  # noqa: F401
 from app.models.provider_call_budget import ProviderCallBudget  # noqa: F401
 from app.models.project import Project  # noqa: F401

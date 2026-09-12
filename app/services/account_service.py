@@ -10,6 +10,7 @@ from app.models.career_path import CareerPath
 from app.models.career_path_phase import CareerPathPhase
 from app.models.career_path_project import CareerPathProject
 from app.models.career_path_skill_item import CareerPathSkillItem
+from app.models.career_strategy_target import CareerStrategyTarget
 from app.models.certification import Certification
 from app.models.education import Education
 from app.models.evidence_state_snapshot import EvidenceStateSnapshot
@@ -33,6 +34,7 @@ from app.models.placement_alarm_challenge import PlacementAlarmChallenge
 from app.models.placement_alarm_question_attempt import PlacementAlarmQuestionAttempt
 from app.models.placement_path import PlacementPath
 from app.models.placement_path_topic import PlacementPathTopic
+from app.models.placement_strategy_snapshot import PlacementStrategySnapshot
 from app.models.profile import StudentProfile
 from app.models.project import Project
 from app.models.project_build import ProjectBuild
@@ -155,6 +157,16 @@ def delete_account(db: Session, user: User, storage: StorageProvider) -> None:
         db.query(NotificationEvent).filter(NotificationEvent.profile_id == pid).delete(synchronize_session=False)
         db.query(ReadinessSnapshot).filter(ReadinessSnapshot.profile_id == pid).delete(synchronize_session=False)
         db.query(WeaknessRecord).filter(WeaknessRecord.profile_id == pid).delete(synchronize_session=False)
+        # Career Strategy. Both reference student_profiles, so both must go before the profile
+        # row below or the delete fails outright under real foreign keys -- and a student who
+        # had merely opened the Career Strategy screen once would then be unable to delete
+        # their own account.
+        db.query(PlacementStrategySnapshot).filter(
+            PlacementStrategySnapshot.profile_id == pid
+        ).delete(synchronize_session=False)
+        db.query(CareerStrategyTarget).filter(CareerStrategyTarget.profile_id == pid).delete(
+            synchronize_session=False
+        )
         # recruiter_attack_turns.session_id and project_build_stages.build_id must go before
         # their respective parents (recruiter_attack_sessions, project_builds) below.
         db.query(RecruiterAttackTurn).filter(

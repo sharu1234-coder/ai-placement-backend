@@ -47,3 +47,29 @@ def test_delete_account_frees_email_for_resignup(client):
 
     resp = client.post("/auth/signup", json={"email": email, "password": "supersecret123"})
     assert resp.status_code == 201
+
+
+def test_delete_account_after_using_career_strategy(client):
+    """Career Strategy writes a snapshot the first time a student opens it, and that row points
+    at their profile. Account deletion removes profile-owned rows in dependency order, so a
+    table missing from that list is not a tidiness problem -- with real foreign keys the profile
+    delete fails outright, and a student who had merely *looked* at their strategy could no
+    longer delete their own account.
+
+    This test is the guard: open the screen, then delete. It fails loudly if a future
+    profile-owned table is added to Career Strategy and not to account_service.
+    """
+    headers = _signup_and_login(client, "strategy-delete@example.com")
+
+    roles = client.get("/roles", headers=headers).json()
+    client.post(
+        "/users/me/role",
+        json={"role_id": next(r["id"] for r in roles if r["name"] == "SDE")},
+        headers=headers,
+    )
+    # Writes a placement_strategy_snapshots row.
+    assert client.get("/career-strategy", headers=headers).status_code == 200
+
+    resp = client.request("DELETE", "/users/me", json={"password": "supersecret123"}, headers=headers)
+    assert resp.status_code == 204
+    assert client.get("/users/me", headers=headers).status_code == 401
