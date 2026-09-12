@@ -3,11 +3,21 @@ from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
+# Every max_length below is its own column's cap, not a convention borrowed from a similarly
+# shaped field elsewhere. Without one, an overlong value passes validation here and reaches
+# PostgreSQL, which rejects it with StringDataRightTruncation -- an unhandled DataError, so the
+# student gets a 500 instead of a 422 telling them what to shorten. SQLite does not enforce
+# VARCHAR length at all, which is why the whole suite was green on it: the first run of these
+# tests against PostgreSQL is what surfaced this.
+#
+# app/schemas/profile.py already carries this fix for StudentProfile's own fields and says so
+# in the same words. These are the sub-resources the same pass missed.
+
 
 class EducationCreate(BaseModel):
-    institution: str
-    degree: Optional[str] = None
-    field_of_study: Optional[str] = None
+    institution: str = Field(max_length=255)
+    degree: Optional[str] = Field(default=None, max_length=255)
+    field_of_study: Optional[str] = Field(default=None, max_length=255)
     start_year: Optional[int] = None
     end_year: Optional[int] = None
 
@@ -19,8 +29,8 @@ class EducationRead(EducationCreate):
 
 
 class SkillCreate(BaseModel):
-    name: str
-    proficiency: Optional[str] = None
+    name: str = Field(max_length=100)
+    proficiency: Optional[str] = Field(default=None, max_length=50)
 
 
 class SkillRead(SkillCreate):
@@ -30,15 +40,14 @@ class SkillRead(SkillCreate):
 
 
 class ProjectCreate(BaseModel):
-    # max_length values match this app's other free-text project/AI-input fields for the
-    # same shape of content (see app/schemas/project_builder.py's ProjectBuild title/
-    # stack_summary/repo_url caps) -- description/tech_stack in particular were previously
-    # completely unbounded despite reaching an AI prompt verbatim (interview_service's
-    # question-generation prompt, via {projects}), a real resource-exhaustion/AI-cost vector
-    # every other large free-text AI input in the app already had a cap against.
+    # description stays at 2000 because its column is Text, and the cap is there for the AI
+    # prompt it reaches verbatim (interview_service's question generation, via {projects})
+    # rather than for storage. tech_stack was 300, copied from ProjectBuild.stack_summary,
+    # whose column really is String(300) -- this one's column is String(255), so 256..300
+    # passed validation and then 500'd on PostgreSQL.
     title: str = Field(max_length=200)
     description: Optional[str] = Field(default=None, max_length=2000)
-    tech_stack: Optional[str] = Field(default=None, max_length=300)
+    tech_stack: Optional[str] = Field(default=None, max_length=255)
     url: Optional[str] = Field(default=None, max_length=500)
 
 
@@ -49,8 +58,8 @@ class ProjectRead(ProjectCreate):
 
 
 class ExperienceCreate(BaseModel):
-    company: str
-    title: Optional[str] = None
+    company: str = Field(max_length=255)
+    title: Optional[str] = Field(default=None, max_length=255)
     description: Optional[str] = None
     start_date: Optional[datetime.date] = None
     end_date: Optional[datetime.date] = None
@@ -63,8 +72,8 @@ class ExperienceRead(ExperienceCreate):
 
 
 class CertificationCreate(BaseModel):
-    name: str
-    issuer: Optional[str] = None
+    name: str = Field(max_length=255)
+    issuer: Optional[str] = Field(default=None, max_length=255)
     issued_date: Optional[datetime.date] = None
 
 

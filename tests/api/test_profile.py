@@ -297,12 +297,34 @@ def test_add_project_rejects_overlong_tech_stack(client, auth_headers):
 
 
 def test_add_project_accepts_description_at_the_length_limit(client, auth_headers):
+    """tech_stack is 255 here, not 300, because Project.tech_stack is String(255).
+
+    This test used to send 300 and assert 201, and passed for the life of the project --
+    on SQLite, which does not enforce VARCHAR length. Run against PostgreSQL it failed with
+    StringDataRightTruncation: the schema allowed 300 (a cap copied from ProjectBuild.
+    stack_summary, whose column genuinely is String(300)) while this column holds 255, so
+    anything in 256..300 passed validation and then 500'd. The cap now matches the column and
+    the boundary below is the real one.
+
+    description stays at 2000: its column is Text, so 2000 is an AI-input cap, not a storage one.
+    """
     resp = client.post(
         "/users/me/projects",
-        json={"title": "A project", "description": "x" * 2000, "tech_stack": "x" * 300},
+        json={"title": "A project", "description": "x" * 2000, "tech_stack": "x" * 255},
         headers=auth_headers,
     )
     assert resp.status_code == 201
+
+
+def test_a_tech_stack_past_the_column_width_is_a_422_not_a_500(client, auth_headers):
+    """One character over has to be refused by validation, because the alternative is an
+    unhandled DataError from the driver -- a 500 with no indication of what to shorten."""
+    resp = client.post(
+        "/users/me/projects",
+        json={"title": "A project", "tech_stack": "x" * 256},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 422
 
 
 def test_delete_profile_subresource_not_found(client, auth_headers):
