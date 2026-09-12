@@ -20,10 +20,11 @@ of rendering a confusing empty state.
 **A snapshot is written only when the decision actually changes.** See snapshots.py for what
 "changes" means and why it deliberately excludes wording.
 
-One cost is accepted knowingly: career_twin_service.get_current runs its own evidence pass, so
-a strategy read computes evidence twice -- once for the bundle, once for readiness. The
-alternative is computing a readiness number here, which would be a second readiness engine
-disagreeing with the first one on the same screen. Composition is worth the second pass.
+A strategy read used to compute evidence twice -- once for the signal bundle, once inside
+career_twin_service for readiness. That cost is now gone without moving readiness here: the
+bundle's evidence views are handed to career_twin_service as a cache, and it still computes
+readiness itself, still owning that number alone. Anything it needs that the bundle did not
+carry it still fetches, so the optimisation can only make the read cheaper, never different.
 
 No AI. No network. Every decision is deterministic given the rows and the clock.
 """
@@ -136,7 +137,13 @@ def compute(
     # Career Twin answers "how ready am I for *my* target". For a hypothetical role it would be
     # answering a different question than the one asked, so the comparison path takes its
     # readiness from career_decision_service instead (see targets.py) and leaves this empty.
-    twin = career_twin_service.get_current(db, profile) if role is None else CareerTwinRead(
+    # The bundle already fetched evidence for a superset of this role's skills, so hand those
+    # views over rather than making career_twin_service fetch them again. It still computes
+    # readiness -- this is a cache, not a second calculation -- and anything it needs that the
+    # bundle did not carry, it still fetches for itself.
+    twin = career_twin_service.get_current(
+        db, profile, evidence=bundle.evidence_by_skill
+    ) if role is None else CareerTwinRead(
         has_role=True, role_source="target_role", display_role_name=role.display_role_name,
         role_family_key=role.role_family_key,
     )
@@ -287,6 +294,7 @@ def project(view: StrategyView, *, is_premium: bool) -> CareerStrategyRead:
         role_is_estimate=False if role is None else role.is_estimate,
         readiness_percent=view.twin.readiness_percent,
         readiness_is_estimate=view.twin.is_estimate,
+        readiness_reasons=list(view.twin.reasons),
         signal_count=len(view.bundle.signals),
         bottleneck=(
             None

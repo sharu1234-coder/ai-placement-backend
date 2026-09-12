@@ -15,7 +15,7 @@ box.
 """
 
 import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Mapping, Optional
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -156,7 +156,53 @@ def _compute_trend(db: Session, profile_id: int, role_key: str, today: datetime.
     return current_percent - prior.readiness_percent
 
 
-def get_current(db: Session, profile: StudentProfile) -> CareerTwinRead:
+def _evidence_for(
+    db: Session,
+    profile_id: int,
+    skills: List[str],
+    cached: Optional[Mapping[str, evidence_engine.SkillEvidenceView]],
+) -> List[evidence_engine.SkillEvidenceView]:
+    """Evidence for `skills`, reusing anything the caller already fetched.
+
+    A cache with a fallback, never a substitute. Career Strategy runs an evidence pass to build
+    its signal bundle and then called this service, which ran the same pass again -- the cost
+    was documented and accepted because the alternative looked like computing readiness in the
+    strategy layer, which would have been a second readiness engine.
+
+    Handing the views over instead keeps this service the sole owner of readiness while removing
+    the duplicate read. Any skill the caller did not bring is still fetched here, so a caller
+    whose skill set differs from this role's cannot quietly change the answer -- it can only
+    make it cheaper. Order follows `skills` so the cached and uncached paths return identically
+    ordered results.
+    """
+    if cached is None:
+        return evidence_engine.get_all_skill_evidence(db, profile_id, skills)
+
+    absent = [skill for skill in skills if skill not in cached]
+    fetched = {
+        view.skill: view
+        for view in (evidence_engine.get_all_skill_evidence(db, profile_id, absent) if absent else [])
+    }
+    views: List[evidence_engine.SkillEvidenceView] = []
+    for skill in skills:
+        view = cached.get(skill) or fetched.get(skill)
+        if view is not None:
+            views.append(view)
+    return views
+
+
+def get_current(
+    db: Session,
+    profile: StudentProfile,
+    *,
+    evidence: Optional[Mapping[str, evidence_engine.SkillEvidenceView]] = None,
+) -> CareerTwinRead:
+    """The student's Career Twin.
+
+    `evidence` is an optional cache of already-fetched evidence views (see `_evidence_for`). It
+    changes nothing about the result -- only how many times the database is asked for the same
+    rows. Readiness is still computed here and nowhere else.
+    """
     context = resolve_role_context(db, profile)
     if context is None:
         return CareerTwinRead(
@@ -176,7 +222,7 @@ def get_current(db: Session, profile: StudentProfile) -> CareerTwinRead:
         )
 
     skills = list(context.weights.keys())
-    evidence_views = evidence_engine.get_all_skill_evidence(db, profile.id, skills)
+    evidence_views = _evidence_for(db, profile.id, skills, evidence)
 
     skill_items = [
         SkillTwinItemRead(

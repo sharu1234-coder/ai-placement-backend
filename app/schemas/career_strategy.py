@@ -204,6 +204,11 @@ class CareerStrategyRead(BaseModel):
     # Career Twin's number, not a second readiness calculation. None when it has no basis.
     readiness_percent: Optional[int] = None
     readiness_is_estimate: bool = False
+    # Career Twin's own explanation of that number, carried through verbatim. Free, because the
+    # /career-twin endpoint it comes from is free -- gating it here would only hide from this
+    # screen what the same student can already read on another one, which is not a paywall, just
+    # an inconsistency. A readiness figure with no working shown is a number to distrust.
+    readiness_reasons: List[str] = []
 
     # How much was actually visible. Drives the honest empty state: "3 more things to record"
     # rather than a confident-looking strategy built on one assessment.
