@@ -1,8 +1,10 @@
+import os
+
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
+from sqlalchemy.pool import NullPool, StaticPool
 
 from app.api.deps import get_db
 from app.database.base import Base
@@ -11,14 +13,49 @@ from app.models.role import Role
 from app.models.role_skill_weight import RoleSkillWeight
 from app.models.user import User  # noqa: F401  (registers the table with Base.metadata)
 
+# Opt-in: point the API suite at a real PostgreSQL instead of in-memory SQLite.
+#
+#   TEST_DATABASE_URL=postgresql+psycopg2://postgres@127.0.0.1:55432/aiplacement_test pytest
+#
+# Unset -- which is every existing run, local and CI -- behaves exactly as before. The default
+# matters: SQLite in-memory gives each test a private database for free and runs in seconds,
+# and switching the whole suite to Postgres permanently would cost that for no gain on the
+# tests that are really about pure logic.
+#
+# What it buys is the thing SQLite structurally cannot show us: production is PostgreSQL, and
+# a transaction that fails mid-way behaves differently there (a failed statement poisons the
+# whole transaction until rollback, where SQLite carries on). Savepoint-recovery code is
+# written for that, so it deserves to be exercised against the database it was written for.
+_TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
 
-@pytest.fixture()
-def client():
-    engine = create_engine(
+
+def _make_engine():
+    """The test engine, SQLite by default and PostgreSQL when asked for."""
+    if _TEST_DATABASE_URL:
+        # No StaticPool and no check_same_thread: both are SQLite-specific. NullPool keeps each
+        # test's connections from outliving it, which matters when the tables are dropped and
+        # recreated between tests rather than vanishing with an in-memory database.
+        #
+        # lock_timeout is the difference between a suite that fails and a suite that hangs. A
+        # session left open holds its locks, and the next test's DROP TABLE then waits behind
+        # it with no timeout at all -- the run stops dead with no output and no failing test
+        # name. Fifteen seconds is far longer than any statement here legitimately takes, so
+        # anything that trips it is a real leak, and it says so instead of disappearing.
+        return create_engine(
+            _TEST_DATABASE_URL,
+            poolclass=NullPool,
+            connect_args={"options": "-c lock_timeout=15000"},
+        )
+    return create_engine(
         "sqlite:///:memory:",
         connect_args={"check_same_thread": False},
         poolclass=StaticPool,
     )
+
+
+@pytest.fixture()
+def client():
+    engine = _make_engine()
     # SQLite ignores foreign keys unless asked, per connection. Production is PostgreSQL,
     # which enforces them on every statement -- so without this the suite is structurally
     # unable to see a whole class of bug: deleting a row something still points at.
@@ -29,13 +66,22 @@ def client():
     # committed. Turning the pragma on was measured before being adopted -- those two were the
     # only failures across the whole suite, and both were real defects rather than fixture
     # artefacts.
-    @event.listens_for(engine, "connect")
-    def _enforce_foreign_keys(dbapi_connection, _record):
-        cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.close()
+    # PostgreSQL enforces foreign keys on every statement with nothing to turn on, so the
+    # pragma is both unnecessary and invalid there.
+    if not _TEST_DATABASE_URL:
+
+        @event.listens_for(engine, "connect")
+        def _enforce_foreign_keys(dbapi_connection, _record):
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.close()
 
     testing_session_local = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    # A real database persists between tests, so the previous test's rows have to go or the
+    # seed below collides with itself. An in-memory SQLite database is discarded wholesale and
+    # needs none of this.
+    if _TEST_DATABASE_URL:
+        Base.metadata.drop_all(bind=engine)
     Base.metadata.create_all(bind=engine)
 
     # Minimal role + skill-weight seed for tests (mirrors the real Alembic seed migrations,
@@ -59,8 +105,13 @@ def client():
     seed_session.commit()
     seed_session.close()
 
+    # Sessions handed out below, so they can be closed at teardown even when a test never
+    # lets the generator finish. See the loop at the end of the fixture.
+    issued_sessions = []
+
     def override_get_db():
         db = testing_session_local()
+        issued_sessions.append(db)
         try:
             yield db
         finally:
@@ -75,3 +126,19 @@ def client():
     with TestClient(app) as test_client:
         yield test_client
     app.dependency_overrides.clear()
+    # Ten tests reach past the HTTP layer for a session with `next(app.dependency_overrides
+    # [get_db]())`, which takes the yielded session and never resumes the generator -- so its
+    # `finally: db.close()` never runs and the session outlives the test still inside an open
+    # transaction. On SQLite that is invisible: every session shares one in-memory connection
+    # and there is nothing to contend for. On PostgreSQL the connection stays checked out
+    # holding the locks its last statement took, and the next test's `drop_all` waits behind
+    # it -- which is exactly how the first full PostgreSQL run stopped dead, 215 tests in,
+    # with `DROP TABLE interview_answers` blocked by an idle-in-transaction SELECT.
+    #
+    # Closing them here rather than editing those ten call sites keeps the assertions they
+    # make untouched, and puts the cleanup where the ownership already is: this fixture
+    # created every one of these sessions. `close()` on an already-closed session is a no-op,
+    # so the sessions that did go through the generator cost nothing.
+    for issued in issued_sessions:
+        issued.close()
+    engine.dispose()

@@ -24,11 +24,13 @@ writes -- the test would pass no matter what the code did.
 """
 
 import datetime
+import os
 import uuid
 
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import NullPool
 
 import app.main  # noqa: F401  -- imports every model so create_all sees the full schema
 from app.database.base import Base
@@ -40,17 +42,42 @@ from app.services.job_hunt import alerts, service
 from app.services.job_hunt.providers.base import ProviderJob, ProviderSearchResult
 from tests.fixtures.premium_helpers import grant_premium
 
+# These tests also run against PostgreSQL when TEST_DATABASE_URL is set; unset, the behaviour
+# is exactly as before.
+#
+# Worth being precise about what that adds, because it is easy to overclaim. Replacing the
+# savepoint with the old bare `db.rollback()` fails one of these tests on SQLite *and* on
+# PostgreSQL -- the property they assert (work done before the losing insert survives it) is
+# broken by a session-wide rollback on any backend, so SQLite alone already protects it.
+#
+# What PostgreSQL adds is the failure mode SQLite cannot have. There, a failed statement
+# poisons the whole transaction until it is rolled back, and every later statement raises
+# InFailedSqlTransaction. So a recovery path that merely looks correct on SQLite can still be
+# wrong in production, and running these here rules that out rather than assuming it.
+_TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
+
 
 @pytest.fixture()
 def db(tmp_path):
-    """A real, file-backed session. See the module docstring for why not conftest's client."""
-    engine = create_engine(f"sqlite:///{tmp_path / 'jobhunt.db'}")
+    """A real session with a real connection. See the module docstring for why not conftest's
+    client, and the note above for why PostgreSQL matters here in particular."""
+    if _TEST_DATABASE_URL:
+        # NullPool for the same reason conftest uses it: no connection may outlive the test
+        # whose tables are about to be dropped. A shared pool would hold locks past teardown.
+        engine = create_engine(_TEST_DATABASE_URL, poolclass=NullPool,
+                               connect_args={"options": "-c lock_timeout=15000"})
+        # A real database persists between tests; the in-memory and tmp_path ones do not.
+        Base.metadata.drop_all(bind=engine)
+    else:
+        engine = create_engine(f"sqlite:///{tmp_path / 'jobhunt.db'}")
     Base.metadata.create_all(bind=engine)
     session = sessionmaker(autocommit=False, autoflush=False, bind=engine)()
     try:
         yield session
     finally:
         session.close()
+        if _TEST_DATABASE_URL:
+            Base.metadata.drop_all(bind=engine)
         engine.dispose()
 
 

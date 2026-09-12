@@ -72,3 +72,68 @@ jobs:
       # per test, so this doesn't need Postgres, S3, SMTP, or any API key configured.
       - name: Run tests
         run: pytest -q
+
+  # Production is PostgreSQL, and SQLite cannot show us the differences that matter: a failed
+  # statement poisons a Postgres transaction until it is rolled back, foreign keys are always
+  # enforced rather than opt-in, and sequences, types and ordering are its own. The savepoint
+  # recovery paths in this codebase were written for those semantics, so they deserve to run
+  # against them.
+  #
+  # A separate job rather than a matrix on the one above: the SQLite suite is the fast signal
+  # every push needs, and making it wait on a database container would slow the common case to
+  # buy nothing. This one runs the API tests, which are the ones that actually touch a
+  # database -- the unit tests build their own in-memory engines and are about pure logic.
+  test-postgres:
+    runs-on: ubuntu-latest
+    # A lock wait has no timeout of its own, so a session left open by a test blocks the next
+    # test's DDL forever and the job sits there burning runner minutes with no output and no
+    # failing test name -- which is exactly how the first full PostgreSQL run of this suite
+    # behaved locally. tests/conftest.py now sets lock_timeout so that surfaces as a failure
+    # instead; this is the outer backstop for anything it does not cover.
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: aiplacement_test
+        ports:
+          - 5432:5432
+        # Without this the job can start connecting before the server accepts connections.
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      # The migrations are the contract between this code and a real database, and they are
+      # worth verifying independently of the tests: a migration that only works on SQLite
+      # passes the whole suite above and fails on the first real deploy.
+      - name: Verify migrations against PostgreSQL
+        env:
+          DATABASE_URL: postgresql+psycopg2://postgres:postgres@localhost:5432/aiplacement_test
+        run: |
+          alembic upgrade head
+          alembic check
+          alembic downgrade base
+          alembic upgrade head
+
+      - name: Run API tests against PostgreSQL
+        env:
+          TEST_DATABASE_URL: postgresql+psycopg2://postgres:postgres@localhost:5432/aiplacement_test
+        run: pytest -q tests/api
