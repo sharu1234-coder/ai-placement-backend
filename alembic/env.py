@@ -44,7 +44,11 @@ from app.models.placement_path import PlacementPath  # noqa: F401
 from app.models.placement_path_topic import PlacementPathTopic  # noqa: F401
 from app.models.placement_strategy_snapshot import PlacementStrategySnapshot  # noqa: F401
 from app.models.profile import StudentProfile  # noqa: F401
+from app.models.external_evidence_item import ExternalEvidenceItem  # noqa: F401
+from app.models.external_profile_snapshot import ExternalProfileSnapshot  # noqa: F401
 from app.models.provider_call_budget import ProviderCallBudget  # noqa: F401
+from app.models.provider_connection import ProviderConnection  # noqa: F401
+from app.models.provider_oauth_state import ProviderOAuthState  # noqa: F401
 from app.models.project import Project  # noqa: F401
 from app.models.project_build import ProjectBuild  # noqa: F401
 from app.models.project_build_stage import ProjectBuildStage  # noqa: F401
