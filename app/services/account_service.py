@@ -10,11 +10,12 @@ from app.models.career_path import CareerPath
 from app.models.career_path_phase import CareerPathPhase
 from app.models.career_path_project import CareerPathProject
 from app.models.career_path_skill_item import CareerPathSkillItem
-from app.models.career_strategy_target import CareerStrategyTarget
 from app.models.certification import Certification
 from app.models.education import Education
 from app.models.evidence_state_snapshot import EvidenceStateSnapshot
 from app.models.experience import Experience
+from app.models.external_evidence_item import ExternalEvidenceItem
+from app.models.external_profile_snapshot import ExternalProfileSnapshot
 from app.models.interview import Interview
 from app.models.interview_answer import InterviewAnswer
 from app.models.interview_evaluation import InterviewEvaluation
@@ -39,6 +40,8 @@ from app.models.profile import StudentProfile
 from app.models.project import Project
 from app.models.project_build import ProjectBuild
 from app.models.project_build_stage import ProjectBuildStage
+from app.models.provider_connection import ProviderConnection
+from app.models.provider_oauth_state import ProviderOAuthState
 from app.models.question_attempt import QuestionAttempt
 from app.models.readiness_snapshot import ReadinessSnapshot
 from app.models.recruiter_attack_session import RecruiterAttackSession
@@ -164,7 +167,34 @@ def delete_account(db: Session, user: User, storage: StorageProvider) -> None:
         db.query(PlacementStrategySnapshot).filter(
             PlacementStrategySnapshot.profile_id == pid
         ).delete(synchronize_session=False)
-        db.query(CareerStrategyTarget).filter(CareerStrategyTarget.profile_id == pid).delete(
+        # Professional Presence. The two child tables are owned through provider_connections
+        # rather than by profile_id directly, so they cannot be deleted by the profile filter
+        # used above -- they need the same subquery shape as career_path_phases and
+        # placement_path_topics, and they must both go before provider_connections itself.
+        #
+        # This block matters more than most for privacy rather than just referential integrity.
+        # It is what makes "delete my account" actually destroy the encrypted GitHub access
+        # token, everything observed from the student's public repositories, and every snapshot
+        # of their external profile. Leaving any of it behind would keep a live third-party
+        # credential belonging to someone who no longer has an account -- a credential nobody
+        # can reach to revoke, because the only route to it was the account that just went
+        # away. provider_oauth_states is included for the same reason even though its rows
+        # expire on their own: an in-flight authorisation at the moment of deletion would
+        # otherwise outlive the profile it is bound to.
+        db.query(ExternalEvidenceItem).filter(
+            ExternalEvidenceItem.connection_id.in_(
+                db.query(ProviderConnection.id).filter(ProviderConnection.profile_id == pid)
+            )
+        ).delete(synchronize_session=False)
+        db.query(ExternalProfileSnapshot).filter(
+            ExternalProfileSnapshot.connection_id.in_(
+                db.query(ProviderConnection.id).filter(ProviderConnection.profile_id == pid)
+            )
+        ).delete(synchronize_session=False)
+        db.query(ProviderConnection).filter(ProviderConnection.profile_id == pid).delete(
+            synchronize_session=False
+        )
+        db.query(ProviderOAuthState).filter(ProviderOAuthState.profile_id == pid).delete(
             synchronize_session=False
         )
         # recruiter_attack_turns.session_id and project_build_stages.build_id must go before

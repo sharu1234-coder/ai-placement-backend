@@ -17,6 +17,8 @@ from app.models.certification import Certification
 from app.models.education import Education
 from app.models.evidence_state_snapshot import EvidenceStateSnapshot
 from app.models.experience import Experience
+from app.models.external_evidence_item import ExternalEvidenceItem
+from app.models.external_profile_snapshot import ExternalProfileSnapshot
 from app.models.interview import Interview
 from app.models.interview_answer import InterviewAnswer
 from app.models.interview_evaluation import InterviewEvaluation
@@ -35,6 +37,8 @@ from app.models.profile import StudentProfile
 from app.models.project import Project
 from app.models.project_build import ProjectBuild
 from app.models.project_build_stage import ProjectBuildStage
+from app.models.provider_connection import ProviderConnection
+from app.models.provider_oauth_state import ProviderOAuthState
 from app.models.question import Question
 from app.models.question_attempt import QuestionAttempt
 from app.models.readiness_snapshot import ReadinessSnapshot
@@ -316,6 +320,36 @@ def _seed_full_account(db, email: str):
         based_on="Scaling claim",
     ))
 
+    # Professional Presence. The two evidence tables hang off the connection rather than off
+    # the profile, so they exercise the subquery-shaped delete rather than the profile filter --
+    # and the stored access token is what makes this more than a referential-integrity check:
+    # a connection left behind here is a live third-party credential belonging to an account
+    # that no longer exists, which nobody can reach to revoke.
+    connection = ProviderConnection(
+        profile_id=profile.id,
+        provider="github",
+        provider_user_id="583231",
+        provider_username="octocat",
+        access_token_encrypted="gAAAAA-not-a-real-token-ciphertext",
+        granted_scopes="",
+    )
+    db.add(connection)
+    db.commit()
+    db.refresh(connection)
+    db.add(ExternalEvidenceItem(
+        connection_id=connection.id, skill="Python", signal_kind="repo_primary_language",
+        source_ref="github:repo:octocat/hello-world",
+        observed_at=datetime.datetime(2026, 8, 1, tzinfo=datetime.timezone.utc),
+    ))
+    db.add(ExternalProfileSnapshot(
+        connection_id=connection.id, sequence=1, fingerprint="a" * 64, payload={"public_repos": 4},
+    ))
+    db.add(ProviderOAuthState(
+        state_hash="b" * 64, profile_id=profile.id, provider="github",
+        code_verifier_encrypted="gAAAAA-not-a-real-verifier-ciphertext",
+        expires_at=datetime.datetime(2099, 1, 1, tzinfo=datetime.timezone.utc),
+    ))
+
     db.commit()
     return user, profile, resume, question
 
@@ -362,6 +396,10 @@ def test_delete_account_removes_every_owned_row(db_session):
     assert db_session.query(PlacementAlarmQuestionAttempt).count() == 0
     assert db_session.query(Subscription).count() == 0
     assert db_session.query(PasswordResetToken).count() == 0
+    assert db_session.query(ProviderConnection).count() == 0
+    assert db_session.query(ExternalEvidenceItem).count() == 0
+    assert db_session.query(ExternalProfileSnapshot).count() == 0
+    assert db_session.query(ProviderOAuthState).count() == 0
 
     # The global question bank is shared across all users -- must never be touched.
     assert db_session.get(Question, question.id) is not None
