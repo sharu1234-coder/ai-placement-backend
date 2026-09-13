@@ -23,7 +23,7 @@ starlette==1.6.0
 # /health/ready 200 (so the DB session and migration check work through the real server),
 # and /openapi.json 200 (so every route in the app still builds).
 uvicorn[standard]==0.52.4
-pydantic==2.10.5
+pydantic==2.13.5
 pydantic-settings==2.15.0
 python-dotenv==1.2.3  # bumped from 1.2.1 (PYSEC-2026-2270)
 # Bumped from 2.2.0. This backs pydantic's EmailStr, so it sits in the auth/registration
