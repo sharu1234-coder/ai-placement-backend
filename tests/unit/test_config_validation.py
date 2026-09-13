@@ -433,3 +433,64 @@ class TestDatabaseUrlSchemeNormalisation:
 
         with pytest.raises(RuntimeError, match="DATABASE_URL"):
             validate_for_production()
+
+
+class TestTokenEncryptionKeyGuard:
+    """TOKEN_ENCRYPTION_KEY gets the Razorpay treatment, not the JWT treatment, and the
+    difference is deliberate.
+
+    An UNSET key is a legitimate production state: it means Professional Presence is switched
+    off, and token_crypto raises on first real use -- the "fails loudly on first use" category
+    this module's own docstring describes for ANTHROPIC_API_KEY and the SMTP settings. Refusing
+    to boot over it would make an optional feature mandatory.
+
+    A key that is SET but malformed has no such safety net. Nothing reads it until a student
+    has already been sent to GitHub, authorised there, and been redirected back -- so the
+    failure would land after the irreversible part of the flow, on every student at once, on a
+    screen they cannot retry their way out of.
+    """
+
+    def test_an_unset_key_does_not_block_startup(self, monkeypatch) -> None:
+        _production_base(monkeypatch)
+        _production_ready_ai(monkeypatch)
+        monkeypatch.setattr(settings, "token_encryption_key", None)
+
+        validate_for_production()  # must not raise
+
+    def test_an_empty_key_does_not_block_startup(self, monkeypatch) -> None:
+        """`.env.example` ships the setting with no value, so a copied file yields "" rather
+        than None. It must mean the same thing as unset, not "set to an invalid key"."""
+        _production_base(monkeypatch)
+        _production_ready_ai(monkeypatch)
+        monkeypatch.setattr(settings, "token_encryption_key", "")
+
+        validate_for_production()  # must not raise
+
+    def test_a_malformed_key_is_refused(self, monkeypatch) -> None:
+        _production_base(monkeypatch)
+        _production_ready_ai(monkeypatch)
+        monkeypatch.setattr(settings, "token_encryption_key", "not-a-valid-fernet-key")
+
+        with pytest.raises(RuntimeError, match="TOKEN_ENCRYPTION_KEY"):
+            validate_for_production()
+
+    def test_a_real_key_passes(self, monkeypatch) -> None:
+        from cryptography.fernet import Fernet
+
+        _production_base(monkeypatch)
+        _production_ready_ai(monkeypatch)
+        monkeypatch.setattr(settings, "token_encryption_key", Fernet.generate_key().decode())
+
+        validate_for_production()  # must not raise
+
+    def test_the_error_does_not_echo_the_key(self, monkeypatch) -> None:
+        """A startup error is printed to logs and pasted into issue trackers. If the key were
+        merely mistyped rather than fake, echoing it would publish a real secret."""
+        _production_base(monkeypatch)
+        _production_ready_ai(monkeypatch)
+        secret_looking = "aaaabbbbccccddddeeeeffffgggghhhh-but-not-valid-base64-fernet"
+        monkeypatch.setattr(settings, "token_encryption_key", secret_looking)
+
+        with pytest.raises(RuntimeError) as caught:
+            validate_for_production()
+        assert secret_looking not in str(caught.value)

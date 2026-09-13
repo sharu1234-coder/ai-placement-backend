@@ -141,6 +141,18 @@ class Settings(BaseSettings):
     # credentials, and duplicating it here would just be another place it could drift.
     firebase_app_check_enabled: bool = False
 
+    # Encrypts provider access tokens and PKCE verifiers at rest (app/core/token_crypto.py).
+    # A Fernet key: url-safe base64 of 32 random bytes. Unset is a legitimate state and means
+    # "Professional Presence cannot store credentials", so the feature reports itself
+    # unavailable instead of offering a Connect button that fails after the student has already
+    # authorised on GitHub's site. It is NOT defaulted to anything: a default would be a
+    # published encryption key, which is the same defect JWT_SECRET_KEY's `.env.example`
+    # placeholder turned out to be. Generate with:
+    #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    # Rotating it does not lose student data -- stored tokens become undecryptable and those
+    # connections need re-authorising, while all derived evidence is refetchable.
+    token_encryption_key: Optional[str] = None
+
     @field_validator("database_url")
     @classmethod
     def _normalise_postgres_scheme(cls, value: str) -> str:
@@ -351,3 +363,26 @@ def validate_for_production() -> None:
             "returns would be charged and never activate. Set the webhook secret from the "
             "Razorpay dashboard's webhook configuration before running in production."
         )
+    if settings.token_encryption_key:
+        # Exactly the Razorpay treatment above, and for the same reason. An UNSET key is left
+        # alone: it means Professional Presence is switched off, the feature says so, and
+        # token_crypto raises on first real use -- the "fails loudly on first use" category
+        # this function's docstring describes. What has no safety net is a key that is *set*
+        # but malformed, because nothing reads it until a student has already been sent to
+        # GitHub, authorised there, and been redirected back. The failure would land after the
+        # irreversible part of the flow, on a screen the student cannot retry their way out of,
+        # and it would land on every student at once.
+        #
+        # Local import: token_crypto imports `settings` from this module, so importing it at
+        # module scope would be circular. Same pattern as app/api/deps.py's require_premium.
+        from app.core import token_crypto
+
+        if not token_crypto.is_configured():
+            raise RuntimeError(
+                "TOKEN_ENCRYPTION_KEY is set but is not a valid Fernet key, so provider "
+                "credentials could not be encrypted or read -- every GitHub connection would "
+                "fail after the student had already authorised on GitHub. Generate a real key "
+                'with: python -c "from cryptography.fernet import Fernet; '
+                'print(Fernet.generate_key().decode())" (or leave it unset to disable '
+                "Professional Presence entirely)."
+            )
