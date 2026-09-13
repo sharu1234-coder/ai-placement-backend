@@ -116,4 +116,4 @@ requests==2.34.2      # PYSEC-2026-2275
 h2==4.4.1             # PYSEC-2026-3628
 msgpack==1.2.2        # PYSEC-2026-3625
 click==8.5.0          # PYSEC-2026-2132
-filelock==3.32.5      # PYSEC-2026-1374/1375
+filelock==3.32.6      # PYSEC-2026-1374/1375
