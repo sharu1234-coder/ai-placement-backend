@@ -29,6 +29,7 @@ from app.api.next_best_action import router as next_best_action_router
 from app.api.notifications import router as notifications_router
 from app.api.placement_alarm import router as placement_alarm_router
 from app.api.placement_path import router as placement_path_router
+from app.api.professional_presence import router as professional_presence_router
 from app.api.progress import router as progress_router
 from app.api.project_builder import router as project_builder_router
 from app.api.recruiter_attack import router as recruiter_attack_router
@@ -114,6 +115,12 @@ app.include_router(arena_router, dependencies=_app_check_dep)
 # X-Firebase-AppCheck header -- see the per-route dependency on every other route in
 # app/api/subscriptions.py instead.
 app.include_router(subscriptions_router)
+# Same exception, same reason: professional_presence_router owns GET
+# /professional-presence/connections/{provider}/callback, which GitHub redirects the student's
+# BROWSER to. That request carries no X-Firebase-AppCheck header (and no bearer token) because
+# GitHub has neither, so router-level App Check would 401 every successful authorisation. Every
+# other route on that router carries the dependency per-route -- see app/api/professional_presence.py.
+app.include_router(professional_presence_router)
 
 
 @app.get("/health")
