@@ -153,6 +153,29 @@ class Settings(BaseSettings):
     # connections need re-authorising, while all derived evidence is refetchable.
     token_encryption_key: Optional[str] = None
 
+    # GitHub OAuth (Professional Presence). Both unset is a legitimate state and means the
+    # feature reports itself unavailable rather than offering a Connect button that fails after
+    # the student has already authorised on GitHub's site.
+    #
+    # The client secret exists ONLY here. It is never sent to the Android app, which receives a
+    # finished authorization URL from this server and hands back only the authorization code --
+    # so the app is never entitled to a secret it could leak by being decompiled.
+    github_client_id: Optional[str] = None
+    github_client_secret: Optional[str] = None
+    # Where GitHub sends the student's browser after they approve. Must match the callback URL
+    # registered on the GitHub OAuth App exactly, or GitHub refuses the authorisation with its
+    # own error page before our code ever runs.
+    #
+    # Configured rather than derived from the incoming request's Host header. TrustedHostMiddleware
+    # already constrains that header, but building a redirect target out of anything the caller
+    # sends is how open redirects start, and this value is also the one thing that has to agree
+    # with a setting held on GitHub's side -- so it belongs somewhere a human sets deliberately.
+    github_oauth_redirect_uri: Optional[str] = None
+    # Where the callback sends the browser once the connection is finished, to hand control back
+    # to the Android app. Carries a result only -- never a token, code, state or verifier -- so a
+    # hostile app registering the same scheme learns one boolean. See app/api/professional_presence.py.
+    professional_presence_app_redirect: str = "aiplacementos://presence/callback"
+
     @field_validator("database_url")
     @classmethod
     def _normalise_postgres_scheme(cls, value: str) -> str:
@@ -385,4 +408,46 @@ def validate_for_production() -> None:
                 'with: python -c "from cryptography.fernet import Fernet; '
                 'print(Fernet.generate_key().decode())" (or leave it unset to disable '
                 "Professional Presence entirely)."
+            )
+    if settings.github_client_id:
+        # Same shape as the Razorpay webhook-secret check directly above: an unset client id
+        # means the feature is off and nothing complains, but a HALF-configured one fails only
+        # after a student has been sent to GitHub, approved the consent screen, and been
+        # redirected back -- past the point they can retry their way out of, and for everyone at
+        # once. Each of the three below is individually sufficient to break the flow at exactly
+        # that moment, so each is checked.
+        if not settings.github_client_secret:
+            raise RuntimeError(
+                "GITHUB_CLIENT_ID is configured but GITHUB_CLIENT_SECRET is not -- the "
+                "authorization code could never be exchanged, so every student would approve "
+                "on GitHub and then land on a failure. Set it from the GitHub OAuth App's "
+                "settings page, or unset GITHUB_CLIENT_ID to disable the feature."
+            )
+        if not settings.github_oauth_redirect_uri:
+            raise RuntimeError(
+                "GITHUB_CLIENT_ID is configured but GITHUB_OAUTH_REDIRECT_URI is not -- GitHub "
+                "rejects an authorization request whose redirect_uri does not match the one "
+                "registered on the OAuth App. Set it to this deployment's callback URL, e.g. "
+                "https://api.example.com/professional-presence/connections/github/callback"
+            )
+        if not settings.github_oauth_redirect_uri.startswith("https://"):
+            # The authorization code arrives as a query parameter on this URL. Over plain HTTP
+            # it is readable by anything on the path, and a code plus a leaked client secret is
+            # a complete account connection. GitHub permits http for localhost during
+            # development; production has no such excuse.
+            raise RuntimeError(
+                "GITHUB_OAUTH_REDIRECT_URI is not https -- the authorization code travels as a "
+                f"query parameter on that URL ({settings.github_oauth_redirect_uri!r}), so it "
+                "would be exposed in transit. Use an https callback URL in production."
+            )
+        if not settings.token_encryption_key:
+            # Reaches further than the feature: without a key the PKCE verifier cannot be
+            # stored, so authorisation cannot even begin. Better to say so at boot than to
+            # serve a Connect button that raises on first use.
+            raise RuntimeError(
+                "GITHUB_CLIENT_ID is configured but TOKEN_ENCRYPTION_KEY is not -- GitHub "
+                "access tokens and PKCE verifiers could not be encrypted, and storing them in "
+                "plaintext is not an accepted fallback. Generate a key with: "
+                'python -c "from cryptography.fernet import Fernet; '
+                'print(Fernet.generate_key().decode())"'
             )

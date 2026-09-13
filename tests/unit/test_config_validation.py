@@ -494,3 +494,98 @@ class TestTokenEncryptionKeyGuard:
         with pytest.raises(RuntimeError) as caught:
             validate_for_production()
         assert secret_looking not in str(caught.value)
+
+
+class TestGitHubOAuthGuards:
+    """GitHub OAuth gets the Razorpay treatment: unset is off, half-configured is refused.
+
+    The reason half-configured earns a startup failure rather than a runtime one is specific and
+    worth stating. Nothing reads these settings until a student has already pressed Connect, been
+    sent to GitHub, approved the consent screen, and been redirected back. A missing secret or
+    redirect URI surfaces only at that point -- past the part of the flow they cannot retry their
+    way out of, and for every student at once. Startup is the last moment the failure is cheap.
+    """
+
+    @staticmethod
+    def _github(monkeypatch, **overrides):
+        from cryptography.fernet import Fernet
+
+        values = {
+            "github_client_id": "Iv1.abc123",
+            "github_client_secret": "a-real-looking-client-secret",
+            "github_oauth_redirect_uri": (
+                "https://api.example.com/professional-presence/connections/github/callback"
+            ),
+            "token_encryption_key": Fernet.generate_key().decode(),
+        }
+        values.update(overrides)
+        for name, value in values.items():
+            monkeypatch.setattr(settings, name, value)
+
+    def test_an_unset_client_id_does_not_block_startup(self, monkeypatch) -> None:
+        """The feature being switched off is a legitimate production state, and making an
+        optional feature mandatory at boot would be the wrong trade."""
+        _production_base(monkeypatch)
+        _production_ready_ai(monkeypatch)
+        self._github(monkeypatch, github_client_id=None, github_client_secret=None)
+
+        validate_for_production()  # must not raise
+
+    def test_a_fully_configured_provider_passes(self, monkeypatch) -> None:
+        _production_base(monkeypatch)
+        _production_ready_ai(monkeypatch)
+        self._github(monkeypatch)
+
+        validate_for_production()  # must not raise
+
+    def test_a_client_id_without_a_secret_is_refused(self, monkeypatch) -> None:
+        _production_base(monkeypatch)
+        _production_ready_ai(monkeypatch)
+        self._github(monkeypatch, github_client_secret=None)
+
+        with pytest.raises(RuntimeError, match="GITHUB_CLIENT_SECRET"):
+            validate_for_production()
+
+    def test_a_client_id_without_a_redirect_uri_is_refused(self, monkeypatch) -> None:
+        _production_base(monkeypatch)
+        _production_ready_ai(monkeypatch)
+        self._github(monkeypatch, github_oauth_redirect_uri=None)
+
+        with pytest.raises(RuntimeError, match="GITHUB_OAUTH_REDIRECT_URI"):
+            validate_for_production()
+
+    def test_a_plaintext_redirect_uri_is_refused(self, monkeypatch) -> None:
+        """The authorization code arrives as a query parameter on this URL. Over plain HTTP it is
+        readable by anything on the path, and a code plus a leaked client secret is a complete
+        account connection."""
+        _production_base(monkeypatch)
+        _production_ready_ai(monkeypatch)
+        self._github(
+            monkeypatch,
+            github_oauth_redirect_uri="http://api.example.com/professional-presence/connections/github/callback",
+        )
+
+        with pytest.raises(RuntimeError, match="https"):
+            validate_for_production()
+
+    def test_a_client_id_without_an_encryption_key_is_refused(self, monkeypatch) -> None:
+        """Reaches further than the token: without a key the PKCE verifier cannot be stored, so
+        authorisation could not even begin."""
+        _production_base(monkeypatch)
+        _production_ready_ai(monkeypatch)
+        self._github(monkeypatch, token_encryption_key=None)
+
+        with pytest.raises(RuntimeError, match="TOKEN_ENCRYPTION_KEY"):
+            validate_for_production()
+
+    def test_no_guard_message_echoes_the_client_secret(self, monkeypatch) -> None:
+        """Startup errors are printed to logs and pasted into issue trackers. A guard that
+        quoted the secret back would publish it every time something else was misconfigured."""
+        _production_base(monkeypatch)
+        _production_ready_ai(monkeypatch)
+        secret = "ghs_averyrealisticlookingclientsecretvalue"
+        self._github(monkeypatch, github_client_secret=secret, github_oauth_redirect_uri=None)
+
+        with pytest.raises(RuntimeError) as caught:
+            validate_for_production()
+        assert secret not in str(caught.value)
