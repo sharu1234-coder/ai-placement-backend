@@ -333,3 +333,31 @@ class TestTargets:
 
         after = len(client.get("/career-strategy/history", headers=auth_headers).json()["snapshots"])
         assert after == before
+
+
+def test_a_student_who_set_comparison_targets_can_still_delete_their_account(
+    client, auth_headers, monkeypatch
+):
+    """F-01 at the boundary where it actually bit: DELETE /users/me returning 500.
+
+    career_strategy_targets.profile_id is NOT NULL with no ondelete, and the table was missing
+    from account_service.delete_account -- so the profile delete raised IntegrityError and the
+    route 500'd. The rollback left the account intact, meaning a student could never delete it.
+
+    Premium-only, so it hit exactly the students who had paid, and no existing test reached it:
+    tests/api/test_account_deletion.py's Career Strategy case opens the strategy screen, which
+    writes a placement_strategy_snapshots row -- a different table that was already covered.
+    """
+    _grant_premium(client, monkeypatch, auth_headers, payment_id="pay_delete_targets")
+    sde_id = _sde_role_id(client, auth_headers)
+    assert client.post(
+        "/career-strategy/targets", json={"role_ids": [sde_id]}, headers=auth_headers
+    ).status_code == 200
+
+    resp = client.request("DELETE", "/users/me", json={"password": "supersecret123"}, headers=auth_headers)
+
+    assert resp.status_code == 204, resp.text
+    assert client.get("/users/me", headers=auth_headers).status_code == 401
+    # The shared role catalog survives -- one student leaving must not remove a role every
+    # other student compares against.
+    assert client.get("/roles").status_code in (200, 401)

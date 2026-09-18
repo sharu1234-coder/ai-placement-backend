@@ -514,25 +514,37 @@ secret-shaped setting that had no fail-safe.
   via a `TestClient(app, base_url="https://testserver")` in tests, not just asserted from
   reading the code.
 - **Deployment requirement, documented not automated**: if this app runs behind a reverse
-  proxy (the normal case), start Uvicorn with `--proxy-headers` (and
-  `--forwarded-allow-ips` set to the proxy's IP, or `*` if the platform doesn't expose a
-  fixed IP) so it correctly reads `X-Forwarded-Proto` from the proxy — without this,
+  proxy (the normal case), start Uvicorn with `--proxy-headers` and `--forwarded-allow-ips`
+  set to the proxy's IP or CIDR (see the rate-limiting bullet below before reaching for `*` —
+  it is safe for reading the scheme and not safe for the client address) so it correctly reads
+  `X-Forwarded-Proto` from the proxy — without this,
   `request.url.scheme` always reports `http` internally even when the public-facing
   connection is HTTPS, and the HSTS header above would never fire. Deliberately did **not**
   add Starlette's `HTTPSRedirectMiddleware`: without `--proxy-headers` configured correctly
   first, it can misfire (redirect loops, or rejecting legitimate HTTPS traffic that arrives
   internally as plain HTTP from the proxy) — safer to document the real requirement than
   ship a redirect that silently assumes a specific deployment topology.
-- **The same two flags also decide whether rate limiting works at all**, which is easy to miss
-  because the paragraph above is about HTTPS. `app/core/rate_limit.py` keys every limit on the
-  client IP via slowapi's `get_remote_address`, i.e. the socket peer. Run behind a proxy
-  *without* `--proxy-headers` and every user shares one bucket, so login caps at 5/minute for
-  the whole user base and one attacker can lock everybody out. Run with
-  `--forwarded-allow-ips="*"` and the opposite happens: `X-Forwarded-For` becomes
-  attacker-controlled, so rotating a header value per request defeats every limit in the app,
-  login and password reset included. **Set `--forwarded-allow-ips` to the proxy's real
-  address or CIDR; only fall back to `"*"` if the platform genuinely cannot expose one**, and
-  treat that as a known weakening of brute-force protection rather than a neutral default.
+- **The same two flags also decide whether rate limiting works**, which is easy to miss because
+  the paragraph above is about HTTPS. `app/core/rate_limit.py` keys a limit on the
+  **authenticated user** where there is one, and falls back to the client IP
+  (`get_remote_address`, i.e. the socket peer) only on routes that have no account to key on —
+  login, signup, password reset. So the proxy configuration no longer affects a logged-in
+  student's budget at all; it decides whether those unauthenticated limits work.
+  - Behind a proxy *without* `--proxy-headers`, every unauthenticated request appears to come
+    from the proxy, so they share one bucket: login caps at 5/minute for the whole user base
+    and one attacker can lock everybody out.
+  - With `--forwarded-allow-ips="*"`, the opposite: Uvicorn rewrites the client address from an
+    `X-Forwarded-For` sent by *anyone*, so rotating one header value per request defeats every
+    IP-keyed limit — login and password reset included.
+  - **Set `--forwarded-allow-ips` to the proxy's real address or CIDR, not `"*"`.** The one
+    defensible exception is a platform where the container is reachable *only* through that
+    platform's own proxy, so no attacker can present a forged header directly; `docs/PRODUCTION_DEPLOYMENT.md`
+    §7 and §26.1 state the condition and why Render meets it. Outside that condition, treat
+    `"*"` as a known weakening of brute-force protection, not a neutral default.
+  - **Status: UNVERIFIED — deployment verification required.** Nothing in this repository can
+    confirm how Uvicorn is actually started, so this remains a deployment obligation rather
+    than a solved problem. Verify it on the running service by asserting the client address the
+    app observes for a request carrying a forged `X-Forwarded-For`.
 - CORS was deliberately **not** added: there's no browser-based client yet (Android talks
   to this API via Retrofit, which isn't subject to CORS) — add a restrictive
   `CORSMiddleware` if/when a web frontend is built, not preemptively.

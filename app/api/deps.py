@@ -1,10 +1,11 @@
 from collections.abc import Generator
 
 import jwt
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
+from app.core.rate_limit import RATE_LIMIT_SUBJECT_ATTR
 from app.core.security import decode_token
 from app.database.session import SessionLocal
 from app.models.user import User
@@ -21,6 +22,7 @@ def get_db() -> Generator[Session, None, None]:
 
 
 def get_current_user(
+    request: Request,
     credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
     db: Session = Depends(get_db),
 ) -> User:
@@ -48,6 +50,13 @@ def get_current_user(
         # logout/password-reset (app/api/auth.py's logout endpoint,
         # app/services/password_reset_service.py's reset_password both bump token_version).
         raise credentials_error
+
+    # Rate-limit identity, published only now -- past every check above, so it can never be set
+    # for a request whose token was forged, expired, revoked, of the wrong type, or belongs to
+    # a deactivated user. app/core/rate_limit.user_or_ip_key reads it and falls back to the
+    # client address when it is absent, so failing to reach this line means the request is
+    # limited by IP rather than escaping limits altogether.
+    setattr(request.state, RATE_LIMIT_SUBJECT_ATTR, user.id)
     return user
 
 

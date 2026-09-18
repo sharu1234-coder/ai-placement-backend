@@ -10,6 +10,7 @@ from app.models.career_path import CareerPath
 from app.models.career_path_phase import CareerPathPhase
 from app.models.career_path_project import CareerPathProject
 from app.models.career_path_skill_item import CareerPathSkillItem
+from app.models.career_strategy_target import CareerStrategyTarget
 from app.models.certification import Certification
 from app.models.education import Education
 from app.models.evidence_state_snapshot import EvidenceStateSnapshot
@@ -300,6 +301,18 @@ def delete_account(db: Session, user: User, storage: StorageProvider) -> None:
 
         # -- Standalone profile-owned tables: no incoming or outgoing FKs to anything else
         # deleted in this function. --------------------------------------------------------
+        # career_strategy_targets: profile_id is NOT NULL with no ondelete, so under real
+        # foreign keys the `db.delete(profile)` below raises IntegrityError the moment a
+        # student has ever added a comparison role -- they could then never delete their own
+        # account (a 500, and the rollback leaves the account intact). Nothing references this
+        # table, so its only ordering requirement is to precede the profile row.
+        #
+        # It holds no state of its own beyond (profile, role, position) -- every readiness
+        # figure is recomputed by the same deterministic engine -- so removing it destroys no
+        # history that existed anywhere else.
+        db.query(CareerStrategyTarget).filter(CareerStrategyTarget.profile_id == pid).delete(
+            synchronize_session=False
+        )
         db.query(Subscription).filter(Subscription.profile_id == pid).delete(synchronize_session=False)
         db.query(Education).filter(Education.profile_id == pid).delete(synchronize_session=False)
         db.query(Certification).filter(Certification.profile_id == pid).delete(synchronize_session=False)

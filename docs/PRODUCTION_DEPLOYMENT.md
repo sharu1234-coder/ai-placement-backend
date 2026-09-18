@@ -218,12 +218,52 @@ smoke test:
 to `None`, which uvicorn resolves to `127.0.0.1`. So the setting that actually decides this is
 `--forwarded-allow-ips`.
 
+**Rate-limit counters are per worker.** slowapi's default storage is in-memory, so each uvicorn
+worker holds its own copy of every counter. The start command above runs `--workers 4`, which
+means a limit written as `20/hour` admits up to **80/hour** per key across the four workers,
+depending on how the platform distributes requests. This is a real ceiling, not an exact quota,
+and it is the honest description of what the limiter provides today:
+
+- It bounds abuse and AI cost within a predictable multiple. That is what it is for.
+- It is **not** a billing-accurate global quota, and nothing in this deployment should be
+  described as one.
+- Making it exact requires shared storage (Redis) via slowapi's `storage_uri`, which adds an
+  infrastructure dependency and a monthly cost. That is a deliberate decision to take before
+  launch, not an oversight — reduce `--workers` if a tighter effective ceiling matters more
+  than throughput, or accept the multiple and set the written limits with it in mind.
+
 **Do not set `--forwarded-allow-ips="*"`.** It makes uvicorn rewrite the client address from
 an `X-Forwarded-For` header sent by *anyone*, which hands the rate-limit key to the attacker:
-rotating one header value per request defeats every limit in the app, including login and
+rotating one header value per request defeats every IP-keyed limit, including login and
 password reset. `app/core/rate_limit.py` carries this warning at the code itself. Set it to
 the platform's actual proxy address or CIDR. If a platform cannot tell you that range, treat
 it as a question to answer before launch, not a detail to leave at the default.
+
+**What changed, and what did not.** Limits are now keyed by the **authenticated user** where
+there is one, and fall back to the client address only on routes with no account to key on —
+login, signup, password reset (`app/core/rate_limit.user_or_ip_key`). Two consequences:
+
+- A logged-in student's budget no longer depends on the network they are on. A whole campus
+  behind one NAT no longer shares a single bucket, and no forwarded header can move one student
+  into another's bucket. This removes the largest practical failure mode of getting the proxy
+  flags wrong.
+- The requirement above is **not** removed. Login, signup and password reset still key on the
+  address, and those are precisely the limits an attacker wants to escape. Configure
+  `--forwarded-allow-ips` correctly regardless.
+
+**Verification status: UNVERIFIED — DEPLOYMENT VERIFICATION REQUIRED.** Nothing in this
+repository can observe how uvicorn is actually started on the running service, so this is not
+closed by any code change. Verify it after deploying, against the real service:
+
+1. Send an unauthenticated request carrying `X-Forwarded-For: 203.0.113.99`.
+2. Exceed an unauthenticated limit (for example six failed logins in a minute) while varying
+   that header on each request.
+3. If the 429 still arrives, the header is not being trusted and the configuration is correct.
+   If varying the header keeps buying fresh attempts, `--forwarded-allow-ips` is too broad and
+   brute-force protection is not in effect.
+
+Record the result of that check against this section. Until then, treat proxy-header handling
+as unverified rather than working.
 
 ### 7.1 Why local file storage is refused in production
 

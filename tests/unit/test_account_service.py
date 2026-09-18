@@ -13,6 +13,7 @@ from app.models.career_path import CareerPath
 from app.models.career_path_phase import CareerPathPhase
 from app.models.career_path_project import CareerPathProject
 from app.models.career_path_skill_item import CareerPathSkillItem
+from app.models.career_strategy_target import CareerStrategyTarget
 from app.models.certification import Certification
 from app.models.education import Education
 from app.models.evidence_state_snapshot import EvidenceStateSnapshot
@@ -50,6 +51,7 @@ from app.models.resume_analysis import ResumeAnalysis
 from app.models.resume_ats_check import ResumeAtsCheck
 from app.models.roadmap import Roadmap
 from app.models.roadmap_task import RoadmapTask
+from app.models.role import Role
 from app.models.skill import Skill
 from app.models.skill_gap import SkillGap
 from app.models.subscription import Subscription
@@ -350,12 +352,21 @@ def _seed_full_account(db, email: str):
         expires_at=datetime.datetime(2099, 1, 1, tzinfo=datetime.timezone.utc),
     ))
 
+    # Career Strategy comparison target. Needs a real Role row because role_id is a
+    # non-nullable FK into the shared catalog -- and that catalog must survive the delete,
+    # so it is returned for the caller to assert on alongside the shared question bank.
+    role = Role(name="Data Engineer", category="Data", description="Builds data pipelines")
+    db.add(role)
     db.commit()
-    return user, profile, resume, question
+    db.refresh(role)
+    db.add(CareerStrategyTarget(profile_id=profile.id, role_id=role.id, position=0))
+
+    db.commit()
+    return user, profile, resume, question, role
 
 
 def test_delete_account_removes_every_owned_row(db_session):
-    user, profile, resume, question = _seed_full_account(db_session, "delete-me@example.com")
+    user, profile, resume, question, role = _seed_full_account(db_session, "delete-me@example.com")
     resume_file_path = resume.file_path  # read before delete_account expires this row
     storage = RecordingStorage()
 
@@ -401,8 +412,12 @@ def test_delete_account_removes_every_owned_row(db_session):
     assert db_session.query(ExternalProfileSnapshot).count() == 0
     assert db_session.query(ProviderOAuthState).count() == 0
 
+    assert db_session.query(CareerStrategyTarget).count() == 0
+
     # The global question bank is shared across all users -- must never be touched.
     assert db_session.get(Question, question.id) is not None
+    # Nor is the role catalog, even though a deleted career_strategy_targets row pointed at it.
+    assert db_session.get(Role, role.id) is not None
 
     assert storage.deleted_keys == [resume_file_path]
 
@@ -419,7 +434,7 @@ def test_delete_account_with_no_profile_still_deletes_user(db_session):
 
 
 def test_delete_account_does_not_touch_other_users_data(db_session):
-    other_user, other_profile, other_resume, _ = _seed_full_account(db_session, "other@example.com")
+    other_user, other_profile, other_resume, _, _ = _seed_full_account(db_session, "other@example.com")
 
     victim = User(email="victim@example.com", password_hash="hashed")
     db_session.add(victim)
@@ -433,3 +448,140 @@ def test_delete_account_does_not_touch_other_users_data(db_session):
     assert db_session.get(User, other_user.id) is not None
     assert db_session.get(StudentProfile, other_profile.id) is not None
     assert db_session.query(Resume).filter(Resume.id == other_resume.id).count() == 1
+
+
+def test_delete_account_succeeds_for_a_student_with_a_career_strategy_target(db_session):
+    """F-01 regression, reduced to the smallest case that reproduced it.
+
+    career_strategy_targets.profile_id is NOT NULL with no ondelete, so before the fix the
+    `db.delete(profile)` at the end of delete_account raised IntegrityError during autoflush
+    the moment a student had ever added one comparison role -- a 500 from DELETE /users/me,
+    and an account the owner could never delete. Premium-only, so it hit exactly the students
+    who had paid.
+
+    Deliberately NOT part of the full-account seed alone: that test would have caught this
+    too, but only because someone remembered to add the row. This one names the defect, so a
+    future reordering of delete_account that reintroduces it fails with an obvious test name.
+    """
+    user = User(email="strategy-target@example.com", password_hash="hashed")
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+
+    profile = StudentProfile(user_id=user.id, full_name="Priya")
+    db_session.add(profile)
+    db_session.commit()
+    db_session.refresh(profile)
+
+    role = Role(name="ML Engineer", category="Data", description="Trains models")
+    db_session.add(role)
+    db_session.commit()
+    db_session.refresh(role)
+
+    target = CareerStrategyTarget(profile_id=profile.id, role_id=role.id, position=0)
+    db_session.add(target)
+    db_session.commit()
+    db_session.refresh(target)
+    target_id = target.id
+
+    delete_account(db_session, user, RecordingStorage())
+
+    assert db_session.get(User, user.id) is None
+    assert db_session.get(StudentProfile, profile.id) is None
+    assert db_session.get(CareerStrategyTarget, target_id) is None
+    # The role is shared catalog data -- a student deleting their account must not remove a
+    # role every other student compares against.
+    assert db_session.get(Role, role.id) is not None
+
+
+# Tables that carry a student_profiles foreign key but are deliberately NOT deleted by
+# profile, each with the reason. Anything else with such a key must be covered by
+# delete_account, or the parity test below fails.
+#
+# Empty today, and kept as the documented escape hatch rather than removed: the alternative
+# when a genuinely shared table gains a profile_id is editing the test's logic under time
+# pressure, which is how an exception becomes an accident.
+_DELETION_EXEMPT_TABLES: dict = {}
+
+
+def test_every_profile_owned_model_is_covered_by_account_deletion():
+    """F-10-adjacent parity guard for F-01's actual class of defect.
+
+    F-01 was not a logic error -- delete_account's ordering was correct and its reasoning was
+    written down. It was an omission: a new profile-owned table landed and nobody added it
+    here. No test could see that, because every deletion test asserts on tables it already
+    knows about, so the one table nobody thought of is exactly the one nobody asserts on.
+
+    This inverts it. Instead of listing what should be deleted, it asks SQLAlchemy which
+    models actually carry a student_profiles foreign key, and requires each to appear in
+    delete_account. Adding a profile-owned table without touching account deletion now fails
+    here rather than in production.
+
+    Deliberately checks the source for a reference rather than running a deletion: proving a
+    table is emptied would need a seeded row per model (63 of them, several with their own
+    non-nullable parents), and that fixture would itself be the thing nobody updates. A source
+    reference is a weaker assertion but a maintainable one -- and the seeded end-to-end
+    deletion test above still proves the rows genuinely go.
+    """
+    import inspect
+
+    from app.services import account_service
+
+    source = inspect.getsource(account_service.delete_account)
+
+    missing = []
+    for mapper in Base.registry.mappers:
+        model = mapper.class_
+        table = mapper.local_table
+        if table is None:
+            continue
+        owns_profile = any(
+            fk.column.table.name == "student_profiles"
+            for column in table.columns
+            for fk in column.foreign_keys
+        )
+        if not owns_profile:
+            continue
+        if table.name in _DELETION_EXEMPT_TABLES:
+            continue
+        if model.__name__ not in source:
+            missing.append((model.__name__, table.name))
+
+    assert not missing, (
+        "These models have a student_profiles foreign key but are never referenced in "
+        "account_service.delete_account, so a student's rows would survive deleting their "
+        "account (or, for a NOT NULL key, make deletion fail outright): "
+        + ", ".join(f"{name} ({tbl})" for name, tbl in sorted(missing))
+        + ". Add them to delete_account in the correct topological position, or add the table "
+        "to _DELETION_EXEMPT_TABLES with the reason it is shared rather than user-owned."
+    )
+
+
+def test_the_parity_guard_actually_detects_an_uncovered_model():
+    """Proves the guard above can fail -- a test that only ever passes is not a guard.
+
+    Rather than temporarily breaking delete_account, this re-runs the same rule against a
+    source string with one model's name removed, and asserts that model is reported.
+    """
+    import inspect
+
+    from app.services import account_service
+
+    source = inspect.getsource(account_service.delete_account)
+    crippled = source.replace("CareerStrategyTarget", "SomethingElseEntirely")
+
+    missing = []
+    for mapper in Base.registry.mappers:
+        table = mapper.local_table
+        if table is None:
+            continue
+        if not any(
+            fk.column.table.name == "student_profiles"
+            for column in table.columns
+            for fk in column.foreign_keys
+        ):
+            continue
+        if mapper.class_.__name__ not in crippled:
+            missing.append(mapper.class_.__name__)
+
+    assert "CareerStrategyTarget" in missing
