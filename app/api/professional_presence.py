@@ -18,6 +18,7 @@ reads an identity from the request -- `complete()` takes no profile argument -- 
 value an attacker can supply that changes whose account gets connected.
 """
 
+import datetime
 import logging
 from typing import List, Optional
 
@@ -26,17 +27,36 @@ from fastapi.responses import RedirectResponse
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.ai.provider import AIProvider, get_ai_provider
 from app.api.deps import get_current_user, get_db
 from app.core.app_check import verify_app_check_token
 from app.core.config import settings
 from app.core.rate_limit import limiter
+from app.models.external_profile_snapshot import ExternalProfileSnapshot
+from app.models.provider_connection import PROVIDER_GITHUB
 from app.models.user import User
-from app.schemas.professional_presence import AuthorizationStartRead, ConnectionStatusRead
-from app.services.professional_presence import connection_service, oauth_state
+from app.schemas.professional_presence import (
+    AuditFindingRead,
+    AuthorizationStartRead,
+    ConnectionStatusRead,
+    PresenceAuditRead,
+    PresenceHistoryItemRead,
+    SyncResultRead,
+)
+from app.services.professional_presence import (
+    audit_service,
+    connection_service,
+    oauth_state,
+    sync_service,
+)
 from app.services.professional_presence.errors import ProviderError
 from app.services.profile_service import get_or_create_profile
 
 logger = logging.getLogger(__name__)
+
+# History is a "what changed?" screen, not an archive browser. A cap keeps one response from
+# growing without bound for a student who has synced for years.
+_MAX_HISTORY_ITEMS = 24
 
 router = APIRouter(prefix="/professional-presence", tags=["professional-presence"])
 
@@ -197,6 +217,192 @@ def list_connections(
         ConnectionStatusRead.model_validate(item)
         for item in connection_service.status_for(db, profile.id)
     ]
+
+
+@router.post(
+    "/connections/{provider}/sync",
+    response_model=SyncResultRead,
+    dependencies=_app_check_dep,
+)
+@limiter.limit("6/hour")
+def sync_connection(
+    request: Request,
+    provider: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    ai_provider: AIProvider = Depends(get_ai_provider),
+) -> SyncResultRead:
+    """Re-read the connected account and store what it establishes.
+
+    Explicitly student-triggered. There is no background scheduler in this deployment, and the
+    app deliberately does not sync on every screen render -- a sync spends the student's GitHub
+    quota and, when content has changed, one AI generation. Both are real costs that should
+    follow an intent rather than a navigation event.
+
+    6/hour keyed by the authenticated student (app/core/rate_limit.user_or_ip_key), which is a
+    per-worker ceiling rather than an exact global quota -- see docs/PRODUCTION_DEPLOYMENT.md.
+    It is generous for the honest case, since a student has no reason to re-read an account they
+    have not changed, and the fingerprint check means an unchanged account costs no AI call at
+    all.
+
+    A provider failure is a 502 rather than a 500: the fault is upstream, the category is already
+    recorded on the connection, and the message the student sees is written by us. Nothing about
+    the provider's own error text travels.
+    """
+    profile = get_or_create_profile(db, current_user)
+    try:
+        result = sync_service.sync(db, profile.id, provider, ai_provider=ai_provider)
+    except sync_service.ConnectionNotFoundError:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not connected.")
+    except sync_service.ConnectionNotSyncableError:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This connection needs to be reconnected before it can be synced.",
+        )
+    except ProviderError as exc:
+        logger.warning("provider=%s event=sync_failed reason=%s", provider, exc.kind)
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc))
+
+    return SyncResultRead(
+        provider=result.provider,
+        evidence_added=result.evidence_added,
+        evidence_removed=result.evidence_removed,
+        repositories_seen=result.repositories_seen,
+        snapshot_written=result.snapshot_written,
+        complete=result.complete,
+    )
+
+
+# Freshness thresholds, applied server-side so every client says the same thing about the same
+# age. Matches the Evidence Engine's 90-day staleness window at the far end so the two features
+# cannot describe one repository differently.
+_FRESH_DAYS = 7
+_AGING_DAYS = 90
+
+
+def _freshness(last_synced_at: Optional[datetime.datetime]) -> str:
+    if last_synced_at is None:
+        return "never"
+    observed = last_synced_at if last_synced_at.tzinfo else last_synced_at.replace(tzinfo=datetime.timezone.utc)
+    age = (datetime.datetime.now(datetime.timezone.utc) - observed).days
+    if age <= _FRESH_DAYS:
+        return "fresh"
+    if age <= _AGING_DAYS:
+        return "aging"
+    return "stale"
+
+
+@router.get("/audit", response_model=PresenceAuditRead, dependencies=_app_check_dep)
+def get_presence_audit(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> PresenceAuditRead:
+    """The audit for the student's GitHub connection, computed from stored data only.
+
+    Calls no provider and no AI. Observations are recomputed here rather than stored because
+    half of them compare GitHub against the student's own declared skills and resume, which
+    change without GitHub changing -- a stored audit would go quietly wrong the moment a student
+    added a skill. The generated prose *is* stored, keyed by observation, and is looked up rather
+    than regenerated; a finding with no stored prose falls back to a hand-written action.
+
+    Returns a well-formed body for every state, including not-connected and never-synced. A
+    client must be able to render "connect GitHub" and "GitHub could not be reached" from the
+    same response shape, and an endpoint that 404s on "no data yet" makes those two look alike.
+    """
+    profile = get_or_create_profile(db, current_user)
+    connection = sync_service.live_connection(db, profile.id, PROVIDER_GITHUB)
+
+    if connection is None:
+        return PresenceAuditRead(provider=PROVIDER_GITHUB, connected=False, freshness="never")
+
+    snapshot = sync_service.latest_snapshot(db, connection.id)
+    base = dict(
+        provider=PROVIDER_GITHUB,
+        connected=True,
+        username=connection.provider_username,
+        status=connection.status,
+        sync_status=connection.sync_status,
+        last_synced_at=connection.last_synced_at,
+        last_error_kind=connection.last_error_kind,
+        freshness=_freshness(connection.last_synced_at),
+    )
+    if snapshot is None:
+        # Connected but never successfully synced. Deliberately not an error: the student has
+        # done their part, and the screen's job is to offer the sync rather than to report a fault.
+        return PresenceAuditRead(**base)
+
+    payload = snapshot.payload if isinstance(snapshot.payload, dict) else {}
+    narrative = payload.get("narrative") if isinstance(payload.get("narrative"), dict) else {}
+    findings = audit_service.assemble(
+        audit_service.observations_for(db, profile.id, snapshot), narrative
+    )
+    return PresenceAuditRead(
+        **base,
+        snapshot_captured_at=snapshot.created_at,
+        listing_complete=bool(payload.get("listing_complete", True)),
+        findings=[
+            AuditFindingRead(
+                code=f.code,
+                kind=f.kind,
+                subject=f.subject,
+                evidence=f.evidence,
+                why_it_matters=f.why_it_matters,
+                recommended_action=f.recommended_action,
+                is_template=f.is_template,
+            )
+            for f in findings
+        ],
+        narrative_prompt_version=payload.get("narrative_prompt_version"),
+    )
+
+
+@router.get("/history", response_model=List[PresenceHistoryItemRead], dependencies=_app_check_dep)
+def get_presence_history(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> List[PresenceHistoryItemRead]:
+    """Past states of the account, newest first, so "what has changed?" has a real answer.
+
+    Only snapshots for the student's own live connection: a revoked grant's history describes an
+    authorisation that no longer exists, and presenting it as continuous would imply a continuity
+    that was broken.
+    """
+    profile = get_or_create_profile(db, current_user)
+    connection = sync_service.live_connection(db, profile.id, PROVIDER_GITHUB)
+    if connection is None:
+        return []
+
+    rows = (
+        db.query(ExternalProfileSnapshot)
+        .filter(ExternalProfileSnapshot.connection_id == connection.id)
+        .order_by(ExternalProfileSnapshot.sequence.desc())
+        .limit(_MAX_HISTORY_ITEMS)
+        .all()
+    )
+
+    items = []
+    for row in rows:
+        payload = row.payload if isinstance(row.payload, dict) else {}
+        repos = [r for r in (payload.get("repositories") or []) if isinstance(r, dict)]
+        own = [r for r in repos if not r.get("is_fork") and not r.get("is_archived")]
+        languages = sorted(
+            {
+                language
+                for repo in own
+                for language in (repo.get("languages") or [])
+                if isinstance(language, str)
+            }
+        )
+        items.append(
+            PresenceHistoryItemRead(
+                sequence=row.sequence,
+                captured_at=row.created_at,
+                public_repositories=len(own),
+                described_repositories=len([r for r in own if r.get("description")]),
+                languages=languages,
+            )
+        )
+    return items
 
 
 @router.delete(
