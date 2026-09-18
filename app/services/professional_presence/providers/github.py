@@ -21,8 +21,10 @@ URL is excluded specifically because it carries the state as a query parameter, 
 "authorization URL" line in a log a credential in a log.
 """
 
+import datetime
 import logging
-from typing import Optional
+from dataclasses import replace
+from typing import List, Optional, Tuple
 from urllib.parse import urlencode
 
 import httpx
@@ -39,7 +41,13 @@ from app.services.professional_presence.errors import (
     ProviderUnauthorized,
     ProviderUnavailable,
 )
-from app.services.professional_presence.providers.base import ProviderCredential, ProviderIdentity
+from app.services.professional_presence.providers.base import (
+    ProviderCredential,
+    ProviderFetch,
+    ProviderIdentity,
+    ProviderProfile,
+    ProviderRepository,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +59,24 @@ _API_BASE = "https://api.github.com"
 # Matches the timeout the existing public-repo checker already uses, so the two GitHub paths in
 # this codebase behave the same way under a slow provider.
 _TIMEOUT = 10.0
+
+# Repository listing. `affiliation=owner` excludes repositories the student merely collaborates
+# on or that an organisation owns: this feature attributes work to one student, and "has push
+# access to" is not "wrote it". `visibility=public` is belt and braces -- an empty scope cannot
+# see private repositories anyway -- but stating it means a future scope change cannot silently
+# start pulling private work into an audit the student expects to be about their public presence.
+_REPOS_URL = f"{_API_BASE}/user/repos"
+_REPOS_PER_PAGE = 100
+# Three pages, so one sync costs at most three listing calls however many repositories exist. A
+# student past 300 owned public repositories is well outside this product's population, and the
+# cap is reported honestly through ProviderFetch.complete rather than silently truncating.
+_MAX_REPO_PAGES = 3
+
+# The per-repository language breakdown is one call each -- GitHub offers no batch form -- so it
+# is spent only on the most recently pushed repositories. The rest keep the primary language the
+# listing already returned for free, which is the same measurement with less detail. Bounds a
+# sync at 1 + 3 + 25 calls against a 5,000/hour authenticated quota.
+_MAX_REPOS_FOR_LANGUAGE_DETAIL = 25
 
 
 def _raise_for_status(response: httpx.Response) -> None:
@@ -192,6 +218,136 @@ class GitHubOAuthProvider:
             username=login if isinstance(login, str) else None,
         )
 
+    def _get(self, url: str, access_token: str, params: Optional[dict] = None) -> httpx.Response:
+        """One authorised GET, with transport failures already reduced to categories."""
+        try:
+            response = httpx.get(
+                url,
+                params=params,
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Accept": "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+                timeout=_TIMEOUT,
+            )
+        except httpx.TimeoutException:
+            raise ProviderTimeout()
+        except httpx.HTTPError:
+            raise ProviderUnavailable()
+        _raise_for_status(response)
+        return response
+
+    def fetch_account(self, access_token: str) -> ProviderFetch:
+        """Profile, then owned public repositories, then language detail for the newest few.
+
+        Every endpoint used here is readable with the empty scope this app requests, which is
+        the constraint that shaped the whole method. Contribution and activity history live
+        behind `read:user`; that scope is deliberately not requested, so this feature reports
+        what repositories show and stays silent about commit activity rather than guessing.
+        """
+        profile = self._fetch_profile(access_token)
+        repositories, complete = self._fetch_repositories(access_token)
+        repositories = self._attach_language_detail(access_token, repositories)
+        return ProviderFetch(profile=profile, repositories=tuple(repositories), complete=complete)
+
+    def _fetch_profile(self, access_token: str) -> ProviderProfile:
+        payload = _json_or_malformed(self._get(_USER_URL, access_token))
+
+        raw_id = payload.get("id")
+        if not isinstance(raw_id, int):
+            raise ProviderMalformedResponse()
+
+        def _text(key: str) -> Optional[str]:
+            value = payload.get(key)
+            # "" and null both mean "not filled in" on GitHub, and the audit's completeness
+            # checks must not count an empty string as a present value.
+            return value.strip() if isinstance(value, str) and value.strip() else None
+
+        def _count(key: str) -> int:
+            value = payload.get(key)
+            return value if isinstance(value, int) and value >= 0 else 0
+
+        return ProviderProfile(
+            provider_user_id=str(raw_id),
+            username=_text("login"),
+            name=_text("name"),
+            bio=_text("bio"),
+            company=_text("company"),
+            location=_text("location"),
+            blog=_text("blog"),
+            public_repos=_count("public_repos"),
+            followers=_count("followers"),
+        )
+
+    def _fetch_repositories(self, access_token: str) -> Tuple[List[ProviderRepository], bool]:
+        repositories: List[ProviderRepository] = []
+        complete = True
+
+        for page in range(1, _MAX_REPO_PAGES + 1):
+            response = self._get(
+                _REPOS_URL,
+                access_token,
+                params={
+                    "visibility": "public",
+                    "affiliation": "owner",
+                    "sort": "pushed",
+                    "direction": "desc",
+                    "per_page": _REPOS_PER_PAGE,
+                    "page": page,
+                },
+            )
+            try:
+                payload = response.json()
+            except ValueError:
+                raise ProviderMalformedResponse()
+            # This endpoint documents an array; an object here means the contract changed.
+            if not isinstance(payload, list):
+                raise ProviderMalformedResponse()
+
+            for item in payload:
+                if isinstance(item, dict):
+                    parsed = _parse_repository(item)
+                    if parsed is not None:
+                        repositories.append(parsed)
+
+            if len(payload) < _REPOS_PER_PAGE:
+                break
+            if page == _MAX_REPO_PAGES:
+                # A full final page at the cap means there may be more we never saw. Saying so
+                # is what stops reconciliation deleting evidence it simply did not read.
+                complete = False
+
+        return repositories, complete
+
+    def _attach_language_detail(
+        self, access_token: str, repositories: List[ProviderRepository]
+    ) -> List[ProviderRepository]:
+        """Fill in the full language set for the newest repositories; leave the rest as listed.
+
+        A failure is swallowed per repository rather than failing the sync. The primary language
+        is already known from the listing, so losing the detail costs a little breadth, whereas
+        failing the sync would cost the student every piece of evidence over one unavailable
+        sub-resource.
+        """
+        detailed: List[ProviderRepository] = []
+        for index, repo in enumerate(repositories):
+            if index >= _MAX_REPOS_FOR_LANGUAGE_DETAIL:
+                detailed.append(repo)
+                continue
+            try:
+                payload = _json_or_malformed(
+                    self._get(f"{_API_BASE}/repos/{repo.full_name}/languages", access_token)
+                )
+            except ProviderError:
+                detailed.append(repo)
+                continue
+            languages = tuple(
+                name for name, size in payload.items() if isinstance(name, str) and isinstance(size, int)
+            )
+            detailed.append(replace(repo, languages=languages or repo.languages))
+        return detailed
+
     def revoke(self, access_token: str) -> None:
         """DELETE /applications/{client_id}/grant -- removes the grant and, with it, every token
         issued to this app for that user.
@@ -214,6 +370,61 @@ class GitHubOAuthProvider:
             )
         except httpx.HTTPError:
             logger.info("provider=%s event=revoke_failed reason=unavailable", self.key)
+
+
+def _parse_repository(item: dict) -> Optional[ProviderRepository]:
+    """One listing entry to one normalised repository, or None if it is unusable.
+
+    Returns None rather than raising: a single malformed entry in an otherwise good listing
+    should cost that repository, not the whole sync. A missing `full_name` is the one
+    disqualifier, because it is the provenance key every evidence row for this repository is
+    filed under, and a row whose provenance cannot be named is worse than a row we never wrote.
+    """
+    full_name = item.get("full_name")
+    if not isinstance(full_name, str) or "/" not in full_name:
+        return None
+
+    def _text(key: str) -> Optional[str]:
+        value = item.get(key)
+        return value.strip() if isinstance(value, str) and value.strip() else None
+
+    primary_language = _text("language")
+    raw_topics = item.get("topics")
+    topics = (
+        tuple(topic for topic in raw_topics if isinstance(topic, str) and topic.strip())
+        if isinstance(raw_topics, list)
+        else ()
+    )
+
+    stars = item.get("stargazers_count")
+    return ProviderRepository(
+        full_name=full_name,
+        name=_text("name") or full_name.split("/", 1)[1],
+        description=_text("description"),
+        primary_language=primary_language,
+        # Seeded from the listing so a repository still carries its measured language even when
+        # the per-repository detail call is skipped by the cap or fails.
+        languages=(primary_language,) if primary_language else (),
+        topics=topics,
+        is_fork=bool(item.get("fork")),
+        is_archived=bool(item.get("archived")),
+        stars=stars if isinstance(stars, int) and stars >= 0 else 0,
+        pushed_at=_parse_timestamp(item.get("pushed_at")),
+    )
+
+
+def _parse_timestamp(value) -> Optional[datetime.datetime]:
+    """GitHub sends RFC 3339 with a trailing Z, which fromisoformat rejects before Python 3.11.
+
+    An unparseable timestamp yields None rather than raising. It only costs staleness precision
+    for that one repository, while raising would discard an otherwise complete sync.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 _PROVIDERS = {PROVIDER_GITHUB: GitHubOAuthProvider()}
