@@ -1,10 +1,15 @@
 """Evidence Engine -- the shared substrate for Career Twin and Skill Passport. Aggregates, per
 skill, every real signal the app already has: assessment scores, practice attempts, projects,
-interview questions, and resume mentions. Deliberately NOT a new persisted table -- every
-underlying fact is already a row somewhere (AssessmentResult, QuestionAttempt, Project,
-InterviewEvaluation, ResumeAnalysis); a separate "evidence event" table would be a second,
+interview questions, resume mentions, and signals observed on providers the student authorised
+through Professional Presence. Deliberately NOT a new persisted table -- every underlying fact
+is already a row somewhere (AssessmentResult, QuestionAttempt, Project, InterviewEvaluation,
+ResumeAnalysis, ExternalEvidenceItem); a separate "evidence event" table would be a second,
 driftable source of truth. Computed live at read time, same philosophy as
 career_path/service.py's job-readiness computation and progress_service's dashboard.
+
+External evidence is the one source that comes from outside this product, and it is deliberately
+the weakest kind: unscored, so it can widen the base for a skill but can never by itself clear
+the bar `verified` sets. See _match_external.
 
 A user claiming a skill (e.g. a plain profile Skill row) is deliberately NOT one of the sources
 below -- a claim must never, by itself, produce SUPPORTED/STRONG/VERIFIED evidence (see the
@@ -24,11 +29,13 @@ from app.models.assessment import Assessment
 from app.models.assessment_result import AssessmentResult
 from app.models.career_path import CareerPath
 from app.models.career_path_project import CareerPathProject
+from app.models.external_evidence_item import SIGNAL_REPO_TOPIC, ExternalEvidenceItem
 from app.models.interview import Interview
 from app.models.interview_evaluation import InterviewEvaluation
 from app.models.interview_question import InterviewQuestion
 from app.models.project import Project
 from app.models.project_build import ProjectBuild
+from app.models.provider_connection import ProviderConnection
 from app.models.question import Question
 from app.models.question_attempt import QuestionAttempt
 from app.models.recruiter_attack_session import RecruiterAttackSession
@@ -46,7 +53,7 @@ _STRONG_SCORE_THRESHOLD = 75.0
 
 
 class EvidenceItem(BaseModel):
-    source: str  # assessment | practice | project | interview | recruiter_attack | resume
+    source: str  # assessment | practice | project | interview | recruiter_attack | resume | external
     source_id: Optional[int] = None
     label: str
     score: Optional[float] = None  # 0-100, when the source produces a real score
@@ -96,6 +103,10 @@ class _ProfileEvidenceSources:
     interview_rows: List[Tuple[InterviewQuestion, InterviewEvaluation]]
     recruiter_attack_rows: List[Tuple[RecruiterAttackTurn, RecruiterAttackSession]]
     resume_skills: Optional[List[str]]  # None means no completed resume analysis exists
+    # Signals observed on providers the student authorised (Professional Presence). Only rows
+    # belonging to a connection that is still live: disconnecting must stop the evidence
+    # counting immediately, without needing a cleanup pass to have run first.
+    external_evidence: List[ExternalEvidenceItem]
 
 
 def _fetch_profile_sources(db: Session, profile_id: int) -> _ProfileEvidenceSources:
@@ -143,6 +154,20 @@ def _fetch_profile_sources(db: Session, profile_id: int) -> _ProfileEvidenceSour
     except NoResumeAnalysisError:
         resume_skills = None
 
+    # One query for every provider signal this profile has, joined through the connection so
+    # ownership is established in SQL rather than trusted from the evidence row. Ordered newest
+    # first so _match_external's first match is the most recent work.
+    external_evidence = (
+        db.query(ExternalEvidenceItem)
+        .join(ProviderConnection, ProviderConnection.id == ExternalEvidenceItem.connection_id)
+        .filter(
+            ProviderConnection.profile_id == profile_id,
+            ProviderConnection.revoked_at.is_(None),
+        )
+        .order_by(ExternalEvidenceItem.observed_at.desc())
+        .all()
+    )
+
     return _ProfileEvidenceSources(
         assessment_results=assessment_results,
         practice_rows=practice_rows,
@@ -152,6 +177,7 @@ def _fetch_profile_sources(db: Session, profile_id: int) -> _ProfileEvidenceSour
         interview_rows=interview_rows,
         recruiter_attack_rows=recruiter_attack_rows,
         resume_skills=resume_skills,
+        external_evidence=external_evidence,
     )
 
 
@@ -278,6 +304,53 @@ def _match_resume(sources: _ProfileEvidenceSources, skill: str) -> Optional[Evid
     return None
 
 
+def _match_external(sources: _ProfileEvidenceSources, skill: str) -> Optional[EvidenceItem]:
+    """A signal observed on a provider the student authorised.
+
+    Carries NO score, and that is load-bearing rather than an omission. `verified` requires a
+    source scored at or above _STRONG_SCORE_THRESHOLD, so an unscored source can add breadth but
+    can never, on its own, promote a skill to verified. A public repository is not a graded
+    assessment and there is no honest number to put here -- inventing one (stars, commit counts,
+    a "quality" formula) would manufacture verified skills out of public repositories, which is
+    exactly the product rule this engine exists to uphold. `ExternalEvidenceItem` has no score
+    column for the same reason, so the guarantee is structural in both places.
+
+    `self_asserted` is decided per signal kind, not hardcoded. A repository's languages are
+    GitHub's measurement of the bytes of code actually committed -- the student typed them
+    nowhere, so that is genuine independent evidence. A repository *topic* is a label the owner
+    typed onto their own repository, and anyone can put "kubernetes" on an empty repository in
+    seconds; treating it as independent would let a student promote a skill to `strong` purely
+    by labelling. Marking topics self-asserted keeps them as real context that cannot, by
+    itself, satisfy the independence requirement.
+
+    Rows arrive newest-first, so the first match is the most recently pushed work. Where a skill
+    has both a measured language and a typed topic, the language wins on that ordering only by
+    accident -- so it is preferred explicitly below.
+    """
+    fallback: Optional[EvidenceItem] = None
+    for item in sources.external_evidence:
+        if not skill_present(skill, [item.skill]):
+            continue
+        is_topic = item.signal_kind == SIGNAL_REPO_TOPIC
+        repository = (item.detail or {}).get("repository")
+        candidate = EvidenceItem(
+            source="external",
+            source_id=item.id,
+            label=(
+                f"Repository topic on {repository}" if is_topic else f"Code on {repository}"
+            ) if repository else ("Repository topic" if is_topic else "Public repository code"),
+            score=None,
+            detected_at=item.observed_at,
+            self_asserted=is_topic,
+        )
+        if not is_topic:
+            return candidate
+        # Hold the topic in case nothing measured turns up, but keep looking for a language.
+        if fallback is None:
+            fallback = candidate
+    return fallback
+
+
 def _as_utc(dt: datetime.datetime) -> datetime.datetime:
     """SQLite (used in tests and, per app/database/session.py, potentially elsewhere) has no
     native timezone-aware datetime type -- a value written as tz-aware comes back naive on
@@ -349,6 +422,7 @@ def _evidence_view_from_sources(sources: _ProfileEvidenceSources, skill: str) ->
             _match_interview(sources, skill),
             _match_recruiter_attack(sources, skill),
             _match_resume(sources, skill),
+            _match_external(sources, skill),
         )
         if item is not None
     ]

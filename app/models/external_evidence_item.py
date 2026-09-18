@@ -52,12 +52,13 @@ class ExternalEvidenceItem(Base):
     manufacture verified skills out of public repositories. Leaving the column out makes that
     impossible rather than merely discouraged.
 
-    `self_asserted` -- every row in this table is, by definition, something observed on an
-    external platform rather than something the student told us directly, so the value would be
-    False in every row forever. A column that is always False is not a fact, it is an
-    opportunity for a future bug to set it True. The matcher hardcodes `self_asserted=False`
-    instead. Student-entered LinkedIn information is NOT stored here for exactly this reason --
-    it is a claim, not an observation, and it does not belong in a table of observations.
+    `self_asserted` -- whether a signal is the student's own assertion is already implied by
+    `signal_kind`, so storing it again would create a second thing that can disagree with the
+    first. The Evidence Engine's matcher derives it in one place instead: a measured language is
+    independent evidence, a repository topic is a label the owner typed and is treated as
+    self-asserted (see evidence_engine._match_external). Student-entered LinkedIn information is
+    not stored here at all -- it is a claim, not an observation, and it does not belong in a
+    table of observations.
 
     The unique constraint makes re-synchronisation idempotent. A sync that runs twice observes
     the same language on the same repository both times; without it the student's evidence
