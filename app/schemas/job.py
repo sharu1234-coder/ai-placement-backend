@@ -96,6 +96,76 @@ class InterviewPrepQuestionRead(BaseModel):
     question: str
 
 
+class GapGuidanceRead(BaseModel):
+    """Grounded guidance for one skill the student is missing or weak on.
+
+    skill, severity and is_explicit_requirement are DETERMINISTIC -- they come from the
+    Requirement row and the existing matching engine, never from the AI. Only the three prose
+    fields are generated, and only for a skill the deterministic layer already established as a
+    gap, so the AI can explain a gap but can never invent one or promote an inferred
+    requirement into an explicit one.
+    """
+
+    skill: str
+    severity: str
+    is_explicit_requirement: bool
+    requirement_importance: str
+    why_it_matters: str
+    recommended_action: str
+    practice_direction: str
+
+
+class ResumeRecommendationItemRead(BaseModel):
+    """One suggested resume change for this specific JD.
+
+    current_fact is what the student's resume actually says today, and that is now enforced
+    rather than merely requested of the model: jd_grounding.ground_resume_recommendations
+    drops any item whose current_fact contradicts a deterministic skill gap, matches no known
+    skill/project/flagged section, carries a metric the resume does not support, or cites a
+    requirement this JD never stated. An item that cannot be grounded is dropped, never
+    repaired -- the only honest alternative to an unverifiable fact is no fact.
+
+    "Not present in your resume" is the one exempt value: it asserts absence, which cannot
+    overstate the student.
+
+    suggestion is wording built only from that fact plus the JD's own language. Nothing here
+    edits the uploaded PDF -- these are recommendations the student chooses to act on.
+    """
+
+    area: str
+    requirement: Optional[str]
+    current_fact: str
+    suggestion: str
+    rationale: str
+
+
+class ResumeRecommendationsRead(BaseModel):
+    """Recommendations plus an explicit reason when there are none.
+
+    status carries the "why" so the client never has to guess whether an empty list means
+    "your resume already covers this JD" or "we have no resume to look at".
+    """
+
+    status: Literal["ready", "no_resume", "insufficient_resume_data"]
+    missing_keywords: List[str]
+    items: List[ResumeRecommendationItemRead]
+
+
+class ProjectConnectionRead(BaseModel):
+    """A JD requirement tied to a project the student genuinely has.
+
+    project_title and requirement are matched deterministically against the student's own
+    project records; the AI only writes why_relevant and the questions. A requirement with no
+    real matching project produces no connection at all rather than an invented one.
+    """
+
+    requirement: str
+    project_title: str
+    project_source: Literal["resume", "profile"]
+    why_relevant: str
+    likely_questions: List[str]
+
+
 class JobPreparationPlanRead(BaseModel):
     id: int
     jd_id: int
@@ -106,4 +176,9 @@ class JobPreparationPlanRead(BaseModel):
     preparation_gaps: List[SkillGapStatusRead]
     preparation_plan: List[PreparationPlanCategoryRead]
     interview_prep: List[InterviewPrepQuestionRead]
+    # Added after the first release of this endpoint. Optional so that plans saved before the
+    # columns existed still deserialise -- an older row reads back as None, not as an error.
+    gap_guidance: Optional[List[GapGuidanceRead]] = None
+    resume_recommendations: Optional[ResumeRecommendationsRead] = None
+    project_connections: Optional[List[ProjectConnectionRead]] = None
     created_at: datetime.datetime

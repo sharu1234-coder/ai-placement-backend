@@ -241,11 +241,11 @@ def test_career_path_ai_generation_points_at_the_hardened_role_prompt():
 
 
 def test_jd_service_points_at_the_hardened_prep_plan_prompt():
-    assert jd_service._PREP_PLAN_PROMPT_PATH.name == "jd_preparation_plan_v3.txt"
+    assert jd_service._PREP_PLAN_PROMPT_PATH.name == "jd_preparation_plan_v4.txt"
 
 
 def test_prep_plan_prompt_frames_role_and_company_as_untrusted_data():
-    text = (_PROMPTS_DIR / "jd_preparation_plan_v3.txt").read_text(encoding="utf-8")
+    text = (_PROMPTS_DIR / "jd_preparation_plan_v4.txt").read_text(encoding="utf-8")
     normalized = " ".join(text.split())  # collapses line-wrap whitespace before substring checks
     assert "UNTRUSTED DATA" in normalized
     assert "<<<CONTEXT_START>>>" in text and "<<<CONTEXT_END>>>" in text
@@ -261,7 +261,7 @@ def test_prep_plan_prompt_frames_matching_and_missing_skills_as_untrusted_data()
     by an earlier, separately-hardened resume/JD matching step) were completely unwrapped in
     v2 despite Role/Company in the same file already being delimited and framed as untrusted.
     v3 wraps both in their own markers and extends the SECURITY RULE to name them explicitly."""
-    text = (_PROMPTS_DIR / "jd_preparation_plan_v3.txt").read_text(encoding="utf-8")
+    text = (_PROMPTS_DIR / "jd_preparation_plan_v4.txt").read_text(encoding="utf-8")
     assert "<<<MATCHING_SKILLS_START>>>" in text and "<<<MATCHING_SKILLS_END>>>" in text
     assert "<<<MISSING_SKILLS_START>>>" in text and "<<<MISSING_SKILLS_END>>>" in text
     matching_marker = text.index("{matching_skills}")

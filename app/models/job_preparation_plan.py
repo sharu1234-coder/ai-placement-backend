@@ -25,6 +25,12 @@ class JobPreparationPlan(Base):
     preparation_gaps: Mapped[list] = mapped_column(JSON, nullable=False)
     preparation_plan: Mapped[list] = mapped_column(JSON, nullable=False)
     interview_prep: Mapped[list] = mapped_column(JSON, nullable=False)
+    # Added after this table shipped, so all three are nullable: rows written before the
+    # columns existed keep reading back fine, and a NULL here means "this plan predates the
+    # section", which is a different thing from an empty section and is reported as such.
+    gap_guidance: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
+    resume_recommendations: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    project_connections: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime, nullable=False, default=lambda: datetime.datetime.now(datetime.timezone.utc)
     )

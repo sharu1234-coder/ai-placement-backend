@@ -6,7 +6,7 @@ create_all reads the models, not the migration. Production has no create_all any
 `app/` and is built exclusively by Alembic, so without this file the two ways of producing the
 schema are never compared and a defect in the migration reaches production unopposed.
 
-So this runs the real thing: base -> head, then head -> base, then base -> head again. The
+So this runs the real thing: base -> this revision, back down, then up again. The
 second upgrade is not redundant. A downgrade that drops a table but leaves an index, or leaves
 a type behind, succeeds quietly and only fails on the *next* upgrade -- which in practice means
 it fails during a rollback, at the worst possible moment.
@@ -122,7 +122,7 @@ def _current_revision(url: str):
 def test_the_migration_round_trips_base_to_head_and_back(migration_target):
     config = _alembic_config()
 
-    command.upgrade(config, "head")
+    command.upgrade(config, _THIS_REVISION)
     tables = _table_names(migration_target)
     for name in _NEW_TABLES:
         assert name in tables, f"{name} missing after upgrade"
@@ -139,7 +139,7 @@ def test_the_migration_round_trips_base_to_head_and_back(migration_target):
 
     # The pass that catches a downgrade which dropped a table but left an index behind: that
     # failure is silent until something tries to create the table again.
-    command.upgrade(config, "head")
+    command.upgrade(config, _THIS_REVISION)
     tables = _table_names(migration_target)
     for name in _NEW_TABLES:
         assert name in tables, f"{name} missing after the second upgrade"
@@ -149,7 +149,7 @@ def test_the_migration_round_trips_base_to_head_and_back(migration_target):
 def test_the_migration_produces_the_columns_the_models_declare(migration_target):
     """Guards against the migration and the models drifting apart. Everywhere else in the
     suite the schema comes from the models, so only this comparison can see a difference."""
-    command.upgrade(_alembic_config(), "head")
+    command.upgrade(_alembic_config(), _THIS_REVISION)
 
     engine = create_engine(migration_target)
     try:
@@ -191,7 +191,7 @@ def test_the_migration_produces_the_columns_the_models_declare(migration_target)
 
 
 def test_foreign_keys_point_where_the_models_say(migration_target):
-    command.upgrade(_alembic_config(), "head")
+    command.upgrade(_alembic_config(), _THIS_REVISION)
 
     engine = create_engine(migration_target)
     try:
@@ -217,7 +217,7 @@ def test_postgresql_creates_both_indexes_as_genuinely_partial(migration_target):
     ever disconnected GitHub. So this reads PostgreSQL's own rendered index definition and
     requires the WHERE clause to be present.
     """
-    command.upgrade(_alembic_config(), "head")
+    command.upgrade(_alembic_config(), _THIS_REVISION)
 
     engine = create_engine(migration_target)
     try:
