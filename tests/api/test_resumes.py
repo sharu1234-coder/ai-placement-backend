@@ -279,3 +279,105 @@ def test_get_resume_analysis_isolated_per_user(client, auth_headers, use_fake_ai
         f"/resumes/{resume_id}/analysis", headers={"Authorization": f"Bearer {other_token}"}
     )
     assert resp.status_code == 404
+
+
+def test_get_resume_file_returns_the_uploaded_pdf(client, auth_headers, use_fake_ai):
+    """The app previews the student's own resume, so the bytes must come back unchanged."""
+    use_fake_ai(FakeAIProvider(parsed=SAMPLE_PARSED_RESUME))
+    pdf_bytes = make_pdf_with_text("Jane Doe - Python developer.")
+
+    resume_id = client.post(
+        "/resumes",
+        files={"file": ("my cv.pdf", pdf_bytes, "application/pdf")},
+        headers=auth_headers,
+    ).json()["id"]
+
+    resp = client.get(f"/resumes/{resume_id}/file", headers=auth_headers)
+
+    assert resp.status_code == 200
+    assert resp.content == pdf_bytes
+    assert resp.headers["content-type"] == "application/pdf"
+    # Shown in an in-app viewer, not downloaded, and under the student's own filename.
+    assert resp.headers["content-disposition"] == 'inline; filename="my cv.pdf"'
+    # A resume is personal data: no shared cache may keep a copy.
+    assert resp.headers["cache-control"] == "private, no-store"
+
+
+def test_get_resume_file_requires_auth(client):
+    assert client.get("/resumes/1/file").status_code == 401
+
+
+def test_get_resume_file_not_found(client, auth_headers):
+    assert client.get("/resumes/999999/file", headers=auth_headers).status_code == 404
+
+
+def test_get_resume_file_isolated_per_user(client, auth_headers, use_fake_ai):
+    """Another student's resume_id must be indistinguishable from one that never existed."""
+    use_fake_ai(FakeAIProvider(parsed=SAMPLE_PARSED_RESUME))
+
+    resume_id = client.post(
+        "/resumes",
+        files={"file": ("resume.pdf", make_pdf_with_text("Private resume text."), "application/pdf")},
+        headers=auth_headers,
+    ).json()["id"]
+
+    client.post("/auth/signup", json={"email": "other-file@example.com", "password": "supersecret123"})
+    other_token = client.post(
+        "/auth/login", json={"email": "other-file@example.com", "password": "supersecret123"}
+    ).json()["access_token"]
+
+    resp = client.get(f"/resumes/{resume_id}/file", headers={"Authorization": f"Bearer {other_token}"})
+
+    assert resp.status_code == 404
+    # 404, not 403: a 403 would confirm the id exists. And the owner still has access.
+    assert b"Private resume" not in resp.content
+    assert client.get(f"/resumes/{resume_id}/file", headers=auth_headers).status_code == 200
+
+
+def test_get_resume_file_header_cannot_be_injected_via_filename(client, auth_headers, use_fake_ai):
+    """The filename is student-supplied, so it must not be able to forge a second header."""
+    use_fake_ai(FakeAIProvider(parsed=SAMPLE_PARSED_RESUME))
+
+    resume_id = client.post(
+        "/resumes",
+        files={
+            "file": (
+                'evil";\r\nX-Injected: yes\r\n.pdf',
+                make_pdf_with_text("Resume text."),
+                "application/pdf",
+            )
+        },
+        headers=auth_headers,
+    ).json()["id"]
+
+    resp = client.get(f"/resumes/{resume_id}/file", headers=auth_headers)
+
+    assert resp.status_code == 200
+    assert "x-injected" not in resp.headers
+    disposition = resp.headers["content-disposition"]
+    assert "\r" not in disposition and "\n" not in disposition
+    assert disposition.count('"') == 2
+
+
+def test_get_resume_file_reports_unavailable_when_storage_fails(client, auth_headers, use_fake_ai, monkeypatch):
+    """A readable DB row whose bytes are gone is an outage, not a missing resume -- and the
+    error must not leak the storage key."""
+    use_fake_ai(FakeAIProvider(parsed=SAMPLE_PARSED_RESUME))
+
+    resume_id = client.post(
+        "/resumes",
+        files={"file": ("resume.pdf", make_pdf_with_text("Resume text."), "application/pdf")},
+        headers=auth_headers,
+    ).json()["id"]
+
+    from app.storage import local_provider
+
+    def _boom(self, key):
+        raise OSError(f"cannot read {key}")
+
+    monkeypatch.setattr(local_provider.LocalStorageProvider, "load", _boom)
+
+    resp = client.get(f"/resumes/{resume_id}/file", headers=auth_headers)
+
+    assert resp.status_code == 503
+    assert "uploads" not in resp.text and ".pdf" not in resp.text

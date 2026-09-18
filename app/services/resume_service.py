@@ -149,6 +149,38 @@ def get_resume_analysis(db: Session, resume_id: int, profile_id: int) -> Optiona
     return to_analysis_read(analysis)
 
 
+class ResumeFileUnavailable(Exception):
+    """The Resume row exists but its bytes could not be read back from storage."""
+
+
+def get_resume_file(
+    db: Session, resume_id: int, profile_id: int, storage: StorageProvider
+) -> Optional[tuple[bytes, str]]:
+    """Return (pdf_bytes, download_filename) for a resume the caller owns, else None.
+
+    Ownership is checked the same way get_resume_analysis does -- the row is fetched by id and
+    then rejected unless it belongs to this profile, so another student's resume_id is a plain
+    404 rather than a 403 that would confirm the id exists.
+
+    The storage key is never returned to the caller: it is an internal, randomized path, and
+    handing it out would leak where uploads live. The client gets bytes and the student's own
+    original filename, nothing else.
+    """
+    resume = db.get(Resume, resume_id)
+    if resume is None or resume.profile_id != profile_id:
+        return None
+
+    try:
+        data = storage.load(resume.file_path)
+    except Exception as exc:  # storage backends raise their own error types (OSError, ClientError, ...)
+        # Deliberately logs the resume id but not the storage key or the exception's own
+        # message, which for S3 can embed the bucket and key.
+        logger.warning("Resume file unreadable for resume_id=%s: %s", resume.id, type(exc).__name__)
+        raise ResumeFileUnavailable from exc
+
+    return data, resume.original_filename or "resume.pdf"
+
+
 def delete_resume(db: Session, resume_id: int, profile_id: int, storage: StorageProvider) -> bool:
     """PROJECT_HANDOFF.md section 6: "Provide deletion controls for user data" /
     "Protect resumes and uploaded documents" -- there was previously no way to delete an

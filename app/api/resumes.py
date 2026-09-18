@@ -1,6 +1,6 @@
 from typing import Optional
 
-from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Request, Response, UploadFile, status
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
@@ -14,10 +14,12 @@ from app.schemas.resume_ats_check import AtsCheckListItemRead, AtsCheckReportRea
 from app.services.ats_check_service import generate_ats_check, get_ats_check, list_ats_checks
 from app.services.profile_service import get_or_create_profile
 from app.services.resume_service import (
+    ResumeFileUnavailable,
     ResumeProcessingError,
     delete_resume,
     get_latest_resume,
     get_resume_analysis,
+    get_resume_file,
     process_resume_upload,
 )
 from app.storage.provider import StorageProvider, get_storage_provider
@@ -116,6 +118,49 @@ def get_resume_analysis_endpoint(
     if analysis is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Resume analysis not found")
     return analysis
+
+
+@router.get("/{resume_id}/file")
+def get_resume_file_endpoint(
+    resume_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    storage: StorageProvider = Depends(get_storage_provider),
+) -> Response:
+    """Stream back the student's own uploaded PDF so the app can preview it.
+
+    Deliberately NOT a redirect to a storage URL: a pre-signed S3 link would be a bearer
+    credential of its own, valid for anyone who obtained it for as long as it lived. Serving the
+    bytes through this authenticated route keeps the existing token as the only way in.
+
+    Returned inline rather than as an attachment -- the caller is an in-app viewer, not a
+    browser download -- and the filename is quoted defensively because it is student-supplied.
+    """
+    profile = get_or_create_profile(db, current_user)
+    try:
+        result = get_resume_file(db, resume_id, profile.id, storage)
+    except ResumeFileUnavailable:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Resume file is temporarily unavailable",
+        )
+    if result is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Resume not found")
+
+    data, filename = result
+    # Strip anything that could break out of the quoted header value or inject a second header.
+    _UNSAFE_IN_HEADER = '"\\;\r\n'
+    safe_name = "".join(ch for ch in filename if ch.isprintable() and ch not in _UNSAFE_IN_HEADER)[:120]
+    safe_name = safe_name or "resume.pdf"
+    return Response(
+        content=data,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'inline; filename="{safe_name}"',
+            # A resume is personal data -- keep it out of shared caches entirely.
+            "Cache-Control": "private, no-store",
+        },
+    )
 
 
 @router.post("/{resume_id}/ats-check", response_model=AtsCheckReportRead, status_code=status.HTTP_201_CREATED)
