@@ -17,7 +17,13 @@ from cryptography.fernet import Fernet
 
 from app.ai.provider import AIGenerationError
 from app.core.config import settings
-from app.services.professional_presence.errors import ProviderRateLimited, ProviderUnauthorized
+from app.services.professional_presence.errors import (
+    ProviderMalformedResponse,
+    ProviderRateLimited,
+    ProviderTimeout,
+    ProviderUnauthorized,
+    ProviderUnavailable,
+)
 from app.services.professional_presence.providers.base import (
     ProviderCredential,
     ProviderFetch,
@@ -207,12 +213,63 @@ class TestSync:
             raise ProviderUnauthorized()
 
         monkeypatch.setattr(GitHubOAuthProvider, "fetch_account", _unauthorized)
-        client.post("/professional-presence/connections/github/sync", headers=headers)
+        response = client.post("/professional-presence/connections/github/sync", headers=headers)
+
+        # A revoked authorisation is a 409 "reconnect", never the 502 that means GitHub could
+        # not be reached: the app words those two oppositely, and only one of them is fixed by
+        # waiting.
+        assert response.status_code == 409
+        assert "reconnect" in response.json()["detail"].lower()
+        assert "reach" not in response.json()["detail"].lower()
 
         status = client.get("/professional-presence/connections", headers=headers).json()
         github = next(item for item in status if item["provider"] == "github")
         assert github["status"] == "needs_reauth"
         assert github["last_error_kind"] == "unauthorized"
+
+    def test_a_credential_that_stays_rejected_keeps_reporting_a_conflict(self, client, monkeypatch):
+        # needs_reauth keeps the stored credential, so a second attempt reaches GitHub again and
+        # is rejected again. It must still say "reconnect", not drift into "unreachable".
+        headers = _auth(client)
+        _connect(client, headers)
+        monkeypatch.setattr(
+            GitHubOAuthProvider, "fetch_account", lambda self, token: (_ for _ in ()).throw(ProviderUnauthorized())
+        )
+        client.post("/professional-presence/connections/github/sync", headers=headers)
+
+        again = client.post("/professional-presence/connections/github/sync", headers=headers)
+
+        assert again.status_code == 409
+
+    @pytest.mark.parametrize(
+        "failure, words",
+        [
+            pytest.param(ProviderUnavailable, "could not be reached", id="unavailable"),
+            pytest.param(ProviderTimeout, "did not respond", id="timeout"),
+            pytest.param(ProviderMalformedResponse, "could not read", id="malformed"),
+        ],
+    )
+    def test_github_being_unreachable_is_a_502_and_never_asks_for_a_reconnect(
+        self, client, monkeypatch, failure, words
+    ):
+        # The other half of the distinction: an outage is temporary, is reported as one, and
+        # must not demote a perfectly good authorisation to needs_reauth -- that would send the
+        # student through GitHub's consent screen to fix something reconnecting cannot fix.
+        headers = _auth(client)
+        _connect(client, headers)
+        monkeypatch.setattr(
+            GitHubOAuthProvider, "fetch_account", lambda self, token: (_ for _ in ()).throw(failure())
+        )
+
+        response = client.post("/professional-presence/connections/github/sync", headers=headers)
+
+        assert response.status_code == 502
+        assert words in response.json()["detail"].lower()
+        assert "reconnect" not in response.json()["detail"].lower()
+        status = client.get("/professional-presence/connections", headers=headers).json()
+        github = next(item for item in status if item["provider"] == "github")
+        assert github["status"] == "active"
+        assert github["sync_status"] == "failed"
 
 
 class TestIsolation:
@@ -388,3 +445,140 @@ class TestDisconnect:
         body = client.get("/professional-presence/audit", headers=headers).json()
         assert body["connected"] is False
         assert body["findings"] == []
+
+
+class TestAuditCounts:
+    """`repository_count` and `evidence_count` -- what the profile card shows at a glance.
+
+    Both are computed from stored data on every read rather than denormalised onto the
+    connection, so they cannot be left stale by a sync that failed halfway.
+    """
+
+    def test_counts_are_zero_before_the_first_sync(self, client):
+        # Connected but never synced is a real state, not a missing one: zero is the truth,
+        # and a client should not have to distinguish null from 0 to render "nothing yet".
+        headers = _auth(client)
+        _connect(client, headers)
+
+        body = client.get("/professional-presence/audit", headers=headers).json()
+
+        assert body["connected"] is True
+        assert body["repository_count"] == 0
+        assert body["evidence_count"] == 0
+
+    def test_counts_are_zero_when_not_connected(self, client):
+        headers = _auth(client)
+
+        body = client.get("/professional-presence/audit", headers=headers).json()
+
+        assert body["connected"] is False
+        assert body["repository_count"] == 0
+        assert body["evidence_count"] == 0
+
+    def test_counts_reflect_what_the_sync_actually_stored(self, client):
+        headers = _auth(client)
+        _connect(client, headers)
+
+        sync = client.post(
+            "/professional-presence/connections/github/sync", headers=headers
+        ).json()
+        body = client.get("/professional-presence/audit", headers=headers).json()
+
+        # Tied to the sync's own report rather than to a hardcoded number, so the assertion
+        # keeps meaning if the stub's fixture repositories change.
+        assert body["evidence_count"] == sync["evidence_added"]
+        assert body["repository_count"] > 0
+
+    def test_repository_count_matches_what_history_reports(self, client):
+        # The two are the same claim rendered in two places, and a screen may show them
+        # together. They share one helper precisely so they cannot drift apart.
+        headers = _auth(client)
+        _connect(client, headers)
+        client.post("/professional-presence/connections/github/sync", headers=headers)
+
+        audit = client.get("/professional-presence/audit", headers=headers).json()
+        history = client.get("/professional-presence/history", headers=headers).json()
+
+        assert audit["repository_count"] == history[0]["public_repositories"]
+
+    def test_a_second_sync_that_changes_nothing_does_not_change_the_counts(self, client):
+        headers = _auth(client)
+        _connect(client, headers)
+        client.post("/professional-presence/connections/github/sync", headers=headers)
+        first = client.get("/professional-presence/audit", headers=headers).json()
+
+        client.post("/professional-presence/connections/github/sync", headers=headers)
+        second = client.get("/professional-presence/audit", headers=headers).json()
+
+        assert second["repository_count"] == first["repository_count"]
+        assert second["evidence_count"] == first["evidence_count"]
+
+    def test_disconnecting_returns_the_counts_to_zero(self, client):
+        # Evidence is scoped to the connection, so a revoked grant's rows can never keep
+        # inflating a number the student reads as "what my profile is worth".
+        headers = _auth(client)
+        _connect(client, headers)
+        client.post("/professional-presence/connections/github/sync", headers=headers)
+        assert client.get("/professional-presence/audit", headers=headers).json()["evidence_count"] > 0
+
+        client.delete("/professional-presence/connections/github", headers=headers)
+
+        body = client.get("/professional-presence/audit", headers=headers).json()
+        assert body["repository_count"] == 0
+        assert body["evidence_count"] == 0
+
+    def test_forks_and_archives_are_not_counted(self, client, monkeypatch):
+        # The same population the evidence comes from. Counting a fork would put somebody
+        # else's code into "your repositories", and make the two numbers look inconsistent.
+        headers = _auth(client)
+        _connect(client, headers)
+        monkeypatch.setattr(
+            GitHubOAuthProvider,
+            "fetch_account",
+            lambda self, token: _fetch(
+                [
+                    _repo("own-work"),
+                    _repo("someone-elses", is_fork=True, primary_language="Go", languages=("Go",)),
+                    _repo("finished", is_archived=True, primary_language="Rust", languages=("Rust",)),
+                ]
+            ),
+        )
+
+        sync = client.post("/professional-presence/connections/github/sync", headers=headers).json()
+        body = client.get("/professional-presence/audit", headers=headers).json()
+
+        assert sync["repositories_seen"] == 3
+        assert body["repository_count"] == 1
+        assert body["evidence_count"] == sync["evidence_added"]
+        history = client.get("/professional-presence/history", headers=headers).json()
+        assert history[0]["public_repositories"] == 1
+
+    def test_a_revoked_authorisation_keeps_the_counts_it_already_had(self, client, monkeypatch):
+        # A connection GitHub has stopped accepting is still the student's connection, and what
+        # it already proved is still true. The counts must survive until the student reconnects.
+        headers = _auth(client)
+        _connect(client, headers)
+        client.post("/professional-presence/connections/github/sync", headers=headers)
+        before = client.get("/professional-presence/audit", headers=headers).json()
+        monkeypatch.setattr(
+            GitHubOAuthProvider, "fetch_account", lambda self, token: (_ for _ in ()).throw(ProviderUnauthorized())
+        )
+
+        client.post("/professional-presence/connections/github/sync", headers=headers)
+        after = client.get("/professional-presence/audit", headers=headers).json()
+
+        assert after["status"] == "needs_reauth"
+        assert after["connected"] is True
+        assert after["repository_count"] == before["repository_count"] > 0
+        assert after["evidence_count"] == before["evidence_count"] > 0
+
+    def test_one_students_counts_are_not_another_students(self, client):
+        connected = _auth(client, "counts-owner@example.com")
+        _connect(client, connected)
+        client.post("/professional-presence/connections/github/sync", headers=connected)
+
+        stranger = _auth(client, "counts-stranger@example.com")
+        body = client.get("/professional-presence/audit", headers=stranger).json()
+
+        assert body["evidence_count"] == 0
+        assert body["repository_count"] == 0

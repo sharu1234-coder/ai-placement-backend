@@ -96,6 +96,19 @@ class PresenceAuditRead(BaseModel):
     snapshot_captured_at: Optional[datetime.datetime] = None
     # False when the repository listing hit its page cap, so the findings describe a subset.
     listing_complete: bool = True
+    # What the connection is currently worth, in the two numbers a student actually asks about.
+    #
+    # `repository_count` counts the repositories the latest snapshot describes, excluding forks
+    # and archives -- deliberately the same set `GET /history` reports as `public_repositories`
+    # and the same set that produces evidence, so a screen showing both cannot show two numbers
+    # that disagree. It is NOT the account's public repo count from GitHub's profile, which
+    # includes forks and would make "12 repositories, 0 evidence" look like a bug.
+    #
+    # Both default to 0 rather than None: a connection that exists but has never synced has
+    # genuinely zero of each, and an Optional here would push a null check into every client
+    # for a state that is not unknown, merely empty.
+    repository_count: int = 0
+    evidence_count: int = 0
     findings: List[AuditFindingRead] = []
     # Which prompt produced the generated prose, or None when every finding is a template.
     narrative_prompt_version: Optional[str] = None

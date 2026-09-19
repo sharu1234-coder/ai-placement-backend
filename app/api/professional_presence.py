@@ -24,6 +24,7 @@ from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import RedirectResponse
+from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -32,6 +33,7 @@ from app.api.deps import get_current_user, get_db
 from app.core.app_check import verify_app_check_token
 from app.core.config import settings
 from app.core.rate_limit import limiter
+from app.models.external_evidence_item import ExternalEvidenceItem
 from app.models.external_profile_snapshot import ExternalProfileSnapshot
 from app.models.provider_connection import PROVIDER_GITHUB
 from app.models.user import User
@@ -49,7 +51,7 @@ from app.services.professional_presence import (
     oauth_state,
     sync_service,
 )
-from app.services.professional_presence.errors import ProviderError
+from app.services.professional_presence.errors import ProviderError, ProviderUnauthorized
 from app.services.profile_service import get_or_create_profile
 
 logger = logging.getLogger(__name__)
@@ -74,6 +76,10 @@ _RESULT_INVALID = "invalid_request"
 _RESULT_CANCELLED = "cancelled"
 _RESULT_ALREADY_CONNECTED = "already_connected"
 _RESULT_NOT_CONFIGURED = "not_configured"
+
+# The one answer to "this connection cannot be synced until the student reconnects", whichever
+# way it was reached: an unreadable stored credential, or GitHub rejecting the credential itself.
+_RECONNECT_REQUIRED = "This connection needs to be reconnected before it can be synced."
 
 
 def _app_redirect(provider: str, outcome: str, reason: Optional[str] = None) -> RedirectResponse:
@@ -248,6 +254,12 @@ def sync_connection(
     A provider failure is a 502 rather than a 500: the fault is upstream, the category is already
     recorded on the connection, and the message the student sees is written by us. Nothing about
     the provider's own error text travels.
+
+    The exception is a credential GitHub rejects, which is a 409 and not a 502. By then the sync
+    has marked the connection `needs_reauth`, so it is the same state the 409 above reports, and
+    it needs the same instruction: reconnect. Answering it with the 502 that means "GitHub could
+    not be reached" told the student to wait for something waiting would never fix, beside a
+    connection card correctly saying the opposite.
     """
     profile = get_or_create_profile(db, current_user)
     try:
@@ -255,10 +267,10 @@ def sync_connection(
     except sync_service.ConnectionNotFoundError:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not connected.")
     except sync_service.ConnectionNotSyncableError:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="This connection needs to be reconnected before it can be synced.",
-        )
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_RECONNECT_REQUIRED)
+    except ProviderUnauthorized as exc:
+        logger.warning("provider=%s event=sync_failed reason=%s", provider, exc.kind)
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=_RECONNECT_REQUIRED)
     except ProviderError as exc:
         logger.warning("provider=%s event=sync_failed reason=%s", provider, exc.kind)
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc))
@@ -290,6 +302,35 @@ def _freshness(last_synced_at: Optional[datetime.datetime]) -> str:
     if age <= _AGING_DAYS:
         return "aging"
     return "stale"
+
+
+def _counted_repositories(payload: dict) -> List[dict]:
+    """The repositories a snapshot describes, excluding forks and archives.
+
+    One definition, used by both `/audit`'s `repository_count` and `/history`'s
+    `public_repositories`, because they are the same claim and a screen may show them side by
+    side. It is also the set that produces evidence (sync_service._is_evidence_bearing):
+    counting forks here would let a student see "20 repositories, 3 evidence" and reasonably
+    conclude the sync is broken, when the truth is that seventeen of them are somebody else's
+    code.
+    """
+    repos = [r for r in (payload.get("repositories") or []) if isinstance(r, dict)]
+    return [r for r in repos if not r.get("is_fork") and not r.get("is_archived")]
+
+
+def _evidence_count(db: Session, connection_id: int) -> int:
+    """How many evidence rows this connection currently holds.
+
+    Counted in SQL rather than loaded and len()'d: this is rendered on a screen that opens
+    often, and the rows themselves are never wanted here. Scoped to the connection, so a
+    revoked grant's leftovers can never inflate a live connection's number.
+    """
+    return (
+        db.query(func.count(ExternalEvidenceItem.id))
+        .filter(ExternalEvidenceItem.connection_id == connection_id)
+        .scalar()
+        or 0
+    )
 
 
 @router.get("/audit", response_model=PresenceAuditRead, dependencies=_app_check_dep)
@@ -329,6 +370,7 @@ def get_presence_audit(
     if snapshot is None:
         # Connected but never successfully synced. Deliberately not an error: the student has
         # done their part, and the screen's job is to offer the sync rather than to report a fault.
+        # Both counts stay at their zero default, which is the truth rather than a placeholder.
         return PresenceAuditRead(**base)
 
     payload = snapshot.payload if isinstance(snapshot.payload, dict) else {}
@@ -340,6 +382,8 @@ def get_presence_audit(
         **base,
         snapshot_captured_at=snapshot.created_at,
         listing_complete=bool(payload.get("listing_complete", True)),
+        repository_count=len(_counted_repositories(payload)),
+        evidence_count=_evidence_count(db, connection.id),
         findings=[
             AuditFindingRead(
                 code=f.code,
@@ -383,8 +427,7 @@ def get_presence_history(
     items = []
     for row in rows:
         payload = row.payload if isinstance(row.payload, dict) else {}
-        repos = [r for r in (payload.get("repositories") or []) if isinstance(r, dict)]
-        own = [r for r in repos if not r.get("is_fork") and not r.get("is_archived")]
+        own = _counted_repositories(payload)
         languages = sorted(
             {
                 language
