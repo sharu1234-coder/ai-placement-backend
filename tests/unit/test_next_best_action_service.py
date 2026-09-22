@@ -16,10 +16,11 @@ from app.models.job_match import JobMatch
 from app.models.placement_path import PlacementPath
 from app.models.placement_path_topic import PlacementPathTopic
 from app.models.profile import StudentProfile
+from app.models.provider_connection import PROVIDER_GITHUB, ProviderConnection
 from app.models.role import Role
 from app.models.role_skill_weight import RoleSkillWeight
 from app.models.skill_gap import SkillGap
-from app.services.next_best_action_service import get_next_best_action
+from app.services.next_best_action_service import MAX_ACTIONS, get_actions, get_next_best_action
 
 
 @pytest.fixture()
@@ -319,3 +320,123 @@ def test_estimated_minutes_is_present_for_every_action_type(db):
     result = get_next_best_action(db, profile)
     assert result.estimated_minutes is not None
     assert result.estimated_minutes > 0
+
+
+# --- The ranked shortlist -------------------------------------------------------------------
+# The ladder was always a priority order; these cover it yielding more than its winner. The
+# rules worth protecting are that one skill never produces two cards, that each tier speaks at
+# most once so three actions are three kinds of work, and that "no urgent gaps detected" is
+# never said next to a gap.
+
+
+def _github_connection(db, profile_id) -> None:
+    db.add(
+        ProviderConnection(
+            profile_id=profile_id,
+            provider=PROVIDER_GITHUB,
+            provider_user_id="4242",
+            provider_username="priya",
+        )
+    )
+    db.commit()
+
+
+def test_the_shortlist_is_capped_and_ordered_by_tier(db):
+    profile = _profile(db)
+    _career_path(db, profile.id, core_skills=["Python"])  # tier 1
+    _assessment_result(db, profile.id, {}, priority_weaknesses=["SQL"])
+    _jd_skill_gap(db, profile.id, "SQL")  # SQL now has two sources -> tier 2
+    _interview_weak_dimension(db, profile.id)  # tier 4
+
+    actions = get_actions(db, profile)
+
+    assert [a.tier for a in actions] == ["critical_role_gap", "repeated_weakness", "interview_weakness"]
+    assert len(actions) == MAX_ACTIONS
+
+
+def test_one_skill_never_produces_two_actions(db):
+    """Python as a role gap and as a repeated weakness is one Python action, not two."""
+    profile = _profile(db)
+    _career_path(db, profile.id, core_skills=["Python"])
+    _assessment_result(db, profile.id, {}, priority_weaknesses=["Python"])
+    _jd_skill_gap(db, profile.id, "Python")
+
+    actions = get_actions(db, profile)
+
+    assert [a.skill for a in actions].count("Python") == 1
+
+
+def test_the_top_action_still_matches_the_single_action_call(db):
+    """Career Strategy's bottleneck and Today's Mission both compose with this one value."""
+    profile = _profile(db)
+    _career_path(db, profile.id, core_skills=["Python"])
+    _interview_weak_dimension(db, profile.id)
+
+    single = get_next_best_action(db, profile)
+    top = get_actions(db, profile)[0]
+
+    assert (single.tier, single.title, single.skill) == (top.tier, top.title, top.skill)
+
+
+def test_maintenance_is_never_offered_beside_a_real_gap(db):
+    profile = _profile(db)
+    _career_path(db, profile.id, core_skills=["Python"])
+    _interview_weak_dimension(db, profile.id)
+
+    assert all(action.tier != "maintenance" for action in get_actions(db, profile))
+
+
+def test_confidence_and_destination_come_from_the_tier(db):
+    """A tier-1 gap is the most important action and the least certain conclusion: it is
+    inferred from evidence we do not have rather than from anything measured."""
+    profile = _profile(db)
+    _career_path(db, profile.id, core_skills=["Python"])
+
+    action = get_actions(db, profile)[0]
+
+    assert action.confidence == "low"
+    assert action.destination == "roadmap"
+
+
+def test_a_measured_weakness_carries_more_confidence_than_an_absence(db):
+    profile = _profile(db)
+    _career_path(db, profile.id, core_skills=["Python"])
+    _assessment_result(db, profile.id, {}, priority_weaknesses=["SQL"])
+    _jd_skill_gap(db, profile.id, "SQL")
+
+    by_tier = {a.tier: a for a in get_actions(db, profile)}
+
+    assert by_tier["repeated_weakness"].confidence == "high"
+    assert by_tier["critical_role_gap"].confidence == "low"
+
+
+def test_the_no_role_action_points_nowhere_and_claims_nothing(db):
+    profile = _profile(db)
+
+    actions = get_actions(db, profile)
+
+    assert len(actions) == 1
+    assert actions[0].has_recommendation is False
+    assert actions[0].destination is None
+    assert actions[0].confidence is None
+
+
+def test_a_role_gap_says_so_when_github_was_never_connected(db):
+    """The student is told what we could not see, rather than that their code shows nothing."""
+    profile = _profile(db)
+    _career_path(db, profile.id, core_skills=["Python"])
+
+    action = get_actions(db, profile)[0]
+
+    assert any("GitHub isn't connected" in reason for reason in action.reasons)
+
+
+def test_a_connected_student_is_not_told_their_code_is_uncounted(db):
+    profile = _profile(db)
+    _career_path(db, profile.id, core_skills=["Python"])
+    _github_connection(db, profile.id)
+
+    action = get_actions(db, profile)[0]
+
+    assert action.tier == "critical_role_gap"
+    assert not any("GitHub" in reason for reason in action.reasons)

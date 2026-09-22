@@ -145,3 +145,19 @@ def test_career_twin_is_isolated_per_profile(client, auth_headers, other_auth_he
     theirs = client.get("/career-twin", headers=other_auth_headers).json()
     assert mine["has_role"] is True
     assert theirs["has_role"] is False
+
+
+def test_unread_sources_are_named_for_free_students_too(client, auth_headers):
+    """`reasons` is the Premium part of this screen. Which sources we could not read is not:
+    a partial measurement that does not say what is missing invites the student to read an
+    absence of evidence as a verdict, and that is a correctness problem rather than a feature."""
+    role_id = _sde_role_id(client, auth_headers)
+    client.post("/users/me/role", json={"role_id": role_id}, headers=auth_headers)
+
+    body = client.get("/career-twin", headers=auth_headers).json()
+
+    assert "premium" in body["reasons"][0].lower()  # still gated
+    assert body["unavailable_sources"] == ["external", "resume"]  # still told the truth
+
+    readiness = client.get("/career-twin/readiness", headers=auth_headers).json()
+    assert readiness["unavailable_sources"] == body["unavailable_sources"]

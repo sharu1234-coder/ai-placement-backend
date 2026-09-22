@@ -11,6 +11,12 @@ Tier 2 ("repeated weakness") is a real, if provisional, signal: a weakness confi
 independent sources (e.g. both a JD gap and a test result) already existing in
 weakness_service's output. A precise cross-session occurrence counter arrives later with
 Interview Memory; until then this tier never fabricates a count it doesn't have.
+
+The ladder yields a short ranked list, not only its winner. Each tier contributes at most one
+action, so three recommendations are three different kinds of work rather than the same tier
+repeated -- and `maintenance` is offered only when no tier above it had anything to say, since
+"no urgent gaps detected" is false the moment one exists. Duplicates are removed by skill: SQL
+arriving from a role gap and from a weakness is one SQL action, not two.
 """
 
 from typing import List, Optional, Set
@@ -23,13 +29,17 @@ from app.models.job_description import JobDescription
 from app.models.placement_path import PlacementPath
 from app.models.placement_path_topic import PlacementPathTopic
 from app.models.profile import StudentProfile
-from app.schemas.next_best_action import NextBestActionRead
+from app.schemas.next_best_action import NextBestActionItem, NextBestActionRead
 from app.services import evidence_engine
 from app.services.role_context import resolve_role_context
 from app.services.weakness_service import WeaknessItem, compute_weaknesses
 
 _CORE_WEIGHT_THRESHOLD = 1.0
 _SEVERITY_RANK = {"medium": 0, "high": 1}
+
+# Three is the product's own answer to "how many things should someone do next". A longer list
+# is not a plan, and the tiers below it are lower-value by construction.
+MAX_ACTIONS = 3
 
 _ESTIMATED_MINUTES = {
     "learn": 15,
@@ -40,6 +50,45 @@ _ESTIMATED_MINUTES = {
     "maintenance": 10,
 }
 
+# How far each tier's conclusion can be leaned on -- the same three bands career_strategy's
+# bottleneck uses. Deliberately NOT a restatement of priority: tier 1 is simultaneously the most
+# important thing to act on and the least certain, because it is inferred from evidence we do
+# not have rather than from anything measured. Saying so is the difference between "this matters
+# most" and "we know this about you".
+_CONFIDENCE_BY_TIER = {
+    "critical_role_gap": "low",  # inferred from absent evidence
+    "repeated_weakness": "high",  # two or more independent signals agree
+    "assessment_weakness": "moderate",  # one measured signal
+    "interview_weakness": "moderate",  # one measured signal
+    "project_requirement": "high",  # a recorded, unfinished item: a fact, not an inference
+    "resume_jd_gap": "low",  # inferred from an absence on the resume
+    "roadmap_dependency": "high",  # a recorded, unstarted topic
+    "stale_skill": "moderate",  # real evidence, only old
+    "maintenance": "low",  # nothing urgent to point at
+}
+
+# Where each tier sends the student, in career_strategy's existing destination vocabulary.
+# Every key here is one the Android app's own destination table already resolves to a real
+# route, so a recommendation cannot point at a screen that does not exist.
+_DESTINATION_BY_TIER = {
+    "critical_role_gap": "roadmap",
+    "repeated_weakness": "practice",
+    "assessment_weakness": "practice",
+    "interview_weakness": "interview",
+    "project_requirement": "career_path",
+    "resume_jd_gap": "resume_ats",
+    "roadmap_dependency": "roadmap",
+    "stale_skill": "practice",
+    "maintenance": "practice",
+}
+
+# Said only when GitHub genuinely is not connected. "You have no evidence for this" and "we
+# never looked at the one place your evidence would be" are different statements, and only the
+# first is a finding -- see evidence_engine.unavailable_sources.
+_EXTERNAL_UNAVAILABLE_REASON = (
+    "GitHub isn't connected, so any public code you have isn't being counted yet."
+)
+
 
 def _make(
     tier: Optional[str],
@@ -48,8 +97,8 @@ def _make(
     reasons: List[str],
     skill: Optional[str] = None,
     has_recommendation: bool = True,
-) -> NextBestActionRead:
-    return NextBestActionRead(
+) -> NextBestActionItem:
+    return NextBestActionItem(
         has_recommendation=has_recommendation,
         tier=tier,
         title=title,
@@ -57,6 +106,8 @@ def _make(
         estimated_minutes=_ESTIMATED_MINUTES[action_type],
         reasons=reasons,
         skill=skill,
+        confidence=_CONFIDENCE_BY_TIER.get(tier) if tier else None,
+        destination=_DESTINATION_BY_TIER.get(tier) if tier else None,
     )
 
 
@@ -95,19 +146,61 @@ def _compute_all_weaknesses(db: Session, profile_id: int) -> List[WeaknessItem]:
     return _merge_weaknesses(role_weaknesses, jd_weaknesses)
 
 
-def get_next_best_action(db: Session, profile: StudentProfile) -> NextBestActionRead:
-    context = resolve_role_context(db, profile)
-    if context is None or not context.weights:
-        return _make(
-            None,
-            "Select a target role to get a personalized next action.",
-            "maintenance",
-            ["No target role is set yet."],
-            has_recommendation=False,
-        )
+def _no_role_action() -> NextBestActionItem:
+    """What to say before there is a target role to measure anything against.
 
-    skills = list(context.weights.keys())
-    evidence_by_skill = {v.skill: v for v in evidence_engine.get_all_skill_evidence(db, profile.id, skills)}
+    has_recommendation=False, because "choose a role" is a prerequisite rather than career
+    work -- the client renders it differently, and a fabricated skill action here would be
+    advice derived from nothing.
+    """
+    return _make(
+        None,
+        "Select a target role to get a personalized next action.",
+        "maintenance",
+        ["No target role is set yet."],
+        has_recommendation=False,
+    )
+
+
+def _build_candidates(
+    db: Session,
+    profile: StudentProfile,
+    context,
+    evidence_by_skill: dict,
+    skills: List[str],
+    limit: int,
+) -> List[NextBestActionItem]:
+    """Tiers 1-8 in priority order, at most one action per tier, de-duplicated as they arrive.
+
+    Tier 9 (maintenance) is deliberately not built here: it states that no urgent gaps were
+    detected, which is only true when this list comes back empty. get_actions adds it in that
+    case and in no other.
+
+    Stops querying as soon as `limit` distinct actions exist. That is what keeps the
+    single-action callers -- Career Strategy's bottleneck and Today's Mission -- reading
+    exactly the rows they read before this list existed: a tier-1 hit still returns without
+    ever touching Career Path projects or Placement Path topics.
+    """
+    candidates: List[NextBestActionItem] = []
+    seen: Set[str] = set()
+
+    def add(action: NextBestActionItem) -> None:
+        """One action per subject, highest tier first.
+
+        SQL arriving as a role gap, as a repeated weakness and as a JD gap is one SQL action:
+        three cards naming the same skill read as a broken screen, and the tier that found it
+        first is by construction the most valuable framing of it. Keyed on the skill where
+        there is one and otherwise on the title, so the two tiers that recommend a named piece
+        of work (a Career Path project, a roadmap topic) cannot collapse into each other.
+        """
+        key = (action.skill or action.title).strip().lower()
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append(action)
+
+    def full() -> bool:
+        return len(candidates) >= limit
 
     # Tier 1 -- critical role gap: a core skill (role-weighted >= 1.0) with zero real evidence.
     core_gaps = sorted(
@@ -116,17 +209,22 @@ def get_next_best_action(db: Session, profile: StudentProfile) -> NextBestAction
     )
     if core_gaps:
         skill = core_gaps[0]
-        return _make(
-            "critical_role_gap",
-            f"Learn {skill} fundamentals",
-            "learn",
-            [
-                f"{context.display_role_name} is your current target role.",
-                f"{skill} is a core skill for this role.",
-                "You have no evidence yet for this skill.",
-            ],
-            skill=skill,
+        reasons = [
+            f"{context.display_role_name} is your current target role.",
+            f"{skill} is a core skill for this role.",
+            "You have no evidence yet for this skill.",
+        ]
+        # The one tier whose entire case is an absence of evidence, and therefore the one tier
+        # obliged to say whether we could see everywhere. Asked only when there is something to
+        # qualify, so the extra read never lands on the paths that do not need it.
+        if evidence_engine.SOURCE_EXTERNAL in evidence_engine.unavailable_sources(db, profile.id):
+            reasons.append(_EXTERNAL_UNAVAILABLE_REASON)
+        add(
+            _make("critical_role_gap", f"Learn {skill} fundamentals", "learn", reasons, skill=skill)
         )
+
+    if full():
+        return candidates
 
     weaknesses = _compute_all_weaknesses(db, profile.id)
 
@@ -134,24 +232,28 @@ def get_next_best_action(db: Session, profile: StudentProfile) -> NextBestAction
     repeated = [w for w in weaknesses if len(w.sources) >= 2]
     if repeated:
         w = repeated[0]
-        return _make(
-            "repeated_weakness",
-            f"Fix {w.skill_tag}",
-            "practice",
-            [f"{w.skill_tag} was flagged by multiple signals: {', '.join(sorted(w.sources))}."],
-            skill=w.skill_tag,
+        add(
+            _make(
+                "repeated_weakness",
+                f"Fix {w.skill_tag}",
+                "practice",
+                [f"{w.skill_tag} was flagged by multiple signals: {', '.join(sorted(w.sources))}."],
+                skill=w.skill_tag,
+            )
         )
 
     # Tier 3 -- assessment weakness.
     assessment_only = _by_sources(weaknesses, {"test_result"})
     if assessment_only:
         w = assessment_only[0]
-        return _make(
-            "assessment_weakness",
-            f"Practice {w.skill_tag}",
-            "practice",
-            [f"Your last assessment flagged {w.skill_tag} as a weak area."],
-            skill=w.skill_tag,
+        add(
+            _make(
+                "assessment_weakness",
+                f"Practice {w.skill_tag}",
+                "practice",
+                [f"Your last assessment flagged {w.skill_tag} as a weak area."],
+                skill=w.skill_tag,
+            )
         )
 
     # Tier 4 -- interview weakness.
@@ -159,13 +261,18 @@ def get_next_best_action(db: Session, profile: StudentProfile) -> NextBestAction
     if interview_only:
         w = interview_only[0]
         label = w.skill_tag.replace("interview:", "").replace("_", " ")
-        return _make(
-            "interview_weakness",
-            f"Practice interview answers on {label}",
-            "practice",
-            [f"A recent interview evaluation flagged {label} as a weak area."],
-            skill=w.skill_tag,
+        add(
+            _make(
+                "interview_weakness",
+                f"Practice interview answers on {label}",
+                "practice",
+                [f"A recent interview evaluation flagged {label} as a weak area."],
+                skill=w.skill_tag,
+            )
         )
+
+    if full():
+        return candidates
 
     # Tier 5 -- project requirement: an incomplete Career Path project.
     path = db.query(CareerPath).filter(CareerPath.profile_id == profile.id, CareerPath.is_primary.is_(True)).first()
@@ -177,24 +284,31 @@ def get_next_best_action(db: Session, profile: StudentProfile) -> NextBestAction
             .first()
         )
         if pending_project is not None:
-            return _make(
-                "project_requirement",
-                f"Work on: {pending_project.title}",
-                "project",
-                [f"{pending_project.title} is part of your Career Path and isn't finished yet."],
+            add(
+                _make(
+                    "project_requirement",
+                    f"Work on: {pending_project.title}",
+                    "project",
+                    [f"{pending_project.title} is part of your Career Path and isn't finished yet."],
+                )
             )
 
     # Tier 6 -- resume/JD gap.
     jd_only = _by_sources(weaknesses, {"jd_gap"})
     if jd_only:
         w = jd_only[0]
-        return _make(
-            "resume_jd_gap",
-            f"Close the {w.skill_tag} gap for your job description",
-            "resume",
-            [f"A job description you're preparing for requires {w.skill_tag}, which isn't on your resume yet."],
-            skill=w.skill_tag,
+        add(
+            _make(
+                "resume_jd_gap",
+                f"Close the {w.skill_tag} gap for your job description",
+                "resume",
+                [f"A job description you're preparing for requires {w.skill_tag}, which isn't on your resume yet."],
+                skill=w.skill_tag,
+            )
         )
+
+    if full():
+        return candidates
 
     # Tier 7 -- roadmap dependency: the next not-started Placement Path topic.
     placement_path = (
@@ -208,28 +322,36 @@ def get_next_best_action(db: Session, profile: StudentProfile) -> NextBestAction
             .first()
         )
         if next_topic is not None:
-            return _make(
-                "roadmap_dependency",
-                f"Continue your roadmap: {next_topic.title}",
-                "roadmap",
-                ["Your roadmap has an unstarted topic ready to go."],
-                skill=next_topic.skill_tag,
+            add(
+                _make(
+                    "roadmap_dependency",
+                    f"Continue your roadmap: {next_topic.title}",
+                    "roadmap",
+                    ["Your roadmap has an unstarted topic ready to go."],
+                    skill=next_topic.skill_tag,
+                )
             )
 
     # Tier 8 -- stale skill: real evidence, but old.
     stale_skills = sorted(skill for skill in skills if evidence_by_skill[skill].state == "stale")
     if stale_skills:
         skill = stale_skills[0]
-        return _make(
-            "stale_skill",
-            f"Refresh your {skill} evidence",
-            "practice",
-            [f"Your {skill} evidence hasn't been demonstrated recently."],
-            skill=skill,
+        add(
+            _make(
+                "stale_skill",
+                f"Refresh your {skill} evidence",
+                "practice",
+                [f"Your {skill} evidence hasn't been demonstrated recently."],
+                skill=skill,
+            )
         )
 
-    # Tier 9 -- maintenance: nothing urgent. Keep the currently-weakest-but-fine skill sharp
-    # rather than fabricating a gap that doesn't exist.
+    return candidates
+
+
+def _maintenance_action(skills: List[str], evidence_by_skill: dict) -> NextBestActionItem:
+    """Tier 9 -- nothing urgent. Keep the currently-weakest-but-fine skill sharp rather than
+    fabricating a gap that doesn't exist."""
     ranked = sorted(skills, key=lambda s: (evidence_by_skill[s].confidence, s))
     if not ranked:
         return _make(None, "Keep up the momentum", "maintenance", ["No urgent gaps detected."], has_recommendation=False)
@@ -242,3 +364,31 @@ def get_next_best_action(db: Session, profile: StudentProfile) -> NextBestAction
         ["No urgent gaps detected -- this keeps your strongest-need area from going stale."],
         skill=skill,
     )
+
+
+def get_actions(db: Session, profile: StudentProfile, limit: int = MAX_ACTIONS) -> List[NextBestActionItem]:
+    """The ranked shortlist, highest value first. Never empty.
+
+    Deterministic: the same stored rows produce the same list in the same order, every time.
+    Every tier is a pure function of data this app already owns, and nothing here calls AI.
+    """
+    context = resolve_role_context(db, profile)
+    if context is None or not context.weights:
+        return [_no_role_action()]
+
+    skills = list(context.weights.keys())
+    evidence_by_skill = {v.skill: v for v in evidence_engine.get_all_skill_evidence(db, profile.id, skills)}
+
+    actions = _build_candidates(db, profile, context, evidence_by_skill, skills, limit)[:limit]
+    return actions or [_maintenance_action(skills, evidence_by_skill)]
+
+
+def get_next_best_action(db: Session, profile: StudentProfile) -> NextBestActionRead:
+    """The single most valuable thing to do next.
+
+    Unchanged in shape and meaning: this is still the top of the same ladder, and Career
+    Strategy's bottleneck and Today's Mission both still get exactly the one recommendation
+    they already composed with.
+    """
+    top = get_actions(db, profile, limit=1)[0]
+    return NextBestActionRead(**top.model_dump())

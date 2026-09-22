@@ -138,7 +138,15 @@ def _fetch_profile_sources(db: Session, profile_id: int) -> _ProfileEvidenceSour
         db.query(InterviewQuestion, InterviewEvaluation)
         .join(Interview, Interview.id == InterviewQuestion.interview_id)
         .join(InterviewEvaluation, InterviewEvaluation.interview_id == Interview.id)
-        .filter(Interview.profile_id == profile_id)
+        .filter(
+            Interview.profile_id == profile_id,
+            # Only genuinely graded interviews are evidence. An evaluation whose AI review
+            # failed exists as a row but carries no score -- excluding it here, in SQL, is what
+            # keeps "we could not grade this" out of the student's skill state entirely, rather
+            # than relying on every reader downstream to remember to null-check. Exactly the
+            # filter recruiter_attack_rows below has always had, and for the same reason.
+            InterviewEvaluation.overall_score.isnot(None),
+        )
         .order_by(InterviewEvaluation.created_at.desc())
         .all()
     )
@@ -459,6 +467,56 @@ def get_all_skill_evidence(db: Session, profile_id: int, skills: List[str]) -> L
     in-memory snapshot, rather than re-querying per skill."""
     sources = _fetch_profile_sources(db, profile_id)
     return [_evidence_view_from_sources(sources, skill) for skill in skills]
+
+
+# The two sources whose absence we can genuinely tell apart from an absence of evidence.
+# Everything else in the ladder above is produced by the student using this app, so "no
+# assessment" really does mean they have not taken one -- there is no separate "we could not
+# look" case to report. Named in EvidenceItem.source vocabulary rather than a second one.
+SOURCE_EXTERNAL = "external"
+SOURCE_RESUME = "resume"
+
+
+def unavailable_sources(db: Session, profile_id: int) -> List[str]:
+    """The evidence sources we could not look at at all for this profile.
+
+    "We did not look" and "we looked and found nothing" are different facts, and only the
+    second one says anything about the student. A student who never connected GitHub has no
+    external evidence rows -- exactly like a student who connected it and writes no public
+    code. Telling the first of them that their public code shows nothing would be reporting a
+    finding from a search that never happened.
+
+    Nothing here changes a skill's state or confidence. A source we could not read contributes
+    no evidence either way, which is already what every matcher above does. This list exists so
+    a caller can say so out loud, instead of letting an absence read as a verdict.
+
+    A connection that needs re-authorising is deliberately NOT unavailable: it is connected,
+    and the evidence it already produced is still on file and still counted (see
+    _fetch_profile_sources, which excludes only revoked connections). What it needs is a
+    reconnect prompt, which the Professional Presence screen already owns.
+    """
+    missing: List[str] = []
+
+    live_connection = (
+        db.query(ProviderConnection.id)
+        .filter(
+            ProviderConnection.profile_id == profile_id,
+            ProviderConnection.revoked_at.is_(None),
+        )
+        .first()
+    )
+    if live_connection is None:
+        missing.append(SOURCE_EXTERNAL)
+
+    try:
+        # The same reader the matchers use, so "we have a resume to read" cannot mean one thing
+        # here and another there. A parsed resume that yielded no skills is available-and-empty,
+        # not unavailable: we did look.
+        latest_resume_skills(db, profile_id)
+    except NoResumeAnalysisError:
+        missing.append(SOURCE_RESUME)
+
+    return missing
 
 
 # One shared phrasing table for "what should I do about this skill", keyed by evidence state

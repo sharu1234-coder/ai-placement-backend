@@ -12,6 +12,18 @@ well-evidenced", which is a meaningfully different (and more honest) number than
 whatever raw test scores happen to exist. measured_score, confidence, and state stay separate,
 visible fields per skill so "why this %?" is always answerable from real data, never a black
 box.
+
+This is the canonical career-level readiness number, and the only one that answers "how ready
+am I for my target role". The product deliberately computes several other readiness figures,
+and each is scoped to a narrower question rather than being a competing answer to this one:
+
+  career_path/service._compute_job_readiness   one saved Career Path's own completion
+  job_hunt/readiness.compute                   one advert, "can I apply to this today"
+  progress_service                             a mean of recent test scores, for the dashboard
+
+Anything new that wants to say how ready a student is for their target role belongs here, and
+must not introduce a fourth number -- two screens disagreeing about one student is how a
+readiness figure stops being believed at all.
 """
 
 import datetime
@@ -266,6 +278,13 @@ def get_current(
 
     weaknesses = compute_weaknesses(db, profile.id, jd_id=None)
 
+    # Which sources this number could not see. Readiness is unchanged by it -- a source we
+    # could not read contributes nothing either way -- but a student looking at a partial
+    # measurement is entitled to know which part is missing, rather than reading "no evidence"
+    # as a finding about them. Computed only on the path that actually produces a number: the
+    # no-role and no-skills branches above have nothing for it to qualify.
+    missing_sources = evidence_engine.unavailable_sources(db, profile.id)
+
     return CareerTwinRead(
         has_role=True,
         role_family_key=context.role_family_key,
@@ -279,4 +298,5 @@ def get_current(
         biggest_gap_skill=biggest_gap,
         next_action_hint=next_action_hint,
         weak_skill_tags=[w.skill_tag for w in weaknesses[:_MAX_WEAK_TAGS]],
+        unavailable_sources=missing_sources,
     )

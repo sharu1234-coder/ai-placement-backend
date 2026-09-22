@@ -12,10 +12,11 @@ from app.models.assessment_result import AssessmentResult
 from app.models.career_path import CareerPath
 from app.models.profile import StudentProfile
 from app.models.project import Project
+from app.models.provider_connection import PROVIDER_GITHUB, ProviderConnection
 from app.models.readiness_snapshot import ReadinessSnapshot
 from app.models.role import Role
 from app.models.role_skill_weight import RoleSkillWeight
-from app.services import notification_service
+from app.services import evidence_engine, notification_service
 from app.services.career_twin_service import _upsert_snapshot, get_current
 
 _UTC = datetime.timezone.utc
@@ -532,3 +533,49 @@ def test_readiness_trend_still_works_at_the_far_edge_of_the_window(db):
 
     twin = get_current(db, profile)
     assert twin.readiness_trend_percent == twin.readiness_percent - 10
+
+
+# --- What the number could not see ----------------------------------------------------------
+# Readiness is a weighted average over evidence we were able to read. When a source was never
+# connected, the honest thing is to say which one -- not to let its absence read as a finding
+# about the student. See evidence_engine.unavailable_sources.
+
+
+def _role_with_one_skill(db) -> Role:
+    role = Role(name="Data Analyst", category="Data")
+    db.add(role)
+    db.commit()
+    db.refresh(role)
+    db.add(RoleSkillWeight(role_id=role.id, skill="SQL", weight=1.0, assessment_type="sql"))
+    db.commit()
+    return role
+
+
+def test_the_twin_names_the_sources_it_could_not_read(db):
+    role = _role_with_one_skill(db)
+    profile = _profile(db, target_role_id=role.id)
+
+    twin = get_current(db, profile)
+
+    assert twin.unavailable_sources == [evidence_engine.SOURCE_EXTERNAL, evidence_engine.SOURCE_RESUME]
+    # The readiness number itself is unaffected: a source we could not read contributes no
+    # evidence either way, which is already what every matcher does.
+    assert twin.readiness_percent == 0
+
+
+def test_a_connected_student_has_nothing_reported_as_unread(db):
+    role = _role_with_one_skill(db)
+    profile = _profile(db, target_role_id=role.id)
+    db.add(
+        ProviderConnection(
+            profile_id=profile.id,
+            provider=PROVIDER_GITHUB,
+            provider_user_id="4242",
+            provider_username="priya",
+        )
+    )
+    db.commit()
+
+    twin = get_current(db, profile)
+
+    assert evidence_engine.SOURCE_EXTERNAL not in twin.unavailable_sources

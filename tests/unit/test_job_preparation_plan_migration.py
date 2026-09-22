@@ -137,7 +137,11 @@ def test_the_migration_round_trips_with_existing_data_intact(migration_target):
     plan_id = _insert_plan_at_previous_revision(migration_target)
     assert plan_id is not None
 
-    command.upgrade(config, "head")
+    # Pinned to this migration rather than "head", matching
+    # test_professional_presence_migration.py. The two were equivalent when this test was
+    # written because this migration WAS head -- which quietly made the test fail the moment
+    # any later migration was added, for reasons having nothing to do with what it tests.
+    command.upgrade(config, _THIS_REVISION)
     columns = _columns(migration_target)
     for name in _NEW_COLUMNS:
         assert name in columns, f"{name} missing after upgrade"
@@ -173,7 +177,7 @@ def test_the_migration_round_trips_with_existing_data_intact(migration_target):
 
     # Catches a downgrade that left something behind: it fails only on the next upgrade, which
     # in practice means during a rollback.
-    command.upgrade(config, "head")
+    command.upgrade(config, _THIS_REVISION)
     columns = _columns(migration_target)
     for name in _NEW_COLUMNS:
         assert name in columns, f"{name} missing after the second upgrade"

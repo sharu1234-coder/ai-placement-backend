@@ -40,6 +40,13 @@ class CareerTwinRead(BaseModel):
 
     weak_skill_tags: List[str] = []
 
+    # Evidence sources we could not read at all (evidence_engine.unavailable_sources), in
+    # EvidenceItem.source vocabulary. Deliberately NOT premium-gated like `reasons` is: a
+    # readiness number computed without a source the student never connected is a partial
+    # measurement, and saying which part is missing is honesty about our own coverage rather
+    # than an advanced insight to sell.
+    unavailable_sources: List[str] = []
+
 
 class CareerTwinReadinessRead(BaseModel):
     """A trimmed projection of CareerTwinRead for a cheap, cacheable Home-screen widget --
@@ -54,3 +61,4 @@ class CareerTwinReadinessRead(BaseModel):
     reasons: List[str] = []
     biggest_gap_skill: Optional[str] = None
     next_action_hint: Optional[str] = None
+    unavailable_sources: List[str] = []

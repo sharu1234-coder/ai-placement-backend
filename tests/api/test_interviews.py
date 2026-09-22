@@ -449,3 +449,134 @@ def test_full_voice_interview_lifecycle_scores_filler_words(client, auth_headers
     assert body["speaking_pace"] is None  # not computable without persisting audio duration
     # SAMPLE_TRANSCRIPT ("Um, so I basically used ... like, bisected ...") has real fillers.
     assert body["filler_word_rate"] > 0.0
+
+
+# --------------------------------------------------------------------------------------
+# Full Recruiter Simulation over the same endpoints (Phase 2B)
+# --------------------------------------------------------------------------------------
+
+
+def test_start_full_simulation_is_accepted_by_the_existing_endpoint(client, auth_headers, role_selected):
+    """No new router, no new request model -- the existing creation endpoint simply accepts the
+    new type value."""
+    resp = client.post("/interviews", json={"type": "full_simulation"}, headers=auth_headers)
+
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["type"] == "full_simulation"
+    assert body["status"] == "in_progress"
+
+
+def test_an_unknown_interview_type_is_still_rejected(client, auth_headers, role_selected):
+    """The Literal stays the only vocabulary -- widening it for the simulation must not turn
+    `type` into a free-text field."""
+    resp = client.post("/interviews", json={"type": "recruiter_freestyle"}, headers=auth_headers)
+
+    assert resp.status_code == 422
+
+
+def test_next_question_reports_the_stage_the_server_decided(client, auth_headers, role_selected, use_fake_ai):
+    interview_id = client.post(
+        "/interviews", json={"type": "full_simulation"}, headers=auth_headers
+    ).json()["id"]
+
+    body = client.get(f"/interviews/{interview_id}/next-question", headers=auth_headers).json()
+
+    assert body["stage"] == "INTRO"
+    assert body["stage_label"] == "Introduction"
+    assert body["question_number"] == 1
+    assert body["total_questions"] == 12
+
+
+def test_a_simulation_runs_to_completion_and_is_evaluated_over_the_existing_endpoints(
+    client, auth_headers, role_selected, use_fake_ai
+):
+    """The whole product flow through the existing API surface: create, twelve question/answer
+    turns, completion, then the ordinary evaluation endpoint with the ordinary dimensions."""
+    interview_id = client.post(
+        "/interviews", json={"type": "full_simulation"}, headers=auth_headers
+    ).json()["id"]
+
+    seen_stages = []
+    for _ in range(20):  # generous bound; the server decides when it ends
+        next_q = client.get(f"/interviews/{interview_id}/next-question", headers=auth_headers).json()
+        if next_q["completed"]:
+            assert next_q["stage"] == "CLOSING"
+            break
+        seen_stages.append(next_q["stage"])
+        answer = client.post(
+            f"/interviews/{interview_id}/answer",
+            json={
+                "interview_question_id": next_q["question"]["id"],
+                "answer_text": "I owned the ingestion path and cut latency by batching writes.",
+            },
+            headers=auth_headers,
+        )
+        assert answer.status_code == 200
+
+    assert seen_stages == [
+        "INTRO", "BACKGROUND", "BACKGROUND", "RESUME", "RESUME", "PROJECT", "PROJECT",
+        "TECHNICAL", "TECHNICAL", "TECHNICAL", "BEHAVIORAL", "CANDIDATE_Q",
+    ]
+
+    result = client.get(f"/interviews/{interview_id}/evaluation", headers=auth_headers)
+    assert result.status_code == 200
+    body = result.json()
+    assert body["overall_score"] == SAMPLE_GENERATED_EVALUATION.overall_score
+    assert body["role_jd_coverage"] == SAMPLE_GENERATED_EVALUATION.role_jd_coverage
+
+
+def test_the_client_cannot_choose_its_own_stage_or_question_number(
+    client, auth_headers, role_selected, use_fake_ai
+):
+    """Stage is derived from the question's position server-side. Anything the client sends
+    alongside the request is ignored, and there is no endpoint that advances a stage."""
+    interview_id = client.post(
+        "/interviews",
+        json={"type": "full_simulation", "stage": "TECHNICAL", "question_number": 9, "total_questions": 99},
+        headers=auth_headers,
+    ).json()["id"]
+
+    body = client.get(f"/interviews/{interview_id}/next-question", headers=auth_headers).json()
+
+    assert body["stage"] == "INTRO"
+    assert body["question_number"] == 1
+    assert body["total_questions"] == 12
+
+
+def test_a_simulation_shows_up_in_the_existing_history_endpoint(client, auth_headers, role_selected, use_fake_ai):
+    interview_id = client.post(
+        "/interviews", json={"type": "full_simulation"}, headers=auth_headers
+    ).json()["id"]
+
+    history = client.get("/interviews", headers=auth_headers).json()
+
+    item = next(i for i in history if i["id"] == interview_id)
+    assert item["type"] == "full_simulation"
+    assert item["status"] == "in_progress"
+
+
+def test_another_students_simulation_is_not_reachable(client, auth_headers, role_selected, use_fake_ai):
+    interview_id = client.post(
+        "/interviews", json={"type": "full_simulation"}, headers=auth_headers
+    ).json()["id"]
+
+    client.post("/auth/signup", json={"email": "intruder-sim@example.com", "password": "supersecret123"})
+    other_token = client.post(
+        "/auth/login", json={"email": "intruder-sim@example.com", "password": "supersecret123"}
+    ).json()["access_token"]
+    other_headers = {"Authorization": f"Bearer {other_token}"}
+
+    assert client.get(f"/interviews/{interview_id}/next-question", headers=other_headers).status_code == 404
+    assert client.get(f"/interviews/{interview_id}/evaluation", headers=other_headers).status_code == 404
+
+
+def test_an_ordinary_interview_still_reports_no_stage(client, auth_headers, role_selected, use_fake_ai):
+    """Existing types are untouched: no stage, and the count they have always had."""
+    interview_id = client.post("/interviews", json={}, headers=auth_headers).json()["id"]
+
+    body = client.get(f"/interviews/{interview_id}/next-question", headers=auth_headers).json()
+
+    assert body["stage"] is None
+    assert body["stage_label"] is None
+    assert body["total_questions"] == 5
