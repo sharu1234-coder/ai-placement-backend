@@ -6,6 +6,7 @@ from app.models.arena_attempt import ArenaAttempt
 from app.models.assessment import Assessment
 from app.models.assessment_blueprint import AssessmentBlueprint
 from app.models.assessment_result import AssessmentResult
+from app.models.career_goal import CareerGoal
 from app.models.career_path import CareerPath
 from app.models.career_path_phase import CareerPathPhase
 from app.models.career_path_project import CareerPathProject
@@ -249,6 +250,12 @@ def delete_account(db: Session, user: User, storage: StorageProvider) -> None:
         db.query(Interview).filter(Interview.profile_id == pid).delete(synchronize_session=False)
         db.query(Roadmap).filter(Roadmap.profile_id == pid).delete(synchronize_session=False)
         db.query(JobMatch).filter(JobMatch.profile_id == pid).delete(synchronize_session=False)
+
+        # -- career_goals: nothing references it, and it nullably references job_descriptions,
+        # so it only has to precede that delete below. Its profile_id is NOT NULL, which is why
+        # omitting it would not merely orphan rows -- it would make the student_profiles delete
+        # at the end fail outright. -----------------------------------------------------------
+        db.query(CareerGoal).filter(CareerGoal.profile_id == pid).delete(synchronize_session=False)
 
         # -- recruiter_attack_sessions: its own turns are gone (leaves, above); must precede
         # project_builds below since source_project_build_id nullably references it. ---------

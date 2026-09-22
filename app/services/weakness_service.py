@@ -99,10 +99,21 @@ def _from_interview_evaluations(db: Session, profile_id: int, jd_id: Optional[in
         .filter(Interview.profile_id == profile_id)
     )
     query = query.filter(Interview.jd_id == jd_id) if jd_id is not None else query.filter(Interview.jd_id.is_(None))
+    # Only genuinely graded interviews carry a signal. Since Phase 2C an evaluation whose AI
+    # review failed exists as a row with every score NULL, and the comparison below is
+    # `score >= threshold` -- so one ungraded interview raised TypeError out of every caller of
+    # compute_weaknesses: GET /weaknesses, Next Best Action, Today's Mission. Excluded here, in
+    # SQL, exactly as evidence_engine._fetch_profile_sources excludes them, rather than relying
+    # on each dimension's comparison to remember to null-check.
+    query = query.filter(InterviewEvaluation.overall_score.isnot(None))
 
     for evaluation in query.all():
         for dimension in INTERVIEW_DIMENSIONS:
             score = getattr(evaluation, dimension)
+            if score is None:
+                # A mode-specific dimension that does not apply to this interview (grammar is
+                # text-only, speaking_pace/filler_word_rate are voice-only). Absent, not weak.
+                continue
             if score >= INTERVIEW_DIMENSION_THRESHOLD:
                 continue
             severity = "high" if score < _INTERVIEW_HIGH_SEVERITY_THRESHOLD else "medium"

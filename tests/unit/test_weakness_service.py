@@ -237,3 +237,98 @@ def test_an_unmeasured_weakness_never_outranks_a_measured_high_severity_one(db):
     assert [w.skill_tag for w in weaknesses] == ["DSA", "Kafka"]
     assert weaknesses[0].severity == "high"
     assert weaknesses[1].severity == "medium"
+
+
+# ==========================================================================================
+# Phase 2C's nullable scores, reaching this module
+# ==========================================================================================
+
+
+def test_an_ungraded_interview_evaluation_is_skipped_rather_than_crashing(db):
+    """A live regression, found while wiring Career Goals to this engine.
+
+    Phase 2C made an evaluation whose AI review failed a real, storable state: the row exists
+    and every score is NULL. This module compares every dimension with `score >= threshold`, so
+    a single ungraded interview raised
+
+        TypeError: '>=' not supported between instances of 'NoneType' and 'float'
+
+    out of compute_weaknesses -- and out of every one of its callers: GET /weaknesses, Next Best
+    Action, and Today's Mission. One failed AI review broke all three for that student until the
+    row was regraded.
+
+    An ungraded evaluation is not a weak result, it is the absence of a result, so it teaches
+    this engine nothing -- the same rule, and the same SQL-level exclusion, that
+    evidence_engine._fetch_profile_sources already applies.
+    """
+    interview = Interview(profile_id=1, type="technical", mode="text", status="completed")
+    db.add(interview)
+    db.commit()
+    db.refresh(interview)
+    # Exactly what interview_service._persist_ungraded writes: feedback, and no scores at all.
+    db.add(InterviewEvaluation(interview_id=interview.id, feedback_text="could not be reviewed"))
+    db.commit()
+
+    assert compute_weaknesses(db, profile_id=1, jd_id=None) == []
+
+
+def test_a_graded_interview_is_still_read_alongside_an_ungraded_one(db):
+    """The exclusion must be exactly one row wide: skipping the ungraded evaluation must not
+    also lose the real signal sitting next to it."""
+    ungraded = Interview(profile_id=1, type="technical", mode="text", status="completed")
+    graded = Interview(profile_id=1, type="technical", mode="text", status="completed")
+    db.add_all([ungraded, graded])
+    db.commit()
+    db.refresh(ungraded)
+    db.refresh(graded)
+    db.add(InterviewEvaluation(interview_id=ungraded.id, feedback_text="could not be reviewed"))
+    db.add(
+        InterviewEvaluation(
+            interview_id=graded.id,
+            technical_correctness=0.3,
+            relevance=0.9,
+            completeness=0.9,
+            reasoning=0.9,
+            structure=0.9,
+            clarity=0.9,
+            grammar=0.9,
+            role_jd_coverage=0.9,
+            overall_score=0.8,
+            feedback_text="ok",
+        )
+    )
+    db.commit()
+
+    weaknesses = compute_weaknesses(db, profile_id=1, jd_id=None)
+
+    assert [w.skill_tag for w in weaknesses] == ["interview:technical_correctness"]
+
+
+def test_a_mode_specific_null_dimension_is_absent_not_weak(db):
+    """grammar is text-only; speaking_pace and filler_word_rate are voice-only. A NULL there
+    means the dimension does not apply to this interview, which is not the same as scoring
+    badly on it -- and must never be reported as a weakness."""
+    interview = Interview(profile_id=1, type="technical", mode="voice", status="completed")
+    db.add(interview)
+    db.commit()
+    db.refresh(interview)
+    db.add(
+        InterviewEvaluation(
+            interview_id=interview.id,
+            technical_correctness=0.9,
+            relevance=0.9,
+            completeness=0.9,
+            reasoning=0.9,
+            structure=0.9,
+            clarity=0.9,
+            grammar=None,  # voice interview: not applicable
+            speaking_pace=None,
+            filler_word_rate=None,
+            role_jd_coverage=0.9,
+            overall_score=0.9,
+            feedback_text="ok",
+        )
+    )
+    db.commit()
+
+    assert compute_weaknesses(db, profile_id=1, jd_id=None) == []
