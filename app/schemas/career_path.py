@@ -143,7 +143,18 @@ class CareerPathSummaryRead(BaseModel):
     role_family_key: str
     display_role_name: str
     is_primary: bool
-    readiness_percent: int
+    # PREPARATION PROGRESS -- completed_items / total_items, nothing else. Renamed from
+    # readiness_percent in Phase 2F because that is not what it measures: readiness in this
+    # product is JobReadinessRead.overall_percent, which averages five grounded signals
+    # (skills, projects, resume, practice, interview). Ticking items off a checklist is
+    # preparation, and calling it readiness told a student they were "73% ready" on the
+    # strength of having marked 73% of a list done.
+    #
+    # Optional because a path with no items yet has nothing to divide by. None means "nothing
+    # to measure"; 0 means "there are items and none are complete". The two are different
+    # facts and this schema already draws that distinction for resume/practice/interview
+    # percents above.
+    preparation_percent: Optional[int] = None
     completed_items: int
     total_items: int
     generated_via: str

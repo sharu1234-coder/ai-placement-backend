@@ -224,7 +224,10 @@ class TestComparison:
         comparison = strategy_service.compare_targets(db, profile, is_premium=True, now=NOW)
         lab = career_decision_service.simulate(db, profile.id, [analyst.id], None)
         mine = next(e for e in comparison.targets if e.display_role_name == "Data Analyst")
-        assert mine.readiness_percent == lab.roles[0].readiness_percent
+        # Phase 2G gave TargetStrategyRead the same field name as its source. The point of
+        # this test is unchanged and now reads directly: there is ONE number, and both screens
+        # show it rather than each computing its own.
+        assert mine.evidence_coverage_percent == lab.roles[0].evidence_coverage_percent
         assert mine.classification == lab.roles[0].classification
 
     def test_unique_and_shared_gaps_are_decided_across_the_whole_set(self, db):

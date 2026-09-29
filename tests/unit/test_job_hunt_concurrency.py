@@ -37,6 +37,7 @@ from app.database.base import Base
 from app.models.job_alert import JobAlert, JobAlertDelivery
 from app.models.job_listing import JobListing
 from app.models.profile import StudentProfile
+from app.models.saved_job import SavedJob
 from app.models.user import User
 from app.services.job_hunt import alerts, service
 from app.services.job_hunt.providers.base import ProviderJob, ProviderSearchResult
@@ -230,6 +231,93 @@ class TestListingInsertRace:
 
         assert adopted.id == winner_id
         assert db.query(JobListing).count() == 1
+
+
+class TestManualJobInsertRace:
+    """Two submissions of the same manually entered job, at once.
+
+    Phase 4 reuses the existing (provider, provider_job_id) unique constraint as the
+    deduplication key for manual entry: the id is derived from the link, so the constraint
+    that already keeps two concurrent searches from storing one advert twice also keeps a
+    double-tapped submit button from producing two tracked applications. These pin that it
+    genuinely recovers rather than raising into the student's face, and that the recovery path
+    is the same savepoint the provider path uses.
+    """
+
+    def test_a_double_submit_of_the_same_link_produces_one_tracked_job(self, db, monkeypatch):
+        profile = make_profile(db)
+        url = "https://careers.example.com/de-2026"
+
+        first = service.add_manual_job(db, profile.id, title="Data Engineer", url=url)
+
+        # The second submission's pre-insert lookup runs before the first committed, so it
+        # sees nothing and tries to insert -- which is the race window as the code experiences
+        # it. The recovery lookup afterwards must find the winner.
+        _blind_once(monkeypatch, "_find_listing", lambda args: args[1] == "manual")
+        second = service.add_manual_job(db, profile.id, title="Data Engineer", url=url)
+
+        assert second.id == first.id, "the loser adopts the winning row, it does not raise"
+        assert db.query(JobListing).filter(JobListing.provider == "manual").count() == 1
+        assert db.query(SavedJob).filter(SavedJob.profile_id == profile.id).count() == 1
+
+    def test_losing_the_race_leaves_the_session_usable(self, db, monkeypatch):
+        """The failure the savepoint exists to prevent, at this call site.
+
+        Each add_manual_job commits, so unlike the search loop there is rarely pending work for
+        a bare rollback to destroy. What a bare rollback would still do is leave the session in
+        a state the rest of this call cannot use -- on PostgreSQL a failed statement poisons
+        the whole transaction until it is rolled back, so the recovery lookup and the save that
+        follow it would both raise. The student would see the duplicate they submitted turn
+        into a server error, and the job they had actually entered first would be the only one
+        in their tracker.
+        """
+        profile = make_profile(db)
+        url = "https://careers.example.com/de-2026"
+        service.add_manual_job(db, profile.id, title="Data Engineer", url=url)
+
+        _blind_once(monkeypatch, "_find_listing", lambda args: args[1] == "manual")
+        service.add_manual_job(db, profile.id, title="Data Engineer", url=url)
+
+        # The session still works afterwards: a different job entered next still lands.
+        later = service.add_manual_job(
+            db, profile.id, title="Analytics Engineer", url="https://careers.example.com/ae"
+        )
+
+        assert db.get(SavedJob, later.id) is not None
+        titles = {
+            listing.title
+            for listing in db.query(JobListing).filter(JobListing.provider == "manual").all()
+        }
+        assert titles == {"Data Engineer", "Analytics Engineer"}
+
+    def test_saving_a_manual_listing_twice_is_still_one_row(self, db):
+        """The per-profile unique constraint on saved_jobs, reached through the manual path.
+        Entering the job and then tapping save on its detail screen must not open a second
+        pipeline entry for the same job."""
+        profile = make_profile(db)
+        saved = service.add_manual_job(
+            db, profile.id, title="Data Engineer", url="https://careers.example.com/de"
+        )
+
+        again = service.save_job(db, profile.id, saved.listing_id, "applied")
+
+        assert again.id == saved.id
+        assert db.query(SavedJob).filter(SavedJob.profile_id == profile.id).count() == 1
+
+    def test_two_students_submitting_the_same_link_at_once_do_not_collide(self, db):
+        """The deduplication key is scoped by profile, so this is not a race at all -- which
+        is the point. Were it global, one of these two would silently adopt the other's row
+        and read their typing."""
+        mine = make_profile(db)
+        theirs = make_profile(db)
+        url = "https://careers.example.com/shared"
+
+        first = service.add_manual_job(db, mine.id, title="As I typed it", url=url)
+        second = service.add_manual_job(db, theirs.id, title="As they typed it", url=url)
+
+        assert first.listing_id != second.listing_id
+        assert db.get(JobListing, first.listing_id).created_by_profile_id == mine.id
+        assert db.get(JobListing, second.listing_id).created_by_profile_id == theirs.id
 
 
 class TestMatchInsertRace:

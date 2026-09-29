@@ -6,13 +6,14 @@ from typing import List, Optional
 from sqlalchemy.orm import Session
 
 from app.ai.input_guard import render_prompt
-from app.ai.output_guard import looks_like_prompt_leak
+from app.ai.output_guard import contains_prompt_leak
 from app.ai.provider import AIGenerationError, AIProvider
 from app.ai.schemas.assessment import GeneratedQuestion
 from app.models.placement_alarm_challenge import PlacementAlarmChallenge
 from app.models.placement_alarm_question_attempt import PlacementAlarmQuestionAttempt
 from app.models.question import Question
 from app.schemas.placement_alarm import ChallengeAnswerResult, ChallengeQuestionRead, ChallengeStateRead
+from app.services.ai_boundary import outside_transaction
 from app.services.skill_matching import NoResumeAnalysisError, is_placement_topic, latest_resume_skills
 
 _PROMPT_PATH = Path(__file__).resolve().parent.parent / "ai" / "prompts" / "alarm_mcq_generator_v2.txt"
@@ -28,8 +29,13 @@ def _sanitize_generated_question(generated: GeneratedQuestion, skill: str) -> Ge
     """Code-level backstop -- see app/ai/output_guard.py's module docstring. Mirrors
     assessment_run_service._sanitize_generated_question (kept as separate, independent code
     per this feature's own module, not a shared call, matching this codebase's existing
-    per-feature duplication pattern for this class of prompt/service pairing)."""
-    if looks_like_prompt_leak(generated.prompt) or looks_like_prompt_leak(generated.explanation):
+    per-feature duplication pattern for this class of prompt/service pairing).
+
+    Checked over the whole object rather than two named fields, which closes two real gaps this
+    enumeration had: `options` (the four choices, persisted and rendered verbatim) and
+    `expected_answer_or_rubric`, which submit_answer returns to the student as `correct_answer`
+    the moment they get the question wrong. Both were generated text that no check ever read."""
+    if contains_prompt_leak(generated):
         logger.warning(
             "Discarding a generated alarm question for skill=%r: output contained prompt-leak markers.",
             skill,
@@ -190,60 +196,67 @@ def start_challenge(
 
     skills = select_alarm_skills(db, profile_id)
 
+    # Every question is generated first, outside any transaction and before a single row is
+    # written (F12-07). This used to interleave: create the challenge, then per skill call the
+    # AI, commit a Question, and leave that iteration's attempt row pending for the *next*
+    # iteration's commit to persist -- so a transaction with unflushed work in it was held open
+    # across all six model calls, six times the latency of any other AI route here.
+    #
+    # Generating first also removes the failure mode the old handler existed to clean up. A
+    # mid-loop failure could previously leave a committed challenge with fewer than
+    # REQUIRED_QUESTIONS attempts, which the idempotency check above would then hand back to
+    # every retry forever; recovering from that meant deleting committed attempt rows before
+    # the challenge, because challenge_id is a real foreign key and PostgreSQL enforces it.
+    # Now nothing is written until every question exists, so there is no partial challenge to
+    # repair and no ordering to get right.
+    generated_questions: list[tuple[str, GeneratedQuestion]] = []
+    with outside_transaction(db):
+        try:
+            for skill_tag in skills:
+                prompt = _build_question_prompt(skill_tag)
+                generated: GeneratedQuestion = ai_provider.generate_structured(prompt, GeneratedQuestion)
+                generated_questions.append((skill_tag, _sanitize_generated_question(generated, skill_tag)))
+        except AIGenerationError:
+            raise ChallengeGenerationError("Couldn't generate challenge questions -- please try again")
+
+    # Re-checked on this side of the boundary: another firing of the same on-device alarm could
+    # have created the challenge while these six calls were running, and handing back the one
+    # that already exists is what the idempotency contract promises.
+    existing = (
+        db.query(PlacementAlarmChallenge)
+        .filter(
+            PlacementAlarmChallenge.profile_id == profile_id,
+            PlacementAlarmChallenge.client_alarm_id == client_alarm_id,
+            PlacementAlarmChallenge.status == "in_progress",
+        )
+        .first()
+    )
+    if existing is not None:
+        return _state_read(db, existing)
+
+    # Then one short write, all of it or none of it.
     challenge = PlacementAlarmChallenge(profile_id=profile_id, client_alarm_id=client_alarm_id)
     db.add(challenge)
+    db.flush()
+    for index, (skill_tag, generated) in enumerate(generated_questions):
+        question = Question(
+            skill_tag=skill_tag,
+            type="mcq",  # forced regardless of what the AI returned -- MCQ-only, by design
+            difficulty="medium",
+            prompt=generated.prompt,
+            options=generated.options,
+            expected_answer_or_rubric=generated.expected_answer_or_rubric,
+            explanation=generated.explanation,
+            source="ai_generated",
+        )
+        db.add(question)
+        db.flush()
+        db.add(
+            PlacementAlarmQuestionAttempt(
+                challenge_id=challenge.id, question_id=question.id, question_index=index
+            )
+        )
     db.commit()
-    db.refresh(challenge)
-
-    try:
-        for index, skill_tag in enumerate(skills):
-            prompt = _build_question_prompt(skill_tag)
-            generated: GeneratedQuestion = ai_provider.generate_structured(prompt, GeneratedQuestion)
-            generated = _sanitize_generated_question(generated, skill_tag)
-            question = Question(
-                skill_tag=skill_tag,
-                type="mcq",  # forced regardless of what the AI returned -- MCQ-only, by design
-                difficulty="medium",
-                prompt=generated.prompt,
-                options=generated.options,
-                expected_answer_or_rubric=generated.expected_answer_or_rubric,
-                explanation=generated.explanation,
-                source="ai_generated",
-            )
-            db.add(question)
-            db.commit()
-            db.refresh(question)
-            db.add(
-                PlacementAlarmQuestionAttempt(
-                    challenge_id=challenge.id, question_id=question.id, question_index=index
-                )
-            )
-        db.commit()
-    except AIGenerationError:
-        # Without this, a mid-loop AI failure would leave `challenge` committed with its
-        # default status="in_progress" and fewer than REQUIRED_QUESTIONS attempt rows --
-        # start_challenge's own idempotency check (the `existing` lookup above) would then
-        # keep handing this broken, uncompletable challenge back to every retry forever. Roll
-        # back the pending (uncommitted) attempt inserts, delete the challenge itself so a
-        # retry starts clean, and surface a clear error instead of an opaque 500. Any Question
-        # rows already committed in earlier loop iterations are left in place -- harmless,
-        # unreferenced catalog rows -- rather than risk deleting shared data.
-        #
-        # The attempt rows are a different matter and must go first. The loop commits once per
-        # question, and that commit also persists the *previous* iteration's attempt row, so a
-        # failure part-way through leaves committed attempts pointing at this challenge. The
-        # rollback does not touch those, and placement_alarm_question_attempts.challenge_id is
-        # a real foreign key -- so on PostgreSQL the delete below raised instead of running,
-        # leaving exactly the permanently-stuck challenge this handler exists to prevent.
-        # SQLite does not enforce foreign keys unless asked, which is why the suite never saw
-        # it (see tests/api/test_job_hunt_fk_integrity.py for where that gap is closed).
-        db.rollback()
-        db.query(PlacementAlarmQuestionAttempt).filter(
-            PlacementAlarmQuestionAttempt.challenge_id == challenge.id
-        ).delete(synchronize_session=False)
-        db.delete(challenge)
-        db.commit()
-        raise ChallengeGenerationError("Couldn't generate challenge questions -- please try again")
 
     return _state_read(db, challenge)
 

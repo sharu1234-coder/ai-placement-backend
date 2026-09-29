@@ -21,6 +21,18 @@ class Settings(BaseSettings):
     refresh_token_expire_days: int = 7
 
     ai_provider: str = "ollama"
+
+    # The hard wall-clock ceiling on ONE logical AI operation -- every attempt, every retry,
+    # every backoff and the one schema correction, added together (see app/ai/retry.py). It is
+    # the only number in this system that was already a statement about how long a person will
+    # wait: the Android client's NetworkModule sets readTimeout(300, SECONDS). Above it the
+    # server is holding a request its own client has already abandoned, which is how F12-06's
+    # stacked retries stayed invisible -- the client, not the server, was enforcing the server's
+    # AI budget. It also sits above both the measured successful-call range (98.9-183.4s on this
+    # project's local dev model) and the 240s per-attempt timeout below, so no normal success is
+    # cut short. Raise via AI_TOTAL_BUDGET_SECONDS on slower hardware.
+    ai_total_budget_seconds: int = 300
+
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "qwen3:8b"
     # A hardcoded 120s was too tight for larger structured-output calls (e.g. a multi-day

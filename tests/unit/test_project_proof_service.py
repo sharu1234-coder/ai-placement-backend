@@ -99,8 +99,13 @@ def _stages(db, build_id, notes_by_stage=None):
 def test_ai_success_populates_all_proof_fields(db):
     build = _build(db)
     stages = _stages(db, build.id)
+    build_id = build.id
 
     svc.generate_proof(db, build, stages, SuccessAIProvider())
+
+    # Re-read: generate_proof persists onto the row, and the AI now runs with no
+    # transaction open (F12-07), so the instance passed in above is no longer the live one.
+    build = db.get(type(build), build_id)
 
     assert build.proof_resume_bullet == SAMPLE_PROOF.resume_bullet
     assert build.proof_readme_markdown == SAMPLE_PROOF.readme_markdown
@@ -112,8 +117,13 @@ def test_ai_success_populates_all_proof_fields(db):
 def test_ai_failure_falls_back_to_a_deterministic_proof(db):
     build = _build(db)
     stages = _stages(db, build.id)
+    build_id = build.id
 
     svc.generate_proof(db, build, stages, FailingAIProvider())
+
+    # Re-read: generate_proof persists onto the row, and the AI now runs with no
+    # transaction open (F12-07), so the instance passed in above is no longer the live one.
+    build = db.get(type(build), build_id)
 
     assert build.title in build.proof_resume_bullet
     assert build.proof_readme_markdown.startswith("# Realtime Pipeline")
@@ -123,8 +133,13 @@ def test_ai_failure_falls_back_to_a_deterministic_proof(db):
 def test_empty_defense_questions_triggers_fallback(db):
     build = _build(db)
     stages = _stages(db, build.id)
+    build_id = build.id
 
     svc.generate_proof(db, build, stages, EmptyQuestionsAIProvider())
+
+    # Re-read: generate_proof persists onto the row, and the AI now runs with no
+    # transaction open (F12-07), so the instance passed in above is no longer the live one.
+    build = db.get(type(build), build_id)
 
     assert build.proof_defense_questions == svc._FALLBACK_DEFENSE_QUESTIONS
 
@@ -132,8 +147,13 @@ def test_empty_defense_questions_triggers_fallback(db):
 def test_leaked_prompt_text_triggers_fallback(db):
     build = _build(db)
     stages = _stages(db, build.id)
+    build_id = build.id
 
     svc.generate_proof(db, build, stages, LeakedTextAIProvider())
+
+    # Re-read: generate_proof persists onto the row, and the AI now runs with no
+    # transaction open (F12-07), so the instance passed in above is no longer the live one.
+    build = db.get(type(build), build_id)
 
     # Falls back entirely rather than trusting a partially-leaked response.
     assert "system prompt" not in build.proof_resume_bullet.lower()

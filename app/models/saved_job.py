@@ -67,9 +67,23 @@ class SavedJob(Base):
     # which moves on every note edit.
     applied_at: Mapped[Optional[datetime.datetime]] = mapped_column(DateTime, nullable=True)
 
+    # Naive UTC, matching job_hunt.service._utcnow -- which is what writes these columns on
+    # every update after the insert.
+    #
+    # They used to default to an AWARE value while every subsequent write was naive, so one
+    # column held both representations over its own lifetime: aware at insert, naive from the
+    # first status change onward. Nothing compared the two, so nothing crashed, but the pair is
+    # only ever one comparison away from `can't compare offset-naive and offset-aware
+    # datetimes` -- and applied_at beside them was naive from the start, so the row was already
+    # internally inconsistent. Matching the writer is the change that removes the hazard rather
+    # than relocating it; the column type is untouched and no stored value moves.
     created_at: Mapped[datetime.datetime] = mapped_column(
-        DateTime, nullable=False, default=lambda: datetime.datetime.now(datetime.timezone.utc)
+        DateTime,
+        nullable=False,
+        default=lambda: datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None),
     )
     updated_at: Mapped[datetime.datetime] = mapped_column(
-        DateTime, nullable=False, default=lambda: datetime.datetime.now(datetime.timezone.utc)
+        DateTime,
+        nullable=False,
+        default=lambda: datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None),
     )

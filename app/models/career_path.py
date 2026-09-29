@@ -1,7 +1,7 @@
 import datetime
 from typing import Optional
 
-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, String
+from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database.base import Base
@@ -19,9 +19,19 @@ class CareerPath(Base):
     one is "the" currently active Career Path (service-enforced single-true-per-profile,
     same style as StudentProfile.custom_target_role's XOR enforcement); the full list of a
     profile's CareerPath rows *is* "recently selected / saved roles" -- no separate history
-    table is needed."""
+    table is needed.
+
+    The one-row-per-role rule is enforced by the database (uq_career_path_per_role_family), not
+    by select_role()'s lookup. Two selections of the same role that overlap -- a retry after a
+    lost response, a second device -- both pass that lookup before either commits, and without
+    the constraint each inserted its own row: a duplicate saved role, and progress made on one
+    copy apparently lost when a later selection picked the other (F12-03). select_role() relies
+    on the constraint to decide which of two overlapping requests creates the row."""
 
     __tablename__ = "career_paths"
+    __table_args__ = (
+        UniqueConstraint("profile_id", "role_family_key", name="uq_career_path_per_role_family"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     profile_id: Mapped[int] = mapped_column(ForeignKey("student_profiles.id"), nullable=False, index=True)

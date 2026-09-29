@@ -100,13 +100,14 @@ class TestPipeline:
 
     def test_readiness_comes_from_career_twin_not_from_a_second_calculation(self, db):
         """Composition, asserted rather than assumed: the number on this screen is the number
-        Career Twin publishes. Two readiness figures disagreeing on two screens is precisely
+        Career Twin publishes. Two coverage figures disagreeing on two screens is precisely
         the failure the orchestration rule exists to prevent."""
         from app.services import career_twin_service
 
         profile = _rich_profile(db)
         view = strategy_service.compute(db, profile, now=NOW)
-        assert view.twin.readiness_percent == career_twin_service.get_current(db, profile).readiness_percent
+        assert (view.twin.evidence_coverage_percent
+                == career_twin_service.get_current(db, profile).evidence_coverage_percent)
 
     def test_the_recommended_action_defers_to_next_best_action_when_they_agree(self, db):
         """Career Strategy does not run a second recommendation ladder. Where NBA already has an
@@ -191,7 +192,7 @@ class TestPremiumProjection:
         assert leaked == [], f"premium content reached a free client: {leaked}"
 
     def test_a_free_student_still_gets_a_useful_screen(self, db):
-        """The free tier is a real product, not a locked door. Role, readiness, the name of the
+        """The free tier is a real product, not a locked door. Role, evidence coverage, the name of
         bottleneck and one thing to do about it are all present."""
         profile = _rich_profile(db)
         free = strategy_service.project(strategy_service.compute(db, profile, now=NOW), is_premium=False)
@@ -241,10 +242,10 @@ class TestPremiumProjection:
                            "recruiter_probability", "percentage_chance"):
                 assert banned not in payload
 
-    def test_unknown_readiness_stays_unknown_rather_than_zero(self, db):
+    def test_unknown_evidence_coverage_stays_unknown_rather_than_zero(self, db):
         profile = make_profile(db)
         free = strategy_service.project(strategy_service.compute(db, profile, now=NOW), is_premium=False)
-        assert free.readiness_percent is None
+        assert free.evidence_coverage_percent is None
 
     def test_only_series_with_real_history_are_reported(self, db):
         """A diminishing-returns section listing a dozen skills with no history answers nothing.

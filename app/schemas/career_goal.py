@@ -47,6 +47,18 @@ class CareerGoalUpdate(BaseModel):
 # not_analyzed is deliberately its own value rather than a flavour of not_started. "We have
 # never read this job description" and "we have read it and you have not started" are
 # different facts, and only the first one has an obvious button attached.
+class CareerGoalLinkApplication(BaseModel):
+    """Which saved job this goal is being pursued through.
+
+    Only the saved job's id. Ownership is NOT carried here and never accepted from a client --
+    the server re-reads the row filtered by the authenticated profile (see
+    career_goal_service.link_saved_job), so sending somebody else's id fails as a 404 rather
+    than linking their application to your goal.
+    """
+
+    saved_job_id: int
+
+
 PREPARATION_STATES = ("not_analyzed", "not_started", "in_progress", "ready_for_review")
 
 
@@ -58,8 +70,48 @@ class CareerGoalListItem(BaseModel):
     status: str
     is_analyzed: bool
     preparation_state: str  # see PREPARATION_STATES
+    # The linked application's current status, or None when this goal is not linked to one.
+    # Only the status: the list row needs to say "Interview stage" beside a goal, and loading
+    # the whole application for every row to render one word would be the query explosion the
+    # detail endpoint deliberately avoids.
+    application_status: Optional[str] = None
     created_at: datetime.datetime
     updated_at: datetime.datetime
+
+
+class GoalApplicationRead(BaseModel):
+    """The real-world application this goal is being pursued through.
+
+    Every field here is read straight from the SavedJob row that job_hunt already maintains --
+    nothing is recomputed, re-derived or stored a second time. `status` is SavedJob.status
+    verbatim so the tracker and the goal can never disagree about what stage something is at.
+
+    `outcome` is None while the process is still running, and that is a real answer rather than
+    a missing one: "applied, waiting" is genuinely different from "went badly", and collapsing
+    them would misrepresent the student's position to them.
+    """
+
+    saved_job_id: int
+    # SavedJob.status verbatim -- saved | applied | assessment | interview | offer | rejected |
+    # closed | dismissed.
+    status: str
+    # None while open; otherwise offer | rejected | closed. See application_outcome.
+    outcome: Optional[str] = None
+    is_terminal: bool
+    # Whether an application was actually submitted. False for a job merely saved, which is why
+    # this is not simply "status != 'saved'".
+    has_applied: bool
+    # Set the first time the tracker recorded "applied", never rewritten. None when the student
+    # has not applied yet.
+    applied_at: Optional[datetime.datetime] = None
+    # The listing as job_hunt holds it, so the goal can show WHICH job it is linked to and the
+    # student can tell they linked the right one. Title/company are the listing's own, and may
+    # legitimately differ from the goal's stated title/company -- those are what the student
+    # typed, these are what the posting says, and this codebase keeps stated and detected
+    # apart everywhere.
+    listing_title: str
+    listing_company: Optional[str] = None
+    listing_url: Optional[str] = None
 
 
 class GoalRequirementRead(BaseModel):
@@ -180,6 +232,11 @@ class CareerGoalDetailRead(BaseModel):
     interview_risks: List[GoalInterviewRiskRead] = []
     preparation_plan: List[GoalPreparationItemRead] = []
     progress: GoalProgressRead
+    # The real-world application, when this goal is linked to one. NULL is the ordinary state:
+    # a goal is an intention, and most are formed before -- or without ever -- applying.
+    # The client must render the unlinked case as "not linked", never as "not applied": a goal
+    # with no linked job says nothing about whether the student applied elsewhere.
+    application: Optional[GoalApplicationRead] = None
     # The existing, profile-level recommendation, returned unchanged. Deliberately not a
     # job-scoped re-ranking: this app has exactly one recommendation engine and Phase 2D does
     # not add a second. NULL when the engine has nothing to recommend.

@@ -98,7 +98,7 @@ class TestFreeResponse:
         body = client.get("/career-strategy", headers=auth_headers).json()
         assert body["has_role"] is False
         assert body["state"] == "FOCUS_ON_TARGET_ROLE"
-        assert body["readiness_percent"] is None
+        assert body["evidence_coverage_percent"] is None
         assert body["bottleneck"] is None
         assert body["state_reason"]  # the screen still explains itself
 

@@ -83,13 +83,15 @@ def get_dashboard(db: Session, profile_id: int) -> ProgressDashboardRead:
     ]
     trend.sort(key=lambda point: point.created_at)
 
-    # Readiness score: the two most recent signals (latest test, latest interview) --
+    # Performance score: the two most recent signals (latest test, latest interview) --
     # deliberately not an average of everything ever taken, so an early, since-improved-on
     # attempt doesn't keep dragging down a student's current standing.
     latest_assessment_score = assessment_rows[-1][0].overall_score if assessment_rows else None
     latest_interview_score = interview_rows[-1][0].overall_score if interview_rows else None
     recent_scores = [s for s in (latest_assessment_score, latest_interview_score) if s is not None]
-    readiness_score = sum(recent_scores) / len(recent_scores) if recent_scores else None
+    # None when neither a test nor an interview has been completed -- absence of a
+    # measurement, not a measured zero.
+    performance_score = sum(recent_scores) / len(recent_scores) if recent_scores else None
 
     active_roadmaps = db.query(Roadmap).filter(Roadmap.profile_id == profile_id, Roadmap.status == "active").all()
     roadmap_ids = [r.id for r in active_roadmaps]
@@ -100,7 +102,7 @@ def get_dashboard(db: Session, profile_id: int) -> ProgressDashboardRead:
     top_weaknesses = [w.skill_tag for w in compute_weaknesses(db, profile_id, jd_id=None)][:_TOP_WEAKNESS_LIMIT]
 
     return ProgressDashboardRead(
-        readiness_score=readiness_score,
+        performance_score=performance_score,
         completed_assessments=len(assessment_rows),
         completed_interviews=len(interview_rows),
         roadmap_tasks_done=sum(1 for t in roadmap_tasks if t.status == "done"),

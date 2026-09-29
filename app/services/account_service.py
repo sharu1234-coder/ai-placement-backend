@@ -25,6 +25,7 @@ from app.models.interview_question import InterviewQuestion
 from app.models.job_alert import JobAlert, JobAlertDelivery
 from app.models.job_description import JobDescription
 from app.models.job_hunt_usage import JobHuntUsage
+from app.models.job_listing import JobListing
 from app.models.job_listing_match import JobListingMatch
 from app.models.job_match import JobMatch
 from app.models.job_preparation_plan import JobPreparationPlan
@@ -147,6 +148,20 @@ def delete_account(db: Session, user: User, storage: StorageProvider) -> None:
         db.query(JobAlert).filter(JobAlert.profile_id == pid).delete(synchronize_session=False)
         db.query(SavedJob).filter(SavedJob.profile_id == pid).delete(synchronize_session=False)
         db.query(JobSavedSearch).filter(JobSavedSearch.profile_id == pid).delete(
+            synchronize_session=False
+        )
+        # The one exception to "job_listings is never deleted here", and it is scoped, not
+        # blanket: only the rows this student typed in themselves (created_by_profile_id set),
+        # never the provider rows (created_by_profile_id NULL) that other students share.
+        #
+        # A manually entered listing holds the student's own writing -- a company someone
+        # referred them to, a description pasted out of an email -- so leaving it behind would
+        # keep that text after they erased their account. It also carries a foreign key to
+        # student_profiles, so leaving it would make the profile delete below fail outright.
+        #
+        # Last of this block because saved_jobs, job_listing_matches and job_alert_deliveries
+        # all reference job_listings and have just gone.
+        db.query(JobListing).filter(JobListing.created_by_profile_id == pid).delete(
             synchronize_session=False
         )
         # The Job Hunt entitlement ledger. A pure leaf -- it references student_profiles and
@@ -314,7 +329,7 @@ def delete_account(db: Session, user: User, storage: StorageProvider) -> None:
         # account (a 500, and the rollback leaves the account intact). Nothing references this
         # table, so its only ordering requirement is to precede the profile row.
         #
-        # It holds no state of its own beyond (profile, role, position) -- every readiness
+        # It holds no state of its own beyond (profile, role, position) -- every evidence-coverage
         # figure is recomputed by the same deterministic engine -- so removing it destroys no
         # history that existed anywhere else.
         db.query(CareerStrategyTarget).filter(CareerStrategyTarget.profile_id == pid).delete(

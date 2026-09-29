@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Dict, Optional
 
 from app.ai.input_guard import render_prompt
-from app.ai.output_guard import looks_like_prompt_leak
+from app.ai.output_guard import contains_prompt_leak
 from app.ai.provider import AIGenerationError, AIProvider
 from app.ai.schemas.project_builder import GeneratedStageGuidanceSet
 from app.services.project_builder.stages import FALLBACK_GUIDANCE, STAGE_ORDER, STAGE_TITLES
@@ -42,7 +42,7 @@ def generate_stage_guidance(
         for stage in generated.stages:
             if stage.stage_key not in STAGE_TITLES:
                 continue  # unrecognized stage_key -- silently dropped, never trusted
-            if looks_like_prompt_leak(stage.guidance_text):
+            if contains_prompt_leak(stage):
                 continue  # code-level backstop -- see app/ai/output_guard.py
             guidance[stage.stage_key] = stage.guidance_text
     except AIGenerationError as exc:

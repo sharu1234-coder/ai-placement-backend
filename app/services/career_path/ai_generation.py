@@ -15,9 +15,10 @@ import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from app.ai.input_guard import render_prompt
+from app.ai.output_guard import leaking_field, looks_like_prompt_leak
 from app.ai.provider import AIGenerationError, AIProvider
 from app.ai.schemas.career_path import GeneratedCareerPathExplanations, GeneratedRoleCatalog
 from app.services.career_path.role_catalog import PHASE_ORDER, ProjectTemplate, RoleFamilyDef, SkillTemplate
@@ -263,6 +264,14 @@ def get_or_generate_role_definition(role_name: str, ai_provider: AIProvider) -> 
     try:
         prompt = _build_role_prompt(role_name)
         generated: GeneratedRoleCatalog = ai_provider.generate_structured(prompt, GeneratedRoleCatalog)
+        # The whole object, not a field list: this is the largest generated shape in the app
+        # (an overview of eight text fields plus nested phases of nested skills), and every
+        # title here becomes a CareerPathSkillItem the student works through for months.
+        # Raised into the existing fallback below, which returns the hand-authored generic
+        # role family -- the behaviour this service already has for an unusable generation.
+        leaked = leaking_field(generated)
+        if leaked is not None:
+            raise AIGenerationError(f"Role definition output leaked prompt scaffolding in field {leaked}")
 
         phase_skill_templates: Dict[str, List[SkillTemplate]] = {}
         for phase in generated.phases:
@@ -309,6 +318,25 @@ def _fallback_skill_explanation(role_name: str, item: ExplainerSkillInput) -> st
     return f"Builds your {item.title} skills -- a core part of becoming job-ready as a {role_name}."
 
 
+def template_skill_explanations(role_name: str, items: Sequence[ExplainerSkillInput]) -> Dict[str, str]:
+    """Every skill's deterministic sentence, with no AI call and no network.
+
+    The same text generate_skill_explanations already falls back to, per skill, whenever the AI
+    fails. A path written with these is therefore in a state this product already ships, not a
+    placeholder -- which is what lets select_role() return before the AI has run (F12-05).
+    """
+    return {item.skill_key: _fallback_skill_explanation(role_name, item) for item in items}
+
+
+def is_template_explanation(role_name: str, item: ExplainerSkillInput, text: Optional[str]) -> bool:
+    """Is this the deterministic sentence, rather than something the AI wrote?
+
+    How the deferred pass tells a path that has not been explained yet from one that has,
+    without a new column to track it.
+    """
+    return text is None or text == _fallback_skill_explanation(role_name, item)
+
+
 def generate_skill_explanations(role_name: str, ai_provider: AIProvider, items: Sequence[ExplainerSkillInput]) -> Dict[str, str]:
     """Never blocks path generation: on any AI failure, or a partial/invalid response, the
     affected skills fall back to a deterministic template sentence. Used for every role,
@@ -321,7 +349,9 @@ def generate_skill_explanations(role_name: str, ai_provider: AIProvider, items: 
             prompt = _build_explainer_prompt(role_name, items)
             generated: GeneratedCareerPathExplanations = ai_provider.generate_structured(prompt, GeneratedCareerPathExplanations)
             for explanation in generated.explanations:
-                if explanation.skill_key in valid_keys:
+                # Not taken if it leaks; the skill falls through to _fallback_skill_explanation
+                # below, the same way an unrecognized skill_key already does.
+                if explanation.skill_key in valid_keys and not looks_like_prompt_leak(explanation.why_it_matters):
                     explanations[explanation.skill_key] = explanation.why_it_matters
         except AIGenerationError as exc:
             logger.warning("AI skill-explanation generation failed for role=%s, using template text: %s", role_name, exc)

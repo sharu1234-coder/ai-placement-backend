@@ -24,7 +24,10 @@ from app.models.notification_event import NotificationEvent
 # Ordered ascending; only a crossing INTO one of these (baseline < milestone <= new) fires,
 # and only the single highest one crossed in a jump is reported, so a student who jumps from
 # 40% to 90% in one read gets one "95%... wait, 90%" style message, not four stacked ones.
-_READINESS_MILESTONES = [50, 70, 85, 95]
+# Thresholds are untouched by Phase 2G: they were chosen for the metric's VALUES, not its
+# name, so renaming the metric must not move them. Only the constant's name and the wording
+# it drives changed.
+_EVIDENCE_COVERAGE_MILESTONES = [50, 70, 85, 95]
 
 # Evidence states that count as "made it" for a notification -- see evidence_engine.py's
 # _compute_state_and_confidence for the full claimed/supported/strong/verified/stale scale.
@@ -62,7 +65,7 @@ def acknowledge(db: Session, profile_id: int, ids: List[int]) -> None:
 def _milestone_crossed(baseline_percent: Optional[int], new_percent: int) -> Optional[int]:
     if baseline_percent is None:
         return None  # No real prior value to compare against -- never fabricate "you improved".
-    crossed = [m for m in _READINESS_MILESTONES if baseline_percent < m <= new_percent]
+    crossed = [m for m in _EVIDENCE_COVERAGE_MILESTONES if baseline_percent < m <= new_percent]
     return max(crossed) if crossed else None
 
 
@@ -75,9 +78,14 @@ def check_readiness_milestone(
     enqueue(
         db,
         profile_id,
+        # The `kind` string stays "readiness_milestone": it is a persisted value already
+        # written to notification_events rows, and changing it would split one event type
+        # across two names in a student's own history for no gain the student can see.
+        # The TEXT is what they read, and the text was claiming readiness for a number that
+        # measures evidence coverage -- that is what Phase 2G fixes here.
         kind="readiness_milestone",
-        title=f"{milestone}% Ready for {display_role_name}!",
-        body=f"Your Career Twin readiness just crossed {milestone}% for {display_role_name}.",
+        title=f"{milestone}% Evidence Coverage for {display_role_name}!",
+        body=f"Your Career Twin evidence coverage just crossed {milestone}% for {display_role_name}.",
     )
 
 

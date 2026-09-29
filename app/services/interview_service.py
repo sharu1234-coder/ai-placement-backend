@@ -8,7 +8,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.ai.input_guard import render_prompt
-from app.ai.output_guard import looks_like_prompt_leak
+from app.ai.output_guard import contains_prompt_leak
 from app.ai.provider import AIGenerationError, AIProvider
 from app.ai.schemas.interview import GeneratedInterviewEvaluation, GeneratedInterviewQuestion
 from app.ai.score_utils import clamp_unit_score
@@ -29,6 +29,7 @@ from app.schemas.interview import (
     NextInterviewQuestionResponse,
 )
 from app.services import weakness_record_service
+from app.services.ai_boundary import outside_transaction
 from app.services.interview_simulation import context as simulation_context
 from app.services.interview_simulation import fallback as simulation_fallback
 from app.services.interview_simulation import stages
@@ -371,10 +372,15 @@ def get_next_question(
         prompt = _build_question_prompt(
             interview.type, context, [q.question_text for q in questions], order_index, total_questions
         )
+    # Plain value, taken before the boundary closes the session; the fallback branch needs it.
+    interview_type = interview.type
     try:
-        generated: GeneratedInterviewQuestion = ai_provider.generate_structured(
-            prompt, GeneratedInterviewQuestion
-        )
+        # Outside any transaction (F12-07). The prompt is already built, so nothing inside wants
+        # the session -- and for a twelve-question simulation this is the call the student waits on.
+        with outside_transaction(db):
+            generated: GeneratedInterviewQuestion = ai_provider.generate_structured(
+                prompt, GeneratedInterviewQuestion
+            )
         # Output-side guard, the same one assessment_run_service, placement_alarm_service,
         # project_builder and recruiter_attack_service already apply to their generated text.
         # This module was the one AI caller that validated the *shape* of the model's output but
@@ -386,11 +392,7 @@ def get_next_question(
         # from escaping its block on the way IN. Both are needed; neither substitutes for the
         # other. Leaked output is raised as a generation failure so it takes the same route as
         # every other one: never shown to anyone, never persisted.
-        if (
-            not generated.question_text.strip()
-            or looks_like_prompt_leak(generated.question_text)
-            or looks_like_prompt_leak(generated.based_on)
-        ):
+        if not generated.question_text.strip() or contains_prompt_leak(generated):
             raise AIGenerationError("Interview question output was empty or leaked prompt scaffolding")
         question_text, based_on = generated.question_text, generated.based_on
     except AIGenerationError as exc:
@@ -400,7 +402,7 @@ def get_next_question(
         # cases, now including a leaked one. A bare `except Exception` here would swallow real
         # programming and database bugs into a plausible-looking interview, which is a far worse
         # outcome than a visible error.
-        if not stages.is_simulation(interview.type):
+        if not stages.is_simulation(interview_type):
             # Ordinary interviews keep the behaviour they have always had -- this surfaces as
             # the documented 422 the client already knows how to show. They are five questions
             # the student can simply restart; a twelve-question conversation abandoned halfway
@@ -413,6 +415,10 @@ def get_next_question(
             interview_id, order_index, type(exc).__name__, stage,
         )
         question_text, based_on = simulation_fallback.question_for(stage, order_index)
+
+    # Re-read and re-check ownership after the boundary: the row loaded before the AI call is
+    # detached, and the response below is built from it.
+    interview = _get_owned_interview(db, interview_id, profile_id)
 
     question = InterviewQuestion(
         interview_id=interview_id,
@@ -471,7 +477,12 @@ def submit_audio_answer(
     if existing is not None:
         raise InterviewQuestionNotPendingError("This question has already been answered")
 
-    answer_text = ai_provider.transcribe(audio_bytes)
+    # Outside any transaction (F12-07). Transcription is a local Whisper pass on CPU, seconds of
+    # work, and it needs nothing but the bytes. _insert_answer_once below is already an atomic
+    # insert guarded by a unique index, so widening this window changes nothing about who wins a
+    # concurrent duplicate -- see its own comment.
+    with outside_transaction(db):
+        answer_text = ai_provider.transcribe(audio_bytes)
 
     # "Minimize stored voice data" (PROJECT_HANDOFF.md section 6): the transcript is kept,
     # the raw recording is not persisted -- audio_url stays null by design, a documented
@@ -495,7 +506,11 @@ def synthesize_question_audio(
     if question is None or question.interview_id != interview_id:
         raise InterviewNotFoundError("Interview question not found")
 
-    return ai_provider.synthesize_speech(question.question_text)
+    # Outside any transaction (F12-07). Speech synthesis writes nothing, so the whole of the rest
+    # of this request is the provider call -- there is no reason to hold a connection for it.
+    question_text = question.question_text
+    with outside_transaction(db):
+        return ai_provider.synthesize_speech(question_text)
 
 
 # The evaluation prompt opens "You are evaluating a completed {interview_type} interview", so a
@@ -648,7 +663,7 @@ def _persist_ungraded(
 
     Every score column stays NULL. Nothing is substituted, defaulted or estimated -- a number
     here would not merely be shown to the student, it would be read by Interview Memory and the
-    Evidence Engine and would move their Career Twin readiness on the strength of a response
+    Evidence Engine and would move their Career Twin evidence coverage on the strength of a response
     that was never a judgement of them.
 
     Writing a row at all (rather than raising) is what lets the client say something true. The
@@ -714,15 +729,20 @@ def get_evaluation(
 
     context = _build_context(db, profile_id, interview)
     prompt = _build_evaluation_prompt(interview.type, interview.mode, context, transcript)
+    # Plain value, taken before the boundary closes the session.
+    interview_mode = interview.mode
     try:
-        generated: GeneratedInterviewEvaluation = ai_provider.generate_structured(
-            prompt, GeneratedInterviewEvaluation
-        )
+        # Outside any transaction (F12-07). Evaluating a twelve-question simulation is the longest
+        # single model call in this module, and it held the whole interview's read transaction.
+        with outside_transaction(db):
+            generated: GeneratedInterviewEvaluation = ai_provider.generate_structured(
+                prompt, GeneratedInterviewEvaluation
+            )
         # Checked before anything is persisted, so a leaked evaluation can never become a stored
         # row -- which would not merely show the student prompt scaffolding as their feedback,
         # but would feed its scores into Interview Memory and the Evidence Engine via the loop
-        # below, moving Career Twin readiness off a response that was never a judgement of them.
-        if not generated.feedback.strip() or looks_like_prompt_leak(generated.feedback):
+        # below, moving Career Twin evidence coverage off a response that was never a judgement of them.
+        if not generated.feedback.strip() or contains_prompt_leak(generated):
             raise AIGenerationError("Interview evaluation output was empty or leaked prompt scaffolding")
     except AIGenerationError as exc:
         # AIGenerationError only -- the same narrow catch as question generation, and for the
@@ -740,10 +760,16 @@ def get_evaluation(
             "state with every score left NULL; a later call will regrade it",
             interview_id, type(exc).__name__,
         )
+        # Re-read: the row found before the AI call was detached by the boundary.
+        existing = db.query(InterviewEvaluation).filter(InterviewEvaluation.interview_id == interview_id).first()
         return _evaluation_read(_persist_ungraded(db, interview_id, existing))
 
+    # Re-read and re-check ownership after the boundary, for the same reason.
+    interview = _get_owned_interview(db, interview_id, profile_id)
+    existing = db.query(InterviewEvaluation).filter(InterviewEvaluation.interview_id == interview_id).first()
+
     filler_word_rate = None
-    if interview.mode == "voice":
+    if interview_mode == "voice":
         answer_texts = [a.answer_text for a in answers_by_question_id.values() if a.answer_text]
         if answer_texts:
             filler_word_rate = _filler_word_rate(" ".join(answer_texts))

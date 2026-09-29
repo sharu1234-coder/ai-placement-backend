@@ -49,7 +49,7 @@ def test_no_role_context_returns_has_role_false(db):
     twin = get_current(db, profile)
     assert twin.has_role is False
     assert twin.role_source == "none"
-    assert twin.readiness_percent is None
+    assert twin.evidence_coverage_percent is None
     assert "target role" in twin.reasons[0].lower()
 
 
@@ -135,11 +135,11 @@ def test_career_path_with_empty_role_overview_has_no_fabricated_skills(db):
     twin = get_current(db, profile)
     assert twin.has_role is True
     assert twin.skills == []
-    assert twin.readiness_percent is None
+    assert twin.evidence_coverage_percent is None
     assert "no required skills" in twin.reasons[0].lower()
 
 
-def test_readiness_is_weighted_confidence_not_a_raw_score_average(db):
+def test_coverage_is_weighted_confidence_not_a_raw_score_average(db):
     profile = _profile(db)
     db.add(
         CareerPath(
@@ -162,7 +162,7 @@ def test_readiness_is_weighted_confidence_not_a_raw_score_average(db):
     db.commit()
     db.refresh(assessment)
     # Python: single assessment source -> "supported" (confidence 0.45), regardless of the
-    # raw 95% score -- confidence, not the raw score, drives readiness.
+    # raw 95% score -- confidence, not the raw score, drives evidence coverage.
     db.add(
         AssessmentResult(
             assessment_id=assessment.id, skill_scores={"Python": 0.95}, overall_score=0.95, priority_weaknesses=[]
@@ -174,9 +174,9 @@ def test_readiness_is_weighted_confidence_not_a_raw_score_average(db):
     python_item = next(s for s in twin.skills if s.skill == "Python")
     assert python_item.measured_score == 95.0
     assert python_item.confidence_percent == 45  # supported, not verified, despite the high raw score
-    # readiness = weighted average of confidence (Python 1.0*45 + SQL 1.0*0 + Docker 0.6*0) / 2.6
-    assert twin.readiness_percent == round(100 * (1.0 * 0.45) / 2.6)
-    assert twin.readiness_percent != 95  # explicitly NOT a naive score average
+    # evidence coverage = weighted average of confidence (Python 1.0*45 + SQL 1.0*0 + Docker 0.6*0) / 2.6
+    assert twin.evidence_coverage_percent == round(100 * (1.0 * 0.45) / 2.6)
+    assert twin.evidence_coverage_percent != 95  # explicitly NOT a naive score average
 
 
 def test_biggest_gap_prefers_lower_confidence_then_higher_weight(db):
@@ -269,7 +269,7 @@ def test_upsert_snapshot_concurrent_first_read_of_day_no_error(db, engine):
 
     session_b = sessionmaker(bind=engine)()
     try:
-        _upsert_snapshot(session_b, profile.id, "sde", today, readiness_percent=40, per_skill={"Python": 40})
+        _upsert_snapshot(session_b, profile.id, "sde", today, evidence_coverage_percent=40, per_skill={"Python": 40})
     finally:
         session_b.close()
 
@@ -277,15 +277,15 @@ def test_upsert_snapshot_concurrent_first_read_of_day_no_error(db, engine):
     # SELECT runs, so this call converges via the existing-row branch -- the same outcome a
     # true interleaved race must also reach via the except-IntegrityError branch, since both
     # paths end with exactly one row holding whichever call wrote last.
-    baseline = _upsert_snapshot(db, profile.id, "sde", today, readiness_percent=55, per_skill={"Python": 55})
+    baseline = _upsert_snapshot(db, profile.id, "sde", today, evidence_coverage_percent=55, per_skill={"Python": 55})
 
     assert baseline == 40  # session_b's value was on record immediately before this write
     rows = db.query(ReadinessSnapshot).filter(ReadinessSnapshot.profile_id == profile.id).all()
     assert len(rows) == 1
-    assert rows[0].readiness_percent == 55  # this call's values are the ones that stuck
+    assert rows[0].evidence_coverage_percent == 55  # this call's values are the ones that stuck
 
 
-def test_readiness_trend_uses_a_real_prior_snapshot(db):
+def test_coverage_trend_uses_a_real_prior_snapshot(db):
     profile = _profile(db)
     db.add(
         CareerPath(
@@ -305,15 +305,15 @@ def test_readiness_trend_uses_a_real_prior_snapshot(db):
             profile_id=profile.id,
             role_family_key="sde",
             snapshot_date=week_ago,
-            readiness_percent=10,
+            evidence_coverage_percent=10,
             per_skill_confidence_percent={"Python": 10},
         )
     )
     db.commit()
 
     twin = get_current(db, profile)
-    # No evidence -> today's readiness is 0; trend = 0 - 10 = -10, a real (if unflattering) delta.
-    assert twin.readiness_trend_percent == twin.readiness_percent - 10
+    # No evidence -> today's coverage is 0; trend = 0 - 10 = -10, a real (if unflattering) delta.
+    assert twin.evidence_coverage_trend_percent == twin.evidence_coverage_percent - 10
 
 
 def _strong_python_evidence(db, profile_id) -> None:
@@ -334,7 +334,7 @@ def _strong_python_evidence(db, profile_id) -> None:
     db.commit()
 
 
-def test_crossing_a_readiness_milestone_notifies(db):
+def test_crossing_a_coverage_milestone_notifies(db):
     profile = _profile(db)
     db.add(
         CareerPath(
@@ -353,7 +353,7 @@ def test_crossing_a_readiness_milestone_notifies(db):
             profile_id=profile.id,
             role_family_key="sde",
             snapshot_date=yesterday,
-            readiness_percent=0,
+            evidence_coverage_percent=0,
             per_skill_confidence_percent={"Python": 0},
         )
     )
@@ -361,7 +361,7 @@ def test_crossing_a_readiness_milestone_notifies(db):
     _strong_python_evidence(db, profile.id)
 
     twin = get_current(db, profile)
-    assert twin.readiness_percent == 70  # single-skill role, "strong" confidence 0.7
+    assert twin.evidence_coverage_percent == 70  # single-skill role, "strong" confidence 0.7
 
     pending = notification_service.get_pending(db, profile.id)
     milestone_events = [p for p in pending if p.kind == "readiness_milestone"]
@@ -385,7 +385,7 @@ def test_no_prior_snapshot_never_fabricates_a_milestone_notification(db):
     db.commit()
     _strong_python_evidence(db, profile.id)
 
-    # First-ever read: readiness lands at 70% with nothing real to compare against yet.
+    # First-ever read: coverage lands at 70% with nothing real to compare against yet.
     get_current(db, profile)
 
     assert [p for p in notification_service.get_pending(db, profile.id) if p.kind == "readiness_milestone"] == []
@@ -410,7 +410,7 @@ def test_crossing_a_milestone_only_notifies_once_even_with_a_same_day_reread(db)
             profile_id=profile.id,
             role_family_key="sde",
             snapshot_date=yesterday,
-            readiness_percent=0,
+            evidence_coverage_percent=0,
             per_skill_confidence_percent={"Python": 0},
         )
     )
@@ -418,7 +418,7 @@ def test_crossing_a_milestone_only_notifies_once_even_with_a_same_day_reread(db)
     _strong_python_evidence(db, profile.id)
 
     get_current(db, profile)  # crosses 50%/70% -- notifies once
-    get_current(db, profile)  # same-day reread, unchanged readiness -- must not notify again
+    get_current(db, profile)  # same-day reread, unchanged coverage -- must not notify again
 
     milestone_events = [p for p in notification_service.get_pending(db, profile.id) if p.kind == "readiness_milestone"]
     assert len(milestone_events) == 1
@@ -449,7 +449,7 @@ def test_evidence_reaching_strong_notifies_once(db):
     assert "Python" in evidence_events[0].title
 
 
-def test_readiness_trend_is_none_with_no_prior_snapshot(db):
+def test_coverage_trend_is_none_with_no_prior_snapshot(db):
     profile = _profile(db)
     db.add(
         CareerPath(
@@ -464,10 +464,10 @@ def test_readiness_trend_is_none_with_no_prior_snapshot(db):
     db.commit()
 
     twin = get_current(db, profile)
-    assert twin.readiness_trend_percent is None
+    assert twin.evidence_coverage_trend_percent is None
 
 
-def test_readiness_trend_ignores_a_baseline_far_older_than_this_week(db):
+def test_coverage_trend_ignores_a_baseline_far_older_than_this_week(db):
     """Real audit gap, now fixed: the trend query took the newest snapshot at least 6 days
     old, with no lower bound on how old. A student who used the app months ago and came back
     had that ancient snapshot used as "last week", so Home greeted them with an impressive
@@ -493,17 +493,17 @@ def test_readiness_trend_ignores_a_baseline_far_older_than_this_week(db):
             profile_id=profile.id,
             role_family_key="sde",
             snapshot_date=long_ago,
-            readiness_percent=10,
+            evidence_coverage_percent=10,
             per_skill_confidence_percent={"Python": 10},
         )
     )
     db.commit()
 
     twin = get_current(db, profile)
-    assert twin.readiness_trend_percent is None
+    assert twin.evidence_coverage_trend_percent is None
 
 
-def test_readiness_trend_still_works_at_the_far_edge_of_the_window(db):
+def test_coverage_trend_still_works_at_the_far_edge_of_the_window(db):
     """The bound must not be so tight that a student with slightly irregular usage loses their
     trend -- snapshots are written on read, so gaps are normal and expected."""
     profile = _profile(db)
@@ -525,18 +525,18 @@ def test_readiness_trend_still_works_at_the_far_edge_of_the_window(db):
             profile_id=profile.id,
             role_family_key="sde",
             snapshot_date=edge,
-            readiness_percent=10,
+            evidence_coverage_percent=10,
             per_skill_confidence_percent={"Python": 10},
         )
     )
     db.commit()
 
     twin = get_current(db, profile)
-    assert twin.readiness_trend_percent == twin.readiness_percent - 10
+    assert twin.evidence_coverage_trend_percent == twin.evidence_coverage_percent - 10
 
 
 # --- What the number could not see ----------------------------------------------------------
-# Readiness is a weighted average over evidence we were able to read. When a source was never
+# Evidence coverage is a weighted average over evidence we were able to read. When a source was
 # connected, the honest thing is to say which one -- not to let its absence read as a finding
 # about the student. See evidence_engine.unavailable_sources.
 
@@ -558,9 +558,9 @@ def test_the_twin_names_the_sources_it_could_not_read(db):
     twin = get_current(db, profile)
 
     assert twin.unavailable_sources == [evidence_engine.SOURCE_EXTERNAL, evidence_engine.SOURCE_RESUME]
-    # The readiness number itself is unaffected: a source we could not read contributes no
+    # The coverage number itself is unaffected: a source we could not read contributes no
     # evidence either way, which is already what every matcher does.
-    assert twin.readiness_percent == 0
+    assert twin.evidence_coverage_percent == 0
 
 
 def test_a_connected_student_has_nothing_reported_as_unread(db):

@@ -348,10 +348,13 @@ def test_turn_from_another_profiles_session_is_not_found(db):
     build = _completed_build(db, profile)
     ai = SucceedingAIProvider()
     session = svc.start_session(db, profile, "project_build", build.id, None)
+    # Read before get_next_turn, which runs its AI call with no transaction open (F12-07) and so
+    # detaches every row loaded before it. The assertion below is unchanged.
+    other_id = other.id
     turn = svc.get_next_turn(db, profile.id, session.id, ai).turn
 
     with pytest.raises(svc.RecruiterAttackNotFoundError):
-        svc.answer_turn(db, other.id, session.id, turn.id, "Not mine to answer.")
+        svc.answer_turn(db, other_id, session.id, turn.id, "Not mine to answer.")
 
 
 # --- results / grading ----------------------------------------------------------------------
@@ -525,11 +528,14 @@ def test_results_isolated_per_profile(db):
     build = _completed_build(db, profile)
     ai = SucceedingAIProvider()
     session = svc.start_session(db, profile, "project_build", build.id, None)
-    _finish_session(db, profile, ai, session.id)
-    svc.get_results(db, profile.id, session.id, ai)
+    # Read before the AI-calling helpers below, which run with no transaction open (F12-07) and so
+    # detach every row loaded before them. The assertion is unchanged.
+    profile_id, other_id, session_id = profile.id, other.id, session.id
+    _finish_session(db, profile, ai, session_id)
+    svc.get_results(db, profile_id, session_id, ai)
 
     with pytest.raises(svc.RecruiterAttackNotFoundError):
-        svc.get_results(db, other.id, session.id, ai)
+        svc.get_results(db, other_id, session_id, ai)
 
 
 # --- prompt-injection hardening (same delimiter-framing checks as
@@ -567,3 +573,43 @@ def test_evaluation_prompt_frames_the_claim_and_transcript_as_untrusted_data():
 def test_recruiter_attack_service_points_at_the_versioned_prompts():
     assert svc._QUESTION_PROMPT_PATH.name == "recruiter_attack_question_v2.txt"
     assert svc._EVALUATION_PROMPT_PATH.name == "recruiter_attack_evaluation_v2.txt"
+
+
+def test_a_session_deleted_while_the_ai_was_grading_is_reported_as_not_found(db):
+    """Grading runs with no transaction open (F12-07), so the row can genuinely disappear between
+    the ownership check at the top of get_results and the write at the end -- an account deletion,
+    say. The state has to be re-read and re-checked on the far side of that gap, not assumed: the
+    alternative is an unhandled AttributeError on a None row, which reaches the client as a 500
+    instead of the 404 this case already has a shape for.
+    """
+    profile = _profile(db)
+    build = _completed_build(db, profile)
+    ai = SucceedingAIProvider()
+    session = svc.start_session(db, profile, "project_build", build.id, None)
+    profile_id, session_id = profile.id, session.id
+    _finish_session(db, profile, ai, session_id)
+    engine = db.get_bind()
+
+    class DeletesTheSessionWhileGrading(AIProvider):
+        def generate_structured(self, prompt, schema):
+            other = sessionmaker(bind=engine)()
+            try:
+                other.query(RecruiterAttackTurn).filter(
+                    RecruiterAttackTurn.session_id == session_id
+                ).delete(synchronize_session=False)
+                other.query(RecruiterAttackSession).filter(
+                    RecruiterAttackSession.id == session_id
+                ).delete(synchronize_session=False)
+                other.commit()
+            finally:
+                other.close()
+            return GeneratedRecruiterAttackEvaluation(
+                technical_defense=0.9, project_ownership=0.85, specificity=0.8, communication=0.75,
+                overall_score=0.82, feedback="Strong, specific defense of the claim.",
+            )
+
+        def generate_text(self, prompt):
+            raise AssertionError("not used")
+
+    with pytest.raises(svc.RecruiterAttackNotFoundError):
+        svc.get_results(db, profile_id, session_id, DeletesTheSessionWhileGrading())

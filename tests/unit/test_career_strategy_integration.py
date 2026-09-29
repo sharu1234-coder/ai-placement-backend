@@ -150,7 +150,7 @@ class TestOneStory:
         """Two readiness figures on two screens would make both untrustworthy."""
         profile = _proven(db)
         view = strategy_service.compute(db, profile, now=NOW)
-        assert view.twin.readiness_percent == career_twin_service.get_current(db, profile).readiness_percent
+        assert view.twin.evidence_coverage_percent == career_twin_service.get_current(db, profile).evidence_coverage_percent
 
     def test_the_strategy_and_next_best_action_do_not_give_conflicting_orders(self, db):
         """Career Strategy consumes the existing recommendation engine rather than running a

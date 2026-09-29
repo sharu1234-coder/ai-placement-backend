@@ -12,7 +12,9 @@ nothing" are different facts and a student deserves to know which one they are l
 """
 
 import datetime
+import hashlib
 import logging
+import uuid
 from typing import Optional
 
 from sqlalchemy.exc import IntegrityError
@@ -82,6 +84,14 @@ MAX_SAVED_SEARCHES = 200
 _MAX_URL_LENGTH = 1000
 _MAX_PROVIDER_ID_LENGTH = 255
 
+# The `provider` value on a listing a student typed in themselves. Not a JobProvider: nothing
+# in providers/factory.py answers to this name, so it can never collide with a configured
+# adapter, and `build_job_provider` would fall through to NullJobProvider if anyone tried.
+#
+# The same word SAVED_JOB_SOURCES already uses for the same fact, rather than a second
+# vocabulary meaning the same thing one layer down.
+MANUAL_PROVIDER = "manual"
+
 
 class JobHuntError(Exception):
     """Base for errors this module raises that the API maps to 4xx."""
@@ -102,6 +112,10 @@ class SavedSearchNotFoundError(JobHuntError):
 
 class SavedJobNotFoundError(JobHuntError):
     pass
+
+
+class InvalidJobUrlError(JobHuntError):
+    """A manually entered job carried a link this app will not store."""
 
 
 class InvalidStatusError(JobHuntError):
@@ -764,19 +778,43 @@ def build_skill_provenance(
     )
 
 
+def assert_listing_visible(listing: JobListing, profile_id: int) -> None:
+    """Raise unless this student may read this listing.
+
+    Two kinds of row live in job_listings and they have opposite privacy.
+
+    A provider advert is public content: many students search the same keywords and match
+    against the same job, and there is nothing in it that belongs to any one of them. Those
+    rows stay readable by anyone, which is what makes a shared listing table correct in the
+    first place.
+
+    A manually entered listing is the student's own writing -- the company a senior referred
+    them to, the description they pasted out of an email. `created_by_profile_id` is set on
+    exactly those, and this is the check that keeps them private.
+
+    ListingNotFoundError rather than a forbidden error, matching every other ownership check in
+    this module: answering "that exists but is not yours" would confirm an id by probing.
+    """
+    owner = listing.created_by_profile_id
+    if owner is not None and owner != profile_id:
+        raise ListingNotFoundError(f"Job listing {listing.id} not found")
+
+
 def get_listing_for_profile(
     db: Session, profile_id: int, listing_id: int
 ) -> tuple[JobListing, JobListingMatch]:
     """One listing plus this student's match for it.
 
     The match is recomputed when it is missing or was produced by an older engine version, so a
-    student never sees a score today's weights would not produce. Listings themselves are not
-    profile-owned, so a listing this student has never searched is still readable -- there is
-    nothing private in it -- but the match returned is always and only theirs.
+    student never sees a score today's weights would not produce. A provider listing is not
+    profile-owned, so one this student has never searched is still readable -- there is nothing
+    private in it -- but a manually entered listing belongs to whoever wrote it, and the match
+    returned is always and only theirs either way.
     """
     listing = db.get(JobListing, listing_id)
     if listing is None:
         raise ListingNotFoundError(f"Job listing {listing_id} not found")
+    assert_listing_visible(listing, profile_id)
 
     search_profile = get_or_create_search_profile(db, profile_id)
     match = (
@@ -801,6 +839,137 @@ def is_stale(listing: JobListing, now: Optional[datetime.datetime] = None) -> bo
     return (now or _utcnow()) > listing.expires_at
 
 
+# -- Manually entered jobs ------------------------------------------------------------------
+
+
+def _manual_listing_identity(profile_id: int, safe_url: Optional[str]) -> str:
+    """The `provider_job_id` for one manually entered job.
+
+    Two jobs are the same job when they are at the same link. That is the only identity a
+    student's own typing gives us, and it is a real one: two different openings at one company
+    have two different pages, so a URL match is an exact claim rather than a guess. Deriving
+    the id from it means the UNIQUE (provider, provider_job_id) constraint that already
+    deduplicates provider adverts deduplicates these too -- and arbitrates the race between two
+    concurrent submissions -- with no second mechanism and no extra query.
+
+    Scoped by profile so it cannot collide across students. Without that prefix, two students
+    adding the same public job posting would land on one shared row, and the second would read
+    the first student's typing.
+
+    With no URL there is no key, so the id is opaque and unique and every submission creates
+    its own row. That is deliberate rather than a gap: a student may genuinely be tracking two
+    different campus roles at the same company with the same title, and nothing distinguishes
+    them. Guessing that the second is a duplicate of the first would silently discard a real
+    application. Fuzzy matching on title and company was considered and rejected for exactly
+    that reason.
+    """
+    if safe_url is None:
+        return f"{profile_id}:{uuid.uuid4().hex}"
+    digest = hashlib.sha256(safe_url.encode("utf-8")).hexdigest()[:40]
+    return f"{profile_id}:{digest}"
+
+
+def add_manual_job(
+    db: Session,
+    profile_id: int,
+    *,
+    title: str,
+    company: Optional[str] = None,
+    location: Optional[str] = None,
+    url: Optional[str] = None,
+    description: Optional[str] = None,
+    status: str = "saved",
+) -> SavedJob:
+    """Record a job the student found somewhere this app cannot search, and start tracking it.
+
+    This is the one creation path for a JobListing that does not come from a provider, and it
+    exists because the entire outcome loop -- listing, saved job, career goal, applied,
+    interview, offer -- hangs off a listing row. Until this function, that row could only be
+    produced by a paid search against a shared quota, so a student whose jobs came from campus
+    placement or a referral could not use the tracker at all.
+
+    Creating the listing and tracking it are one operation rather than two calls. An untracked
+    manual listing would be unreachable by construction: no search returns it, and its owner
+    would have no way back to it. It would also be a row of a student's own text with nothing
+    pointing at it, which is the shape that survives cleanup.
+
+    Saving is delegated to save_job rather than reimplemented, so provenance, the applied_at
+    stamp, the per-profile unique constraint and the concurrent-save recovery are all the same
+    code paths a provider-sourced save uses. `source` is fixed here rather than taken from the
+    caller: where this job came from is a fact the server knows, not a claim the client makes.
+
+    `status` is honoured on creation because a student who finds this product after already
+    interviewing must be able to say so; forcing every manual job to start at "saved" would
+    make them walk a real application backwards through a pipeline it has already passed.
+    """
+    if status not in SAVED_JOB_STATUSES:
+        # Checked before anything is written. save_job would reject it too, but by then the
+        # listing would already exist with nothing tracking it.
+        raise InvalidStatusError(f"Unknown status {status!r}")
+
+    safe_url: Optional[str] = None
+    if url is not None and url.strip():
+        safe_url = normalization.safe_external_url(url)
+        if safe_url is None:
+            # A provider listing with a bad URL is dropped silently, because one bad advert
+            # must not fail a page of twenty. Here the student typed it, so silence would look
+            # like the link was accepted. They are told instead.
+            raise InvalidJobUrlError(
+                "That link could not be saved. Enter a full http:// or https:// web address, "
+                "or leave it empty."
+            )
+        if len(safe_url) > _MAX_URL_LENGTH:
+            raise InvalidJobUrlError("That link is too long to save.")
+
+    provider_job_id = _manual_listing_identity(profile_id, safe_url)
+    listing = _find_listing(db, MANUAL_PROVIDER, provider_job_id)
+    if listing is None:
+        listing = JobListing(
+            provider=MANUAL_PROVIDER,
+            provider_job_id=provider_job_id,
+            created_by_profile_id=profile_id,
+            url=safe_url,
+            title=_fit(title, 500),
+            company=_fit(company, 300),
+            location=_fit(location, 300),
+            description=description,
+            # Nothing is derived from the text the student typed. work_mode and seniority are
+            # inferred for provider adverts because a provider writes standardised copy at
+            # scale; inferring "remote" or "senior" from one student's shorthand would put a
+            # fact in their tracker that they never stated.
+            fetched_at=_utcnow(),
+            # No expiry. expires_at exists to stop a cached provider copy being presented as
+            # current after that provider's retention window; nothing here was cached from
+            # anyone, so this listing is never stale and is_stale correctly returns False.
+            expires_at=None,
+        )
+        try:
+            with db.begin_nested():
+                db.add(listing)
+                db.flush()
+        except IntegrityError:
+            # Two submissions of the same link at once. The unique constraint is the
+            # authority, exactly as it is on the provider path; adopt the row that won.
+            listing = _find_listing(db, MANUAL_PROVIDER, provider_job_id)
+            if listing is None:
+                raise
+
+    already_tracked = (
+        db.query(SavedJob)
+        .filter(SavedJob.profile_id == profile_id, SavedJob.listing_id == listing.id)
+        .first()
+    )
+    if already_tracked is not None:
+        # Re-adding a job already in the tracker returns what is there and changes nothing.
+        # Passing `status` through to save_job here would be destructive: a student re-adding
+        # a link they had already moved to "interview" would have it reset to whatever the
+        # form defaulted to, silently rewinding a real application.
+        db.commit()
+        return already_tracked
+
+    return save_job(db, profile_id, listing.id, status, source=MANUAL_PROVIDER)
+
+
 # -- Saved jobs and application tracking ----------------------------------------------------
 
 
@@ -823,8 +992,14 @@ def save_job(
         raise InvalidStatusError(f"Unknown status {status!r}")
     if source not in SAVED_JOB_SOURCES:
         raise InvalidStatusError(f"Unknown source {source!r}")
-    if db.get(JobListing, listing_id) is None:
+    listing = db.get(JobListing, listing_id)
+    if listing is None:
         raise ListingNotFoundError(f"Job listing {listing_id} not found")
+    # Without this, the id in this request body is an IDOR on every manually entered job: a
+    # student could save another student's typed-in listing and then read its title, company
+    # and pasted description straight back out of their own tracker. Every other Job Hunt id
+    # arrives in a path and is scoped by its handler; this one does not.
+    assert_listing_visible(listing, profile_id)
 
     # `source_saved_search_id` arrives in a request body, unlike every other Job Hunt id,
     # which arrives in a path and is scoped by the handler. Stored unchecked it was a

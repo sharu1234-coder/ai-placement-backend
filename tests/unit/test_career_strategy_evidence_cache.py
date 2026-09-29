@@ -1,19 +1,19 @@
 """The strategy read hands its evidence to Career Twin instead of making it fetch again.
 
 Career Strategy builds a signal bundle that already contains an evidence view per skill, then
-asked career_twin_service for readiness -- and that service ran the identical evidence pass a
-second time. The obvious way to remove the duplicate is to compute readiness in the strategy
-layer from the bundle it already holds. That would be a second readiness engine, free to
+asked career_twin_service for coverage -- and that service ran the identical evidence pass a
+second time. The obvious way to remove the duplicate is to compute coverage in the strategy
+layer from the bundle it already holds. That would be a second coverage engine, free to
 disagree with Career Twin about the same student on the same screen, and it is exactly what this
 whole layer exists to avoid.
 
-So the views are handed over as a *cache* instead. career_twin_service still computes readiness,
+So the views are handed over as a *cache* instead. career_twin_service still computes coverage,
 still owns that number, and still fetches anything the caller did not bring. The optimisation can
 therefore only change the cost of a read, never its result -- which is precisely what these tests
 pin down: one asserts the number is unchanged, the other asserts the reads went down.
 
 The fallback test is the important one. A cache that silently dropped a skill it had not been
-given would produce a *quietly different* readiness, which is the worst possible failure here:
+given would produce a *quietly different* coverage number, which is the worst possible failure:
 no error, no crash, just a number that no longer matches the Career Twin screen.
 """
 
@@ -86,7 +86,7 @@ class TestTheCacheChangesCostNotAnswers:
         uncached = career_twin_service.get_current(db, profile)
         cached = career_twin_service.get_current(db, profile, evidence=bundle.evidence_by_skill)
 
-        assert cached.readiness_percent == uncached.readiness_percent
+        assert cached.evidence_coverage_percent == uncached.evidence_coverage_percent
         assert cached.is_estimate == uncached.is_estimate
         assert [item.skill for item in cached.skills] == [item.skill for item in uncached.skills]
         assert [item.state for item in cached.skills] == [item.state for item in uncached.skills]
@@ -99,11 +99,11 @@ class TestTheCacheChangesCostNotAnswers:
         invariant the integration suite asserts, re-checked on the optimised path."""
         profile = _student(db, user_id=2, role_name="Backend Engineer 2")
         view = strategy_service.compute(db, profile, now=NOW)
-        assert view.twin.readiness_percent == career_twin_service.get_current(db, profile).readiness_percent
+        assert view.twin.evidence_coverage_percent == career_twin_service.get_current(db, profile).evidence_coverage_percent
 
     def test_a_skill_the_caller_did_not_bring_is_still_fetched(self, db):
         """The fallback, and the failure mode worth fearing: a cache that dropped an unknown
-        skill would return a quietly different readiness rather than an error."""
+        skill would return a quietly different coverage number rather than an error."""
         profile = _student(db, user_id=3, role_name="Backend Engineer 3")
         full = career_twin_service.get_current(db, profile)
 
@@ -114,14 +114,14 @@ class TestTheCacheChangesCostNotAnswers:
 
         with_partial = career_twin_service.get_current(db, profile, evidence=partial)
 
-        assert with_partial.readiness_percent == full.readiness_percent
+        assert with_partial.evidence_coverage_percent == full.evidence_coverage_percent
         assert {item.skill for item in with_partial.skills} == {item.skill for item in full.skills}
 
     def test_an_empty_cache_behaves_exactly_like_no_cache(self, db):
         profile = _student(db, user_id=4, role_name="Backend Engineer 4")
         assert (
-            career_twin_service.get_current(db, profile, evidence={}).readiness_percent
-            == career_twin_service.get_current(db, profile).readiness_percent
+            career_twin_service.get_current(db, profile, evidence={}).evidence_coverage_percent
+            == career_twin_service.get_current(db, profile).evidence_coverage_percent
         )
 
     def test_the_cache_removes_the_duplicate_evidence_read(self):

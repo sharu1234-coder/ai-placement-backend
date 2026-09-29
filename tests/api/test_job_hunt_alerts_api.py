@@ -336,6 +336,40 @@ class TestSavedSearchRun:
         assert after["last_error_at"] is not None
         assert after["last_result_count"] == 1
 
+    def test_a_run_that_found_nothing_records_a_real_zero(
+        self, client, auth_headers, use_provider
+    ):
+        """The distinction the saved-search line on Android turns on.
+
+        Three states share one screen: never run, ran and found nothing, and could not run.
+        NULL is reserved for the first, so a successful run that matched nothing has to write
+        an actual 0 -- if it left the column alone the search would go on claiming it had never
+        run, and the student would never learn that their filters have stopped matching.
+
+        It is also the mirror of the failure case above: that one must *not* write a count,
+        this one must. Only one of the two was covered.
+        """
+        use_provider(FakeJobProvider(jobs=[], total=0))
+        client.put(
+            "/job-hunt/profile",
+            json={"target_role_title": "Software Engineer"},
+            headers=auth_headers,
+        )
+        search = seed_search(client, auth_headers, keywords="quantum blacksmith")
+
+        resp = client.post(
+            f"/job-hunt/saved-searches/{search['id']}/run", headers=auth_headers
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["results"] == []
+
+        after = client.get("/job-hunt/saved-searches", headers=auth_headers).json()[0]
+        assert after["last_result_count"] == 0, (
+            "a search that genuinely matched nothing must not read as one that never ran"
+        )
+        assert after["last_success_at"] is not None
+        assert after["last_error_at"] is None
+
     def test_running_another_students_saved_search_is_404(
         self, client, auth_headers, other_headers, use_provider
     ):

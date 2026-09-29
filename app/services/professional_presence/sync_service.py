@@ -173,12 +173,6 @@ def sync(db: Session, profile_id: int, provider_key: str, ai_provider=None) -> S
     snapshot = _write_snapshot_if_changed(db, connection, fetched)
     snapshot_written = snapshot is not None
 
-    if snapshot is not None and ai_provider is not None:
-        # Generated only when the account's content actually changed. Re-syncing an unchanged
-        # profile costs no AI call at all, and the prose already stored against the previous
-        # snapshot is still the prose for the same facts.
-        _attach_narrative(db, profile_id, snapshot, ai_provider)
-
     # Display name only, and refreshed on every sync because a GitHub login can be renamed by
     # its owner. Ownership stays keyed on provider_user_id, which cannot be renamed.
     connection.provider_username = fetched.profile.username or connection.provider_username
@@ -189,6 +183,19 @@ def sync(db: Session, profile_id: int, provider_key: str, ai_provider=None) -> S
         # A successful call proves the credential works again.
         connection.status = STATUS_ACTIVE
     db.commit()
+
+    if snapshot is not None and ai_provider is not None:
+        # After the commit, not before it (F12-07). The evidence reconciliation, the snapshot and
+        # the connection's status are one unit of work, and the prose is not part of it -- this
+        # function's own docstring already says the snapshot and its evidence are the valuable part
+        # and a lost sentence is not worth failing a completed sync over. Running the AI mid-unit
+        # meant the generation either held that whole transaction open or, once it stopped doing
+        # that, discarded it.
+        #
+        # Generated only when the account's content actually changed. Re-syncing an unchanged
+        # profile costs no AI call at all, and the prose already stored against the previous
+        # snapshot is still the prose for the same facts.
+        _attach_narrative(db, profile_id, snapshot, ai_provider)
 
     return SyncResult(
         provider=provider_key,
@@ -380,16 +387,27 @@ def _attach_narrative(db: Session, profile_id: int, snapshot: ExternalProfileSna
     valuable part; losing the prose costs a sentence per finding, while raising would fail a
     sync that has, in every way that matters, already succeeded.
     """
+    from app.services.ai_boundary import outside_transaction
     from app.services.professional_presence import audit_service
 
+    # Plain values, taken before the boundary below closes the session.
+    snapshot_id, connection_id = snapshot.id, snapshot.connection_id
     try:
         observations = audit_service.observations_for(db, profile_id, snapshot)
-        narrative = audit_service.generate_narrative(observations, ai_provider)
+        # Outside any transaction (F12-07). The snapshot and its evidence are already committed,
+        # so nothing is pending, and the prose generation no longer holds a connection.
+        with outside_transaction(db):
+            narrative = audit_service.generate_narrative(observations, ai_provider)
     except Exception:  # noqa: BLE001 -- see docstring: never fail a completed sync over prose
-        logger.warning("event=presence_narrative_skipped connection_id=%s", snapshot.connection_id)
+        logger.warning("event=presence_narrative_skipped connection_id=%s", connection_id)
         return
 
     if not narrative:
+        return
+
+    # Re-read: the row passed in was detached by the boundary.
+    snapshot = db.get(ExternalProfileSnapshot, snapshot_id)
+    if snapshot is None:
         return
 
     payload = dict(snapshot.payload or {})
@@ -398,6 +416,9 @@ def _attach_narrative(db: Session, profile_id: int, snapshot: ExternalProfileSna
     # Reassigned rather than mutated in place: SQLAlchemy does not track mutation inside a plain
     # JSON column, so an in-place update would be silently dropped on commit.
     snapshot.payload = payload
+    # Committed here rather than left for the caller: this now runs after the sync's own commit, so
+    # there is no later commit to ride along with.
+    db.commit()
 
 
 def _write_snapshot_if_changed(

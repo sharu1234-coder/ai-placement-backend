@@ -6,8 +6,8 @@ from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from app.ai.input_guard import render_prompt
-from app.ai.output_guard import looks_like_prompt_leak
-from app.ai.provider import AIProvider
+from app.ai.output_guard import contains_prompt_leak, leaking_field
+from app.ai.provider import AIGenerationError, AIProvider
 from app.ai.schemas.assessment import AnswerGrade, GeneratedQuestion
 from app.ai.score_utils import clamp_unit_score
 from app.models.assessment import Assessment
@@ -24,6 +24,7 @@ from app.schemas.assessment import (
     QuestionRead,
     SkillScore,
 )
+from app.services.ai_boundary import outside_transaction
 
 _QUESTION_PROMPT_PATH = Path(__file__).resolve().parent.parent / "ai" / "prompts" / "question_generator_v2.txt"
 _GRADER_PROMPT_PATH = Path(__file__).resolve().parent.parent / "ai" / "prompts" / "answer_grader_v3.txt"
@@ -48,12 +49,14 @@ def _sanitize_generated_question(generated: GeneratedQuestion, skill: str) -> Ge
 
     `expected_answer_or_rubric` is checked here too (a real audit gap: it previously wasn't)
     because it is exactly the field answer_grader_v3.txt re-interpolates as {rubric} for every
-    non-mcq answer -- a leak that survived here would flow straight into a second AI prompt."""
-    if (
-        looks_like_prompt_leak(generated.prompt)
-        or looks_like_prompt_leak(generated.explanation)
-        or looks_like_prompt_leak(generated.expected_answer_or_rubric)
-    ):
+    non-mcq answer -- a leak that survived here would flow straight into a second AI prompt.
+
+    The check is now over the whole generated object rather than three named fields. That
+    closes a second gap of the same kind: `options` -- the four MCQ choices, persisted on
+    Question.options and rendered to the student verbatim -- was never checked, so a model that
+    leaked into an option instead of the prompt was displayed unaltered. Naming fields is how
+    that gap happened; asking the schema is how it stops happening."""
+    if contains_prompt_leak(generated):
         logger.warning(
             "Discarding a generated question for skill=%r: output contained prompt-leak markers.",
             skill,
@@ -212,12 +215,19 @@ def get_next_question(
         return NextQuestionResponse(completed=True, question=None)
 
     difficulty = _next_difficulty(db, assessment_id, current_section.skill)
-    prompt = _build_question_prompt(current_section.skill, current_section.assessment_type, difficulty)
-    generated: GeneratedQuestion = ai_provider.generate_structured(prompt, GeneratedQuestion)
-    generated = _sanitize_generated_question(generated, current_section.skill)
+    # Plain values, taken before the boundary below closes the session.
+    skill = current_section.skill
+    assessment_type = current_section.assessment_type
+    prompt = _build_question_prompt(skill, assessment_type, difficulty)
+    # Outside any transaction (F12-07). Question generation is a full model call, and holding a
+    # pooled connection and a PostgreSQL snapshot for it bought nothing -- everything it needs is
+    # already in `prompt`.
+    with outside_transaction(db):
+        generated: GeneratedQuestion = ai_provider.generate_structured(prompt, GeneratedQuestion)
+        generated = _sanitize_generated_question(generated, skill)
 
     question = Question(
-        skill_tag=current_section.skill,
+        skill_tag=skill,
         type=generated.type,
         difficulty=difficulty,
         prompt=generated.prompt,
@@ -227,9 +237,10 @@ def get_next_question(
         source="ai_generated",
     )
     db.add(question)
-    db.commit()
-    db.refresh(question)
-
+    # flush, not commit: the question and the attempt that makes it the student's pending question
+    # are one unit. Committing the question on its own (which is what this did) could leave a
+    # generated question with no attempt pointing at it.
+    db.flush()
     db.add(QuestionAttempt(assessment_id=assessment_id, question_id=question.id))
     db.commit()
 
@@ -260,6 +271,10 @@ def submit_answer(
         raise QuestionNotPendingError("No pending question with this id for this assessment")
 
     question = db.get(Question, question_id)
+    # Plain values, taken now: the non-mcq branch below closes the session for the grading call,
+    # and both the conditional UPDATE and the response still need these afterwards.
+    attempt_id = attempt.id
+    question_explanation = question.explanation
 
     if question.type == "mcq":
         is_correct = student_answer.strip().lower() == question.expected_answer_or_rubric.strip().lower()
@@ -282,7 +297,29 @@ def submit_answer(
             rubric=question.expected_answer_or_rubric,
             student_answer=student_answer,
         )
-        grade: AnswerGrade = ai_provider.generate_structured(grade_prompt, AnswerGrade)
+        # Outside any transaction (F12-07). Safe to leave here without re-reading anything,
+        # because the write below is already a conditional UPDATE rather than a load-mutate-commit:
+        # whatever changed while the model was grading, only the request that flips a still-NULL
+        # student_answer row wins. That was written for the same race this boundary widens, so
+        # widening it changes nothing about who wins.
+        with outside_transaction(db):
+            grade: AnswerGrade = ai_provider.generate_structured(grade_prompt, AnswerGrade)
+        # Found by tests/unit/test_ai_output_guard_parity.py, not by the audit: this call site
+        # consumes only `score` today, so no generated text currently crosses the boundary here
+        # (AnswerGrade.feedback is never read, and is_correct is derived from the clamped score
+        # rather than taken from the model). That is a property of the current code, not of the
+        # contract -- surfacing the model's feedback to the student is an obvious future change,
+        # and it would arrive already leaking.
+        #
+        # The guard is over the response as a whole rather than over the field that happens to
+        # be read, because a grade that echoes prompt scaffolding is not a judgement of this
+        # answer: its number is no more trustworthy than its prose. Routed as a generation
+        # failure, which is the path this service already has for a grade it could not obtain --
+        # raised before the conditional UPDATE below, so the attempt stays pending and the
+        # student can resubmit rather than being scored on a hijacked response.
+        leaked = leaking_field(grade)
+        if leaked is not None:
+            raise AIGenerationError(f"Answer grade output leaked prompt scaffolding in field {leaked}")
         score = clamp_unit_score(
             grade.score, field_name="score", context=f"assessment answer grading, question_id={question_id}"
         )
@@ -305,7 +342,7 @@ def submit_answer(
     # here rather than silently overwriting the winner's already-persisted grade.
     result = db.execute(
         update(QuestionAttempt)
-        .where(QuestionAttempt.id == attempt.id, QuestionAttempt.student_answer.is_(None))
+        .where(QuestionAttempt.id == attempt_id, QuestionAttempt.student_answer.is_(None))
         .values(
             student_answer=student_answer,
             is_correct=is_correct,
@@ -317,7 +354,9 @@ def submit_answer(
     if not result.rowcount:
         raise QuestionNotPendingError("No pending question with this id for this assessment")
 
-    return AnswerResult(question_id=question.id, is_correct=is_correct, score=score, explanation=question.explanation)
+    return AnswerResult(
+        question_id=question_id, is_correct=is_correct, score=score, explanation=question_explanation
+    )
 
 
 def get_result(db: Session, profile_id: int, assessment_id: int) -> AssessmentResultRead:

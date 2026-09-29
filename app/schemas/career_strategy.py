@@ -201,14 +201,17 @@ class CareerStrategyRead(BaseModel):
     # the screen can say "we think you're targeting X" rather than asserting it.
     role_is_estimate: bool = False
 
-    # Career Twin's number, not a second readiness calculation. None when it has no basis.
-    readiness_percent: Optional[int] = None
-    readiness_is_estimate: bool = False
+    # Career Twin's EVIDENCE COVERAGE number, not a second calculation. None when it has no
+    # basis. Renamed from readiness_percent in Phase 2G along with its two companions below,
+    # because all three describe the same metric and splitting their names would leave the
+    # screen reading "evidence coverage" from a field called readiness.
+    evidence_coverage_percent: Optional[int] = None
+    evidence_coverage_is_estimate: bool = False
     # Career Twin's own explanation of that number, carried through verbatim. Free, because the
     # /career-twin endpoint it comes from is free -- gating it here would only hide from this
     # screen what the same student can already read on another one, which is not a paywall, just
-    # an inconsistency. A readiness figure with no working shown is a number to distrust.
-    readiness_reasons: List[str] = []
+    # an inconsistency. A coverage figure with no working shown is a number to distrust.
+    evidence_coverage_reasons: List[str] = []
 
     # How much was actually visible. Drives the honest empty state: "3 more things to record"
     # rather than a confident-looking strategy built on one assessment.
@@ -344,7 +347,7 @@ class SetStrategyTargetsRequest(BaseModel):
 class TargetStrategyRead(BaseModel):
     """One target role, judged by the same engine that judges the primary one.
 
-    Every field here is produced by an existing service: readiness and effort by
+    Every field here is produced by an existing service: evidence coverage and effort by
     career_decision_service, the bottleneck and action by the Career Strategy engine with the
     role context swapped. Nothing in this shape is computed specially for the comparison.
     """
@@ -360,9 +363,10 @@ class TargetStrategyRead(BaseModel):
     # invites switching by accident.
     is_current_target: bool = False
 
-    # career_decision_service's number, identical to what Career Decision Lab shows for this
-    # role. None only if it could not be computed at all -- never a zero standing in for one.
-    readiness_percent: Optional[int] = None
+    # career_decision_service's evidence_coverage_percent, identical to what Career Decision
+    # Lab shows for this role. None only if it could not be computed at all -- never a zero
+    # standing in for one. Renamed from readiness_percent in Phase 2G to match its source.
+    evidence_coverage_percent: Optional[int] = None
     classification: Optional[str] = None  # best_fit | alternative | stretch
     # Always an estimate, and labelled as one. Never a probability of being hired.
     estimated_hours_to_strengthen: Optional[float] = None

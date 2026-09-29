@@ -19,11 +19,12 @@ from typing import List, Optional
 from sqlalchemy.orm import Session
 
 from app.ai.input_guard import render_prompt
-from app.ai.output_guard import looks_like_prompt_leak
+from app.ai.output_guard import contains_prompt_leak
 from app.ai.provider import AIGenerationError, AIProvider
 from app.ai.schemas.project_builder import GeneratedProjectProof
 from app.models.project_build import ProjectBuild
 from app.models.project_build_stage import ProjectBuildStage
+from app.services.ai_boundary import outside_transaction
 from app.services.project_builder.stages import STAGE_TITLES
 
 logger = logging.getLogger(__name__)
@@ -74,22 +75,32 @@ def _fallback_proof(role_name: str, title: str) -> GeneratedProjectProof:
 
 
 def _looks_safe(proof: GeneratedProjectProof) -> bool:
-    fields = [proof.resume_bullet, proof.readme_markdown, proof.explanation_60s, proof.explanation_5min]
-    return not any(looks_like_prompt_leak(f) for f in fields) and not any(
-        looks_like_prompt_leak(q) for q in proof.defense_questions
-    )
+    """Every generated field, taken from the schema rather than listed here -- so a field added
+    to GeneratedProjectProof is covered without this function being remembered."""
+    return not contains_prompt_leak(proof)
 
 
 def generate_proof(db: Session, build: ProjectBuild, stages: List[ProjectBuildStage], ai_provider: AIProvider) -> None:
     role_name = build.target_role_name or "this role"
+    # Plain values and a rendered prompt, taken before the boundary below closes the session.
+    build_id, title = build.id, build.title
+    prompt = _build_prompt(role_name, title, build.stack_summary, stages)
     try:
-        prompt = _build_prompt(role_name, build.title, build.stack_summary, stages)
-        generated: GeneratedProjectProof = ai_provider.generate_structured(prompt, GeneratedProjectProof)
+        # Outside any transaction (F12-07). This runs at the end of a build the student has just
+        # completed, and it generates five artefacts in one call.
+        with outside_transaction(db):
+            generated: GeneratedProjectProof = ai_provider.generate_structured(prompt, GeneratedProjectProof)
         if not generated.defense_questions or not _looks_safe(generated):
             raise AIGenerationError("AI proof output was empty or contained prompt-leak markers")
     except AIGenerationError as exc:
-        logger.warning("AI project-proof generation failed for build_id=%s, using template fallback: %s", build.id, exc)
-        generated = _fallback_proof(role_name, build.title)
+        logger.warning("AI project-proof generation failed for build_id=%s, using template fallback: %s", build_id, exc)
+        generated = _fallback_proof(role_name, title)
+
+    # Re-read: the row passed in was detached by the boundary. If the build has gone, there is
+    # nothing to attach the proof to and nothing to report -- this function already returns None.
+    build = db.get(ProjectBuild, build_id)
+    if build is None:
+        return
 
     build.proof_resume_bullet = generated.resume_bullet
     build.proof_readme_markdown = generated.readme_markdown

@@ -36,7 +36,7 @@ from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from app.ai.input_guard import render_prompt
-from app.ai.output_guard import looks_like_prompt_leak
+from app.ai.output_guard import contains_prompt_leak
 from app.ai.provider import AIGenerationError, AIProvider
 from app.ai.schemas.recruiter_attack import GeneratedRecruiterAttackEvaluation, GeneratedRecruiterAttackQuestion
 from app.ai.score_utils import clamp_unit_score
@@ -54,6 +54,7 @@ from app.schemas.recruiter_attack import (
     RecruiterAttackTurnRead,
 )
 from app.services import weakness_record_service
+from app.services.ai_boundary import outside_transaction
 from app.services.project_builder.stages import STAGE_TITLES
 from app.services.role_context import resolve_role_context
 
@@ -260,29 +261,30 @@ def get_next_turn(
 
     question_text: Optional[str] = None
     based_on: Optional[str] = None
+    # The prompt is rendered from the existing turns before the boundary below, and the count is
+    # kept as a plain int because the row written at the end needs it.
+    turn_count = len(turns)
+    template = _QUESTION_PROMPT_PATH.read_text(encoding="utf-8")
+    prompt = render_prompt(
+        template,
+        turn_number=turn_count + 1, total_turns=_TURNS_PER_SESSION, role_name=role_name,
+        claim_context=claim_context, prior_turns=_prior_turns_text(turns),
+    )
     try:
-        template = _QUESTION_PROMPT_PATH.read_text(encoding="utf-8")
-        prompt = render_prompt(
-            template,
-            turn_number=len(turns) + 1, total_turns=_TURNS_PER_SESSION, role_name=role_name,
-            claim_context=claim_context, prior_turns=_prior_turns_text(turns),
-        )
-        generated: GeneratedRecruiterAttackQuestion = ai_provider.generate_structured(
-            prompt, GeneratedRecruiterAttackQuestion
-        )
-        if (
-            not generated.question_text.strip()
-            or looks_like_prompt_leak(generated.question_text)
-            or looks_like_prompt_leak(generated.based_on)
-        ):
+        # Outside any transaction (F12-07).
+        with outside_transaction(db):
+            generated: GeneratedRecruiterAttackQuestion = ai_provider.generate_structured(
+                prompt, GeneratedRecruiterAttackQuestion
+            )
+        if not generated.question_text.strip() or contains_prompt_leak(generated):
             raise AIGenerationError("Recruiter attack question output was empty or leaked prompt scaffolding")
         question_text, based_on = generated.question_text, generated.based_on
     except AIGenerationError as exc:
         logger.warning("Recruiter attack question generation failed for session_id=%s, using fallback: %s", session_id, exc)
-        question_text, based_on = _FALLBACK_QUESTIONS[len(turns) % len(_FALLBACK_QUESTIONS)]
+        question_text, based_on = _FALLBACK_QUESTIONS[turn_count % len(_FALLBACK_QUESTIONS)]
 
     turn = RecruiterAttackTurn(
-        session_id=session_id, order_index=len(turns), question_text=question_text, based_on=based_on,
+        session_id=session_id, order_index=turn_count, question_text=question_text, based_on=based_on,
     )
     db.add(turn)
     db.commit()
@@ -386,13 +388,15 @@ def get_results(
         for t in turns
     )
 
+    template = _EVALUATION_PROMPT_PATH.read_text(encoding="utf-8")
+    prompt = render_prompt(template, role_name=role_name, claim_context=claim_context, transcript=transcript)
     try:
-        template = _EVALUATION_PROMPT_PATH.read_text(encoding="utf-8")
-        prompt = render_prompt(template, role_name=role_name, claim_context=claim_context, transcript=transcript)
-        generated: GeneratedRecruiterAttackEvaluation = ai_provider.generate_structured(
-            prompt, GeneratedRecruiterAttackEvaluation
-        )
-        if not generated.feedback.strip() or looks_like_prompt_leak(generated.feedback):
+        # Outside any transaction (F12-07). The transcript is already rendered into the prompt.
+        with outside_transaction(db):
+            generated: GeneratedRecruiterAttackEvaluation = ai_provider.generate_structured(
+                prompt, GeneratedRecruiterAttackEvaluation
+            )
+        if not generated.feedback.strip() or contains_prompt_leak(generated):
             raise AIGenerationError("Recruiter attack evaluation output was empty or leaked prompt scaffolding")
     except AIGenerationError as exc:
         logger.warning(
@@ -402,7 +406,11 @@ def get_results(
         )
         # Scores are deliberately NOT written here -- see _fallback_feedback. Only the
         # explanatory text is persisted, so the session remains genuinely ungraded.
-        session.feedback_text = _fallback_feedback(turns)
+        #
+        # Re-read after the boundary: the rows this request started from were detached when the
+        # evaluation ran outside a transaction, and _get_owned_session re-checks ownership.
+        session = _get_owned_session(db, profile_id, session_id)
+        session.feedback_text = _fallback_feedback(_get_turns(db, session_id))
         db.commit()
         return _results_read(session)
 
@@ -411,6 +419,9 @@ def get_results(
     # such bound, so this clamps before persisting or feeding Interview Memory below. Only
     # reached on the real-AI path now; the fallback returned above without persisting a score.
     context = f"recruiter attack evaluation, session_id={session_id}"
+    # Re-read and ownership re-checked on this side of the boundary, for the same reason.
+    session = _get_owned_session(db, profile_id, session_id)
+    turns = _get_turns(db, session_id)
     session.technical_defense = clamp_unit_score(generated.technical_defense, field_name="technical_defense", context=context)
     session.project_ownership = clamp_unit_score(generated.project_ownership, field_name="project_ownership", context=context)
     session.specificity = clamp_unit_score(generated.specificity, field_name="specificity", context=context)

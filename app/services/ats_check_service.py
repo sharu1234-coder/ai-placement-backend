@@ -5,6 +5,7 @@ from typing import List, Optional
 from sqlalchemy.orm import Session
 
 from app.ai.input_guard import render_prompt
+from app.ai.output_guard import leaking_field
 from app.ai.provider import AIGenerationError, AIProvider
 from app.ai.schemas.resume_ats_check import GeneratedAtsCheckContent
 from app.models.resume import Resume
@@ -18,6 +19,7 @@ from app.schemas.resume_ats_check import (
     RecommendationRead,
     SectionAnalysisRead,
 )
+from app.services.ai_boundary import outside_transaction
 from app.services.ats_scoring.config import CATEGORY_LABELS
 from app.services.ats_scoring.engine import ScoringResult, score_resume
 from app.storage.provider import StorageError, StorageProvider
@@ -94,6 +96,10 @@ def generate_ats_check(
     if resume is None or resume.profile_id != profile_id:
         return None
 
+    # A plain str, taken now because the boundary below closes the session and the report at the
+    # end of this function still needs it.
+    raw_text = resume.raw_text
+
     analysis = db.query(ResumeAnalysis).filter(ResumeAnalysis.resume_id == resume_id).first()
 
     pdf_bytes: Optional[bytes] = None
@@ -103,7 +109,7 @@ def generate_ats_check(
         logger.warning("Could not load stored PDF for resume_id=%s: %s", resume_id, exc)
 
     scoring = score_resume(
-        raw_text=resume.raw_text,
+        raw_text=raw_text,
         pdf_bytes=pdf_bytes,
         extracted_skills=analysis.extracted_skills if analysis else [],
         extracted_education=analysis.extracted_education if analysis else [],
@@ -113,15 +119,32 @@ def generate_ats_check(
     )
 
     ai_summary = scoring.deterministic_summary
-    try:
-        prompt = _build_prompt(scoring, target_role)
-        generated: GeneratedAtsCheckContent = ai_provider.generate_structured(prompt, GeneratedAtsCheckContent)
-        ai_summary = generated.summary
-        _apply_ai_overlay(scoring, generated)
-    except AIGenerationError as exc:
-        logger.warning("ATS check AI explanation failed for resume_id=%s: %s", resume_id, exc)
-        # never blocks the check from being created -- deterministic score/issues/
-        # recommendations/template summary already stand on their own.
+    # Outside any transaction (F12-07). Everything the AI needs is already in `scoring`, which is
+    # a plain object built by the deterministic engine, so the session is not wanted here at all.
+    # The failure branch only logs, so the whole try/except belongs inside the boundary.
+    with outside_transaction(db):
+        try:
+            prompt = _build_prompt(scoring, target_role)
+            generated: GeneratedAtsCheckContent = ai_provider.generate_structured(prompt, GeneratedAtsCheckContent)
+            # Before ai_summary is taken and before the overlay is applied. _apply_ai_overlay
+            # mutates scoring.issues/recommendations in place, so a leak caught after it ran would
+            # already be inside the object the ResumeAtsCheck row is built from -- and the
+            # deterministic text it overwrote would be gone.
+            leaked = leaking_field(generated)
+            if leaked is not None:
+                raise AIGenerationError(f"ATS check output leaked prompt scaffolding in field {leaked}")
+            ai_summary = generated.summary
+            _apply_ai_overlay(scoring, generated)
+        except AIGenerationError as exc:
+            logger.warning("ATS check AI explanation failed for resume_id=%s: %s", resume_id, exc)
+            # never blocks the check from being created -- deterministic score/issues/
+            # recommendations/template summary already stand on their own.
+
+    # Re-read and re-validate on this side of the boundary: the row below carries a foreign key to
+    # the resume, which the student could have deleted while the AI was running.
+    resume = db.get(Resume, resume_id)
+    if resume is None or resume.profile_id != profile_id:
+        return None
 
     check = ResumeAtsCheck(
         resume_id=resume_id,
@@ -149,7 +172,7 @@ def generate_ats_check(
     db.commit()
     db.refresh(check)
 
-    return _to_report_read(check, resume.raw_text)
+    return _to_report_read(check, raw_text)
 
 
 def _to_report_read(check: ResumeAtsCheck, raw_text: str) -> AtsCheckReportRead:

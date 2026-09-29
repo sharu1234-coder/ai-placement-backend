@@ -63,7 +63,7 @@ def test_no_role_returns_has_role_false_not_a_fabricated_zero(client, auth_heade
     assert response.status_code == 200
     body = response.json()
     assert body["has_role"] is False
-    assert body["readiness_percent"] is None
+    assert body["evidence_coverage_percent"] is None
     assert body["skills"] == []
 
 

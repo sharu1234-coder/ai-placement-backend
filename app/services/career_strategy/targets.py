@@ -6,10 +6,10 @@ target is not a new kind of thing with its own scoring -- it is the existing pip
 (deterministic, evidence-led, no fabricated numbers, no hiring probability) holds here for free
 and cannot drift, because there is only one implementation to drift from.
 
-Readiness and effort across roles come from `career_decision_service.simulate`, which already
-owns per-role readiness and already computes skill overlap. Calling it once with every target
+Evidence coverage and effort across roles come from `career_decision_service.simulate`, which
+already owns per-role coverage and computes skill overlap. Calling it once with every target
 gets all of that in a single pass rather than N, and -- more importantly -- guarantees that the
-readiness shown on the comparison screen is the same number Career Decision Lab shows for the
+coverage shown on the comparison screen is the same number Career Decision Lab shows for the
 same role. Two screens disagreeing about one role would make both untrustworthy.
 
 **Comparison runs never write history.** Looking at what your strategy *would* be for another
@@ -180,7 +180,7 @@ def comparison_set(
 
     The primary is returned separately rather than merged into the list because it is not
     interchangeable with the others: it is the one the student's snapshots, history and Career
-    Twin readiness actually belong to.
+    Twin evidence coverage actually belong to.
     """
     primary = current_target(db, profile)
     targets: List[Tuple[Role, RoleContext]] = []

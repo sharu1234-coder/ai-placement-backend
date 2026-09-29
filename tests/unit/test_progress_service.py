@@ -34,7 +34,7 @@ def _at(hour: int) -> datetime.datetime:
 
 def test_no_data_returns_empty_dashboard(db):
     dashboard = get_dashboard(db, profile_id=1)
-    assert dashboard.readiness_score is None
+    assert dashboard.performance_score is None
     assert dashboard.completed_assessments == 0
     assert dashboard.completed_interviews == 0
     assert dashboard.roadmap_tasks_done == 0
@@ -96,29 +96,29 @@ def _make_interview_evaluation(db, profile_id, overall_score, created_at, interv
     db.commit()
 
 
-def test_readiness_score_averages_latest_assessment_and_interview(db):
+def test_performance_score_averages_latest_assessment_and_interview(db):
     _make_assessment_result(db, profile_id=1, overall_score=0.4, created_at=_at(9))
     _make_interview_evaluation(db, profile_id=1, overall_score=0.8, created_at=_at(10))
 
     dashboard = get_dashboard(db, profile_id=1)
-    assert dashboard.readiness_score == pytest.approx(0.6)
+    assert dashboard.performance_score == pytest.approx(0.6)
     assert dashboard.completed_assessments == 1
     assert dashboard.completed_interviews == 1
 
 
-def test_readiness_score_uses_only_available_signal(db):
+def test_performance_score_uses_only_available_signal(db):
     _make_assessment_result(db, profile_id=1, overall_score=0.5, created_at=_at(9))
 
     dashboard = get_dashboard(db, profile_id=1)
-    assert dashboard.readiness_score == pytest.approx(0.5)
+    assert dashboard.performance_score == pytest.approx(0.5)
 
 
-def test_readiness_score_uses_most_recent_of_each_kind(db):
+def test_performance_score_uses_most_recent_of_each_kind(db):
     _make_assessment_result(db, profile_id=1, overall_score=0.2, created_at=_at(8))
     _make_assessment_result(db, profile_id=1, overall_score=0.9, created_at=_at(11))
 
     dashboard = get_dashboard(db, profile_id=1)
-    assert dashboard.readiness_score == pytest.approx(0.9)
+    assert dashboard.performance_score == pytest.approx(0.9)
 
 
 def test_trend_sorted_chronologically_across_both_kinds(db):

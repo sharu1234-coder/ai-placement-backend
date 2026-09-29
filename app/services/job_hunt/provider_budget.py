@@ -43,7 +43,7 @@ def _today() -> datetime.date:
     """The provider's own boundary. Jobvetta documents its quota per UTC day, and a local-time
     boundary would hand out a second allowance at the wrong hour and run the key dry early on
     whichever day the two disagreed."""
-    return datetime.datetime.utcnow().date()
+    return datetime.datetime.now(datetime.timezone.utc).date()
 
 
 def reserve_call(
@@ -125,7 +125,7 @@ def _take_slot(db: Session, provider_name: str, day: datetime.date, daily_budget
         )
         .values(
             call_count=ProviderCallBudget.call_count + 1,
-            updated_at=datetime.datetime.utcnow(),
+            updated_at=datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None),
         )
     )
     if result.rowcount:

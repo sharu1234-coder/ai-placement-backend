@@ -87,21 +87,6 @@ def fingerprint(decision: StrategyDecision) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-class SnapshotSummary(BaseModel):
-    """One history row, without the stored payload."""
-
-    model_config = ConfigDict(frozen=True)
-
-    id: int
-    sequence: int
-    state: str
-    strategy_version: int
-    primary_bottleneck_id: Optional[str] = None
-    primary_category: Optional[str] = None
-    primary_subject: Optional[str] = None
-    created_at: datetime.datetime
-
-
 class ChangedItem(BaseModel):
     model_config = ConfigDict(frozen=True)
 

@@ -95,10 +95,18 @@ def test_the_migration_creates_the_table_with_the_nullability_the_design_needs(m
 
 def test_the_migration_produces_the_nullability_the_model_declares(migration_target):
     """Guards against the migration and the model drifting apart, since everywhere else in the
-    suite the schema comes from the model and the two are never compared."""
+    suite the schema comes from the model and the two are never compared.
+
+    Upgrades to "head" rather than to _THIS_REVISION, unlike its two neighbours above. Those
+    two assert what 7c41a0d9e2b5 itself did and must stay pinned to it; this one compares the
+    live model against the schema, and the model always describes the LATEST schema. Pinning it
+    to a historical revision made it fail the moment a later migration added a column
+    (Phase 2E's saved_job_id) -- correctly, but for a reason that is about the pin rather than
+    about any drift.
+    """
     from app.models.career_goal import CareerGoal
 
-    command.upgrade(_alembic_config(), _THIS_REVISION)
+    command.upgrade(_alembic_config(), "head")
 
     migrated = _columns(migration_target)
     for column in CareerGoal.__table__.columns:

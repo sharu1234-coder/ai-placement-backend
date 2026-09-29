@@ -4,7 +4,7 @@ The distinction these tests hold: a source we never looked at is not a source th
 empty. A student who has never connected GitHub has no external evidence rows -- exactly like a
 student who connected it and writes no public code -- and only the second of those two is a fact
 about the student. evidence_engine.unavailable_sources is what lets a caller tell them apart, so
-a readiness number computed without GitHub can say which part it could not see rather than
+an evidence-coverage number computed without GitHub can say which part it could not see rather
 letting the absence read as a finding.
 
 The needs-reauth case is the one worth stating out loud: that connection is still live and its

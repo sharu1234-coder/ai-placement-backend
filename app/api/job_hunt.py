@@ -43,6 +43,7 @@ from app.schemas.job_hunt import (
     JobSearchProfileUpdate,
     JobSearchRequest,
     JobSearchResponse,
+    ManualJobCreate,
     ReadinessDimensionRead,
     ReadinessGapRead,
     RoleSuggestionsRead,
@@ -526,6 +527,48 @@ def _to_match_read(
 
 
 # -- Saved jobs / application tracker -------------------------------------------------------
+
+
+@router.post("/listings", response_model=SavedJobRead, status_code=status.HTTP_201_CREATED)
+def create_manual_listing(
+    payload: ManualJobCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> SavedJobRead:
+    """Add a job the student found outside this app, and start tracking it.
+
+    The one creation path for a listing that did not come from a job provider. Everything
+    downstream -- the tracker, the Career Goal link, the stage pipeline, the outcome, Home --
+    reads a SavedJob and cannot tell the difference, which is the whole point: where a student
+    found a job should not decide whether the product can help them pursue it.
+
+    Deterministic end to end. No provider is called, so this costs no quota and works with
+    JOB_PROVIDER unset entirely; no AI is called, so a pasted job description is stored, not
+    interpreted. The URL is validated and stored, never fetched.
+
+    Returns the SavedJobRead rather than a bare listing, because a listing nobody is tracking
+    is not something a student can do anything with -- and because it gives the client the
+    tracker row it needs next in the same round trip.
+    """
+    profile = get_or_create_profile(db, current_user)
+    try:
+        saved = service.add_manual_job(
+            db,
+            profile.id,
+            title=payload.title,
+            company=payload.company,
+            location=payload.location,
+            url=payload.url,
+            description=payload.description,
+            status=payload.status,
+        )
+    except service.InvalidJobUrlError as exc:
+        # 422 with the message, unlike the provider errors above: this one is about what the
+        # student typed, so it is the one class of failure they can actually act on.
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+    except service.InvalidStatusError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+    return _to_saved_read(db, profile.id, saved)
 
 
 @router.post("/saved", response_model=SavedJobRead, status_code=status.HTTP_201_CREATED)

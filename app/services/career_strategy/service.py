@@ -1,7 +1,7 @@
 """The unified Career Strategy service -- the one entry point the API calls.
 
 This module is an orchestrator and nothing else. Every number in the response was produced by
-the service that owns it: readiness by career_twin_service, the recommendation by
+the service that owns it: evidence coverage by career_twin_service, the recommendation by
 next_best_action_service, evidence by evidence_engine, match components by job_hunt/matching,
 interview status by Interview Memory. What happens here is sequencing, composition, persistence
 and the premium projection.
@@ -21,9 +21,9 @@ of rendering a confusing empty state.
 "changes" means and why it deliberately excludes wording.
 
 A strategy read used to compute evidence twice -- once for the signal bundle, once inside
-career_twin_service for readiness. That cost is now gone without moving readiness here: the
+career_twin_service for evidence coverage. That cost is gone without moving that work here: the
 bundle's evidence views are handed to career_twin_service as a cache, and it still computes
-readiness itself, still owning that number alone. Anything it needs that the bundle did not
+coverage itself, still owning that number alone. Anything it needs that the bundle did not
 carry it still fetches, so the optimisation can only make the read cheaper, never different.
 
 No AI. No network. Every decision is deterministic given the rows and the clock.
@@ -136,10 +136,10 @@ def compute(
 
     # Career Twin answers "how ready am I for *my* target". For a hypothetical role it would be
     # answering a different question than the one asked, so the comparison path takes its
-    # readiness from career_decision_service instead (see targets.py) and leaves this empty.
+    # evidence coverage from career_decision_service instead (see targets.py), leaving this empty.
     # The bundle already fetched evidence for a superset of this role's skills, so hand those
     # views over rather than making career_twin_service fetch them again. It still computes
-    # readiness -- this is a cache, not a second calculation -- and anything it needs that the
+    # coverage -- this is a cache, not a second calculation -- and anything it needs that the
     # bundle did not carry, it still fetches for itself.
     twin = career_twin_service.get_current(
         db, profile, evidence=bundle.evidence_by_skill
@@ -292,9 +292,9 @@ def project(view: StrategyView, *, is_premium: bool) -> CareerStrategyRead:
         display_role_name=None if role is None else role.display_role_name,
         role_source="none" if role is None else role.role_source,
         role_is_estimate=False if role is None else role.is_estimate,
-        readiness_percent=view.twin.readiness_percent,
-        readiness_is_estimate=view.twin.is_estimate,
-        readiness_reasons=list(view.twin.reasons),
+        evidence_coverage_percent=view.twin.evidence_coverage_percent,
+        evidence_coverage_is_estimate=view.twin.is_estimate,
+        evidence_coverage_reasons=list(view.twin.reasons),
         signal_count=len(view.bundle.signals),
         bottleneck=(
             None
@@ -546,15 +546,15 @@ def _tradeoffs(entries: List[TargetStrategyRead], shared_skills: List[str]) -> L
         return []
 
     lines: List[str] = []
-    ranked = [entry for entry in entries if entry.readiness_percent is not None]
-    ranked.sort(key=lambda entry: -(entry.readiness_percent or 0))
+    ranked = [entry for entry in entries if entry.evidence_coverage_percent is not None]
+    ranked.sort(key=lambda entry: -(entry.evidence_coverage_percent or 0))
 
     if len(ranked) >= 2:
         best, second = ranked[0], ranked[1]
-        if best.readiness_percent != second.readiness_percent:
+        if best.evidence_coverage_percent != second.evidence_coverage_percent:
             lines.append(
-                f"You are closer to {best.display_role_name} ({best.readiness_percent}%) than to "
-                f"{second.display_role_name} ({second.readiness_percent}%) on the evidence you have today."
+                f"You are closer to {best.display_role_name} ({best.evidence_coverage_percent}%) than to "
+                f"{second.display_role_name} ({second.evidence_coverage_percent}%) on the evidence you have today."
             )
         else:
             lines.append(
@@ -591,7 +591,7 @@ def _primary_role_id(primary: Optional[RoleContext]) -> Optional[int]:
     """The catalogue role id behind the student's real target, when there is one.
 
     Career Paths use their own family keys and have no Role row, so this is None for them --
-    which means career_decision_service cannot score that target and its readiness column stays
+    which means career_decision_service cannot score that target and its coverage column stays
     empty rather than being filled with a number from somewhere else.
     """
     if primary is None or not primary.role_family_key.startswith("role:"):
@@ -611,7 +611,7 @@ def compare_targets(
 ) -> TargetComparisonRead:
     """Run the one strategy engine against each saved target and put the results side by side.
 
-    Readiness, classification and effort come from career_decision_service in a single call --
+    Evidence coverage, classification and effort come from career_decision_service in one call --
     the same numbers Career Decision Lab shows for the same role, not a second opinion. The
     state, bottleneck and top action for each come from this package's own engine with the role
     context swapped, so a comparison column is produced by exactly the code that produces the
@@ -638,7 +638,7 @@ def compare_targets(
     if not contexts:
         return TargetComparisonRead(is_premium=True, max_targets=targets.MAX_COMPARISON_TARGETS)
 
-    # One call for every role: per-role readiness and the shared-skill analysis in a single pass
+    # One call for every role: per-role evidence coverage and the shared-skill analysis in one pass
     # through the existing engine, rather than one simulation per target.
     scored: Dict[int, CareerDecisionRoleRead] = {}
     shared_skills: List[str] = []
@@ -674,7 +674,11 @@ def compare_targets(
                 role_id=role_id,
                 display_role_name=context.display_role_name,
                 is_current_target=is_current,
-                readiness_percent=None if row is None else row.readiness_percent,
+                # Career Decision's evidence-coverage number. Phase 2G gave this field the
+                # name its value has always had; it was already Optional and already rendered
+                # honestly when null, so an unmeasurable role flows through as null end to end
+                # rather than arriving as a confident 0.
+                evidence_coverage_percent=None if row is None else row.evidence_coverage_percent,
                 classification=None if row is None else row.classification,
                 estimated_hours_to_strengthen=(
                     None if row is None else row.estimated_hours_to_strengthen

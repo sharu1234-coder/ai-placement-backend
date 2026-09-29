@@ -4,6 +4,7 @@ from pydantic import BaseModel, ValidationError
 
 from app.ai.ollama_provider import OllamaProvider, _redact_validation_error
 from app.ai.provider import AIGenerationError
+from app.ai.retry import MAX_ATTEMPTS_PER_STAGE
 
 
 class Animal(BaseModel):
@@ -78,14 +79,20 @@ def test_generate_structured_raises_after_two_failures(monkeypatch):
 
 def test_network_error_raises_ai_generation_error(monkeypatch):
     """A sustained network outage (every attempt transient) still exhausts its bounded
-    retries and eventually raises AIGenerationError -- 1 initial attempt + 2 retries = 3
-    total calls, not an infinite retry loop."""
+    retries and eventually raises AIGenerationError -- 1 initial attempt + 1 retry = 2
+    total calls, not an infinite retry loop.
+
+    Was 3 (1 + 2 retries) until F12-06. The count changed deliberately: the third attempt
+    composed with the schema correction and, on the Anthropic path, with the SDK's own retry
+    loop, into 6 and 16 provider calls for one logical operation. See
+    tests/unit/test_ai_retry_budget.py for the whole policy; app/ai/retry.py:MAX_ATTEMPTS_PER_STAGE
+    is the single knob this number comes from now."""
     post, calls = _counting_post([httpx.ConnectError("connection refused")] * 3)
     monkeypatch.setattr(httpx, "post", post)
     provider = OllamaProvider(base_url="http://fake", model="fake-model")
     with pytest.raises(AIGenerationError):
         provider.generate_text("hello")
-    assert calls["count"] == 3
+    assert calls["count"] == MAX_ATTEMPTS_PER_STAGE == 2
 
 
 def test_transient_network_error_is_retried_then_succeeds(monkeypatch):

@@ -5,12 +5,14 @@ from typing import Optional
 from sqlalchemy.orm import Session
 
 from app.ai.input_guard import render_prompt
-from app.ai.provider import AIProvider
+from app.ai.output_guard import leaking_field
+from app.ai.provider import AIGenerationError, AIProvider
 from app.ai.schemas.roadmap import GeneratedRoadmap
 from app.models.job_description import JobDescription
 from app.models.roadmap import Roadmap
 from app.models.roadmap_task import RoadmapTask
 from app.schemas.roadmap import RoadmapRead, RoadmapTaskRead
+from app.services.ai_boundary import outside_transaction
 from app.services.weakness_service import compute_weaknesses
 
 _ROADMAP_PROMPT_PATH = Path(__file__).resolve().parent.parent / "ai" / "prompts" / "roadmap_generator_v2.txt"
@@ -85,7 +87,28 @@ def generate_roadmap(
         )
 
     prompt = _build_prompt(weaknesses, duration_days)
-    generated: GeneratedRoadmap = ai_provider.generate_structured(prompt, GeneratedRoadmap)
+    # Outside any transaction (F12-07). The prompt is already a plain string and the weaknesses
+    # were only needed to build it, so nothing here wants the session.
+    with outside_transaction(db):
+        generated: GeneratedRoadmap = ai_provider.generate_structured(prompt, GeneratedRoadmap)
+        # Before the supersede below, not after. Every task's title, description and skill_tag is
+        # generated text that becomes a RoadmapTask row, and superseding first would mean a leaked
+        # generation retired the student's working roadmap on its way to being rejected.
+        #
+        # Raised rather than substituted: a roadmap is a plan for weeks of the student's time, and
+        # there is no honest template to put in its place. app/api/roadmap.py already turns this
+        # into the provider-agnostic 422 and the student can regenerate.
+        leaked = leaking_field(generated)
+        if leaked is not None:
+            raise AIGenerationError(f"Roadmap output leaked prompt scaffolding in field {leaked}")
+
+    # Re-validated on this side of the boundary, not trusted from before the AI call: the roadmap
+    # row below carries a foreign key to the JD, which the student could have deleted while the
+    # model was working.
+    if jd_id is not None:
+        jd = db.get(JobDescription, jd_id)
+        if jd is None or jd.profile_id != profile_id:
+            raise InvalidRoadmapRequestError("Job description not found")
 
     # Only one active roadmap per profile+jd scope at a time -- generating a new one
     # (including via reassess, which calls this) supersedes whatever was active before.
@@ -96,12 +119,14 @@ def generate_roadmap(
     )
     for old in previously_active:
         old.status = "superseded"
-    db.commit()
 
     roadmap = Roadmap(profile_id=profile_id, jd_id=jd_id, duration_days=duration_days, status="active")
     db.add(roadmap)
-    db.commit()
-    db.refresh(roadmap)
+    # flush, not commit: the tasks below need the roadmap's id, but retiring the old roadmap,
+    # creating the new one and writing its tasks are one unit of work. Three separate commits
+    # (which is what this was) could leave an active roadmap with no tasks in it, or supersede the
+    # student's working roadmap with nothing to replace it.
+    db.flush()
 
     today = date.today()
     tasks = [

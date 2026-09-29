@@ -111,3 +111,70 @@ def test_concurrent_submit_answer_loses_the_atomic_update_race_without_corruptin
         assert attempt.score == 1.0
     finally:
         session_c.close()
+
+
+def _seed_short_answer(db):
+    """Same shape as _seed, but a short-answer question -- the only kind that reaches the AI
+    grader, and therefore the only kind with a real gap between the pending check and the write."""
+    blueprint = AssessmentBlueprint(profile_id=PROFILE_ID, source="role", sections=[])
+    db.add(blueprint)
+    db.flush()
+    assessment = Assessment(profile_id=PROFILE_ID, blueprint_id=blueprint.id, status="in_progress")
+    db.add(assessment)
+    db.flush()
+    question = Question(
+        skill_tag="SQL", type="short_answer", difficulty="medium", prompt="What is a primary key?",
+        options=None, expected_answer_or_rubric="A column that uniquely identifies a row.",
+        explanation="Primary keys identify rows.",
+    )
+    db.add(question)
+    db.flush()
+    attempt = QuestionAttempt(assessment_id=assessment.id, question_id=question.id)
+    db.add(attempt)
+    db.commit()
+    return assessment.id, question.id, attempt.id
+
+
+def test_an_answer_persisted_while_the_ai_was_grading_is_not_overwritten(db):
+    """The race the F12-07 boundary widened, and the one the conditional UPDATE exists for.
+
+    Grading now runs with no transaction open, so the gap between "this question is still
+    pending" and "write the grade" is a whole model call wide. This makes something else answer
+    the question *inside* that gap: the pending check has already passed, so nothing but the
+    conditional UPDATE can reject the write. The earlier concurrency test cannot reach that -- it
+    re-reads before the check and is turned away there instead.
+    """
+    assessment_id, question_id, attempt_id = _seed_short_answer(db)
+    engine = db.get_bind()
+
+    class AnswersFromAnotherSessionWhileGrading(AIProvider):
+        """Stands in for a concurrent request that lands while the model is working."""
+
+        def generate_structured(self, prompt, schema):
+            other = sessionmaker(bind=engine)()
+            try:
+                attempt = other.get(QuestionAttempt, attempt_id)
+                attempt.student_answer = "the winner's answer"
+                attempt.is_correct = True
+                attempt.score = 1.0
+                other.commit()
+            finally:
+                other.close()
+            return schema(is_correct=True, score=0.2, feedback="graded late")
+
+        def generate_text(self, prompt):
+            raise AssertionError("not used")
+
+    with pytest.raises(svc.QuestionNotPendingError):
+        svc.submit_answer(
+            db, PROFILE_ID, assessment_id, question_id,
+            "the loser's answer", None, AnswersFromAnotherSessionWhileGrading(),
+        )
+
+    verify = sessionmaker(bind=engine)()
+    try:
+        attempt = verify.get(QuestionAttempt, attempt_id)
+        assert attempt.student_answer == "the winner's answer"
+        assert attempt.score == 1.0
+    finally:
+        verify.close()

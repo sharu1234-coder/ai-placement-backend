@@ -9,7 +9,7 @@ database.
 import datetime
 from typing import List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 WorkMode = Literal["remote", "hybrid", "onsite"]
 EmploymentType = Literal["full_time", "part_time", "contract", "internship", "temporary"]
@@ -83,7 +83,10 @@ class RoleSuggestionsRead(BaseModel):
 class JobListingRead(BaseModel):
     id: int
     provider: str
-    url: str
+    # None only on a manually entered job with no link -- a campus placement, a referral, a
+    # role someone described over email. The client hides the apply button rather than opening
+    # nothing; it must never substitute a search URL or the company name.
+    url: Optional[str] = None
     title: str
     company: Optional[str] = None
     location: Optional[str] = None
@@ -204,6 +207,55 @@ class JobSearchResponse(BaseModel):
 
 
 # -- Saved jobs / application tracker -------------------------------------------------------
+
+
+class ManualJobCreate(BaseModel):
+    """A job the student found somewhere this app cannot search.
+
+    Every field here already exists on JobListing. Nothing provider-internal is accepted --
+    not `provider`, not `provider_job_id`, not ranking or search metadata -- because those
+    describe how a listing was ingested, and this one was typed. `source` is absent for the
+    same reason ownership is: the server knows this job was entered by hand, so letting the
+    client assert it would be a claim, not a fact.
+
+    Lengths match the stored columns exactly (title 500, company and location 300) rather than
+    the Career Goal form's 200, because this writes to job_listings and a value that fits the
+    schema but not the column is a 500 on PostgreSQL and a silent truncation on SQLite.
+    """
+
+    title: str = Field(min_length=1, max_length=500)
+    company: Optional[str] = Field(default=None, max_length=300)
+    location: Optional[str] = Field(default=None, max_length=300)
+    # Stored as given if it is a plain http(s) link to a public host, and refused with a
+    # message otherwise. Never fetched: a URL here is data, not an instruction to go and read
+    # something (see job_hunt/normalization.py::safe_external_url for why that boundary is
+    # drawn at storage time).
+    url: Optional[str] = Field(default=None, max_length=1000)
+    # The description column is TEXT and has no stored ceiling, so this bound is the only one.
+    # It matches MAX_JOB_DESCRIPTION_LENGTH so a job description is refused at the same size
+    # whichever door it comes through -- but for a different reason than that constant's:
+    # nothing here is ever sent to an AI provider, so the limit is about unbounded storage of
+    # untrusted input rather than about prompt size.
+    description: Optional[str] = Field(default=None, max_length=20_000)
+    # A student may find this product after already applying, or already interviewing. The
+    # tracker supports every stage, so entry does too -- forcing "saved" first would make them
+    # record something that is not true and then correct it.
+    status: SavedJobStatus = "saved"
+
+    @field_validator("title", "company", "location", "url", "description", mode="before")
+    @classmethod
+    def _strip(cls, value):
+        """Trim, and treat whitespace-only as absent.
+
+        A form field the student tabbed through holds " ", not None, and storing that produces
+        a company named one space -- rendered as a blank line in the tracker rather than
+        omitted. `title` has min_length=1 so this turns a whitespace-only title into the 422 it
+        should be rather than a listing with no name.
+        """
+        if isinstance(value, str):
+            stripped = value.strip()
+            return stripped or None
+        return value
 
 
 class SaveJobRequest(BaseModel):

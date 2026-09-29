@@ -59,7 +59,14 @@ def _give_assessment_evidence(db, profile, skill_scores: dict[str, float]) -> No
     db.commit()
 
 
-def test_role_with_no_weights_is_stretch_with_a_clear_reason(db):
+def test_role_with_no_weights_is_unmeasurable_rather_than_a_stretch(db):
+    """A role nobody has defined skills for cannot be measured OR classified.
+
+    This test used to assert the opposite -- 0% and "stretch" -- which was two fabrications in
+    one row: a percentage never computed, and a verdict that the student is far from a role the
+    app knows nothing about. Missing configuration is not evidence about a candidate, and
+    Phase 2F makes every unmeasurable field null instead.
+    """
     profile = _profile(db)
     role_a = _role(db, "Data Analyst", {"Excel": 1.0})
     role_b = Role(name="Undefined Role", category="Other")
@@ -69,21 +76,33 @@ def test_role_with_no_weights_is_stretch_with_a_clear_reason(db):
 
     result = svc.simulate(db, profile.id, [role_a.id, role_b.id], None)
     empty = next(r for r in result.roles if r.role_id == role_b.id)
-    assert empty.classification == "stretch"
-    assert empty.readiness_percent == 0
+    assert empty.evidence_coverage_percent is None
+    assert empty.classification is None
+    assert empty.estimated_hours_to_strengthen is None
+    assert empty.estimated_weeks is None
     assert "no required skills" in empty.reasons[0].lower()
+    # And nothing anywhere in its reasons asserts a classification it does not have.
+    assert not any("stretch" in reason.lower() for reason in empty.reasons)
 
 
-def test_insufficient_profile_data_yields_stretch_for_every_role(db):
-    """No evidence at all anywhere -- every candidate role should honestly read as a stretch,
-    never a fabricated mid-range number."""
+def test_no_evidence_against_defined_roles_is_a_MEASURED_zero(db):
+    """The other side of the Phase 2F distinction, and the reason this test keeps asserting 0.
+
+    Both roles here DO define required skills, so the calculation is fully performable -- it
+    simply comes out at zero because the student has no evidence yet. That is a measurement,
+    not an absence, and 0% with a "stretch" classification is the honest answer.
+
+    Contrast with the test above, where the role defines no skills at all and every field is
+    null. Measured-zero and unmeasurable must never collapse into each other.
+    """
     profile = _profile(db)
     role_a = _role(db, "SDE", {"DSA": 1.0, "OOP": 0.7})
     role_b = _role(db, "Data Analyst", {"SQL": 1.0, "Excel": 0.6})
 
     result = svc.simulate(db, profile.id, [role_a.id, role_b.id], None)
     assert all(r.classification == "stretch" for r in result.roles)
-    assert all(r.readiness_percent == 0 for r in result.roles)
+    assert all(r.evidence_coverage_percent == 0 for r in result.roles)
+    assert all(r.evidence_coverage_percent is not None for r in result.roles)
 
 
 def test_strong_profile_is_classified_best_fit(db):
@@ -91,7 +110,7 @@ def test_strong_profile_is_classified_best_fit(db):
     role = _role(db, "SDE", {"DSA": 1.0})
     other_role = _role(db, "Data Analyst", {"SQL": 1.0})
     # Two independent sources for DSA (assessment + resume) reach evidence_engine's "strong"
-    # state (confidence 0.7) -- at weight 1.0 that's exactly a 70% readiness, crossing the
+    # state (confidence 0.7) -- at weight 1.0 that's exactly 70% evidence coverage, crossing the
     # best_fit threshold on real, multi-source evidence rather than one lucky score.
     _give_assessment_evidence(db, profile, {"DSA": 0.9})
     resume = Resume(profile_id=profile.id, file_path="x.pdf", raw_text="DSA", parse_status="completed")
@@ -109,7 +128,7 @@ def test_strong_profile_is_classified_best_fit(db):
 
     result = svc.simulate(db, profile.id, [role.id, other_role.id], None)
     sde_result = next(r for r in result.roles if r.role_id == role.id)
-    assert sde_result.readiness_percent >= 70
+    assert sde_result.evidence_coverage_percent >= 70
     assert sde_result.classification == "best_fit"
 
 
@@ -121,7 +140,7 @@ def test_results_are_ranked_most_ready_first(db):
 
     result = svc.simulate(db, profile.id, [weak_role.id, strong_role.id], None)
     assert result.roles[0].role_id == strong_role.id
-    assert result.roles[0].readiness_percent >= result.roles[1].readiness_percent
+    assert result.roles[0].evidence_coverage_percent >= result.roles[1].evidence_coverage_percent
 
 
 def test_shared_skills_are_detected_across_candidate_roles(db):

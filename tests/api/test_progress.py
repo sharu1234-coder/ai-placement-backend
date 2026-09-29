@@ -61,7 +61,7 @@ def test_dashboard_empty_for_new_user(client, auth_headers):
     resp = client.get("/progress/dashboard", headers=auth_headers)
     assert resp.status_code == 200
     body = resp.json()
-    assert body["readiness_score"] is None
+    assert body["performance_score"] is None
     assert body["completed_assessments"] == 0
     assert body["completed_interviews"] == 0
     assert body["roadmap_tasks_total"] == 0
@@ -92,7 +92,7 @@ def test_dashboard_reflects_completed_assessment(client, auth_headers, sde_role_
     resp = client.get("/progress/dashboard", headers=auth_headers)
     assert resp.status_code == 200
     body = resp.json()
-    assert body["readiness_score"] == 0.0
+    assert body["performance_score"] == 0.0
     assert body["completed_assessments"] == 1
     assert body["completed_interviews"] == 0
     assert len(body["trend"]) == 1
@@ -130,4 +130,4 @@ def test_dashboard_isolated_per_user(client, auth_headers, sde_role_id, use_fake
     assert resp.status_code == 200
     body = resp.json()
     assert body["completed_assessments"] == 0
-    assert body["readiness_score"] is None
+    assert body["performance_score"] is None

@@ -26,6 +26,17 @@ from app.models.subscription import Subscription
 
 logger = logging.getLogger(__name__)
 
+def _utcnow() -> datetime.datetime:
+    """Naive UTC, matching every DateTime column on Subscription.
+
+    Replaces datetime.utcnow(), which is deprecated and scheduled for removal, with the
+    value-identical explicit form. Deliberately still naive: every timestamp this module
+    compares against was written naive, and returning an aware value here would turn each
+    of those comparisons into a TypeError at runtime.
+    """
+    return datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+
+
 RAZORPAY_ORDERS_URL = "https://api.razorpay.com/v1/orders"
 
 _MAX_LOGGED_ERROR_BODY = 500
@@ -96,7 +107,7 @@ def create_order(db: Session, profile_id: int, plan: str) -> Subscription:
 
     # Receipt must be <=40 chars and unique per Razorpay's own constraint; profile_id + a
     # microsecond timestamp is enough entropy without needing a DB round-trip first.
-    receipt = f"sub_{profile_id}_{int(datetime.datetime.utcnow().timestamp() * 1000)}"[:40]
+    receipt = f"sub_{profile_id}_{int(_utcnow().timestamp() * 1000)}"[:40]
     try:
         response = httpx.post(
             RAZORPAY_ORDERS_URL,
@@ -207,7 +218,7 @@ def _activate_paid(db: Session, subscription: Subscription, razorpay_payment_id:
     row to "paid" proceeds to treat this as a fresh activation; the loser re-fetches and
     returns the winner's already-committed row, exactly like the sequential idempotent-return
     path above."""
-    now = datetime.datetime.utcnow()
+    now = _utcnow()
     plan_def = PLAN_CATALOG[subscription.plan]
     current_active = _get_active_subscription(db, subscription.profile_id, now)
     base = current_active.expires_at if current_active else now
@@ -292,11 +303,11 @@ def is_premium(db: Session, profile_id: int) -> bool:
     """Single source of truth for server-side premium enforcement (app.api.deps.require_premium)
     -- same "an active, unexpired, paid subscription row" definition get_status already uses,
     so a route's enforcement can never drift from what the client's own status check reports."""
-    return _get_active_subscription(db, profile_id, datetime.datetime.utcnow()) is not None
+    return _get_active_subscription(db, profile_id, _utcnow()) is not None
 
 
 def get_status(db: Session, profile_id: int) -> dict:
-    now = datetime.datetime.utcnow()
+    now = _utcnow()
     active = _get_active_subscription(db, profile_id, now)
     if active is not None:
         return {

@@ -1,6 +1,6 @@
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.ai.provider import AIProvider, get_ai_provider
@@ -58,20 +58,44 @@ def get_role_categories() -> List[str]:
 def generate(
     request: Request,
     payload: SelectCareerRoleRequest,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
     ai_provider: AIProvider = Depends(get_ai_provider),
 ) -> CareerPathRead:
     """Selects (or re-selects) a target role and builds/rebuilds its Career Path content,
     making it the profile's current path. Works even with zero resume/profile data -- a
-    role alone is always enough to produce a real, non-fabricated plan."""
+    role alone is always enough to produce a real, non-fabricated plan.
+
+    Returns as soon as the structural path is committed. Every skill already carries the
+    deterministic "why it matters" sentence, and the AI-written one replaces it after this
+    response (F12-05) -- so a student is never held behind explanatory text that nothing
+    computes from. A failure there leaves the deterministic sentence in place and never
+    turns this successful generation into a failure.
+    """
     profile = get_or_create_profile(db, current_user)
     try:
-        return career_path_service.select_role(
+        result = career_path_service.select_role(
             db, profile.id, ai_provider, role_id=payload.role_id, custom_role=payload.custom_role
         )
     except career_path_service.RoleNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    explanation_session = career_path_service.explanation_session_factory(db)
+    # Release this request's own transaction before scheduling the deferred pass (F12-07).
+    # select_role commits, but building the response read it again, which reopens a transaction
+    # that then lives until the session is closed at the end of the request -- and background
+    # tasks run inside that window. Measured at the seam, the deferred pass ran with the parent
+    # request's transaction still open, so a pooled connection stayed pinned for a whole model
+    # call even though the student already had their answer. `result` is a fully materialized
+    # Pydantic model, so nothing below needs the session.
+    db.close()
+    background_tasks.add_task(
+        career_path_service.apply_skill_explanations,
+        result.id,
+        ai_provider,
+        explanation_session,
+    )
+    return result
 
 
 @router.get("/all", response_model=List[CareerPathSummaryRead])

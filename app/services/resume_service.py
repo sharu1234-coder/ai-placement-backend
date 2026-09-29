@@ -7,6 +7,7 @@ import fitz
 from sqlalchemy.orm import Session
 
 from app.ai.input_guard import render_prompt
+from app.ai.output_guard import leaking_field
 from app.ai.provider import AIGenerationError, AIProvider
 from app.ai.schemas.resume import ParsedResume
 from app.models.job_search_profile import JobSearchProfile
@@ -15,6 +16,7 @@ from app.models.resume import Resume
 from app.models.resume_analysis import ResumeAnalysis
 from app.models.resume_ats_check import ResumeAtsCheck
 from app.schemas.resume import ResumeAnalysisRead, ResumeSummaryRead, ResumeUploadResponse
+from app.services.ai_boundary import outside_transaction
 from app.storage.provider import StorageProvider
 
 logger = logging.getLogger(__name__)
@@ -88,16 +90,49 @@ def process_resume_upload(
     )
     db.add(resume)
     db.commit()
-    db.refresh(resume)
+    # A plain int, taken before the boundary below closes the session: the Resume object itself
+    # does not survive it, and the id is the only thing needed to find the row again.
+    resume_id = resume.id
 
-    try:
-        parsed: ParsedResume = ai_provider.generate_structured(_build_prompt(raw_text), ParsedResume)
-    except AIGenerationError as exc:
-        logger.warning("Resume parsing failed for resume_id=%s: %s", resume.id, exc)
+    parse_failure: Optional[AIGenerationError] = None
+    parsed: Optional[ParsedResume] = None
+    # Outside any transaction (F12-07). The "processing" row above is already committed, so there
+    # is nothing pending to lose, and the parse -- 98-183s against a real model -- no longer holds
+    # a pooled connection or a PostgreSQL snapshot while it runs.
+    with outside_transaction(db):
+        try:
+            parsed = ai_provider.generate_structured(_build_prompt(raw_text), ParsedResume)
+            # Checked before the ResumeAnalysis row exists, because a leak here does not stop at the
+        # student's screen: extracted_skills is what skill_matching.latest_resume_skills reads,
+        # which is what the Evidence Engine, Career Twin, Placement Path and every JD match are
+        # built on. A leaked "skill" persisted here would be read back for months as something
+        # the student claimed about themselves.
+        #
+            # Raised as a generation failure so it takes the route this service already has for
+            # one: parse_status becomes "failed", no analysis row is written, and the student can
+            # re-upload. The field path is safe to carry in the message -- it names which field
+            # failed, never what it said.
+            leaked = leaking_field(parsed)
+            if leaked is not None:
+                raise AIGenerationError(f"Resume parse output leaked prompt scaffolding in field {leaked}")
+        except AIGenerationError as exc:
+            # Recorded, not handled here: writing parse_status="failed" is a database write and
+            # belongs on the other side of the boundary.
+            parse_failure = exc
+
+    # Back in a transaction, on freshly read state rather than the object from before the AI call.
+    resume = db.get(Resume, resume_id)
+    if resume is None:
+        # The profile was deleted while the AI ran. Nothing to record against.
+        raise AIGenerationError("The resume was removed while it was being parsed.")
+
+    if parse_failure is not None:
+        logger.warning("Resume parsing failed for resume_id=%s: %s", resume_id, parse_failure)
         resume.parse_status = "failed"
         db.commit()
-        return ResumeUploadResponse(id=resume.id, parse_status=resume.parse_status, analysis=None)
+        return ResumeUploadResponse(id=resume_id, parse_status="failed", analysis=None)
 
+    assert parsed is not None  # no failure recorded, so the parse produced output
     analysis = ResumeAnalysis(
         resume_id=resume.id,
         extracted_skills=parsed.skills,

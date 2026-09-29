@@ -8,6 +8,7 @@ from pydantic import BaseModel, ValidationError
 
 from app.ai.anthropic_provider import AnthropicProvider, _redact_validation_error
 from app.ai.provider import AIGenerationError
+from app.ai.retry import MAX_ATTEMPTS_PER_STAGE
 from app.core.config import settings
 
 
@@ -164,8 +165,12 @@ def test_generate_structured_exhausts_transient_retries_then_raises(provider):
     with pytest.raises(AIGenerationError):
         provider.generate_structured("prompt", SampleSchema)
 
-    # 1 initial attempt + 2 retries = 3 total calls, then it gives up.
-    assert provider._client.messages.parse.call_count == 3
+    # 1 initial attempt + 1 retry = 2 total calls, then it gives up. Was 3 until F12-06: with
+    # the SDK's own max_retries left at its default of 2 these were 3 wire calls each, so this
+    # scenario alone reached 9 -- and a sustained 429 also slept 180.6s, because the SDK honoured
+    # Retry-After six times while this layer retried on top of it. See
+    # tests/unit/test_ai_retry_budget.py for the whole policy.
+    assert provider._client.messages.parse.call_count == MAX_ATTEMPTS_PER_STAGE == 2
 
 
 def test_redact_validation_error_never_includes_the_raw_invalid_value():

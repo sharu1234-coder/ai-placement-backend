@@ -5,6 +5,7 @@ from typing import Dict, List, Optional
 from sqlalchemy.orm import Session
 
 from app.ai.input_guard import render_prompt
+from app.ai.output_guard import leaking_field
 from app.ai.provider import AIGenerationError, AIProvider
 from app.ai.schemas.jd import AIParsedJD
 from app.ai.schemas.job_preparation_plan import GeneratedJobPreparationContent
@@ -36,6 +37,7 @@ from app.schemas.job import (
 )
 from app.services import jd_grounding
 from app.services import placement_path_rules as rules
+from app.services.ai_boundary import outside_transaction
 from app.services.matching_service import match_resume_to_job
 from app.services.skill_matching import NoResumeAnalysisError
 from app.services.weakness_service import compute_weaknesses
@@ -106,7 +108,25 @@ def parse_job_description(
     original value so existing callers are unaffected. It changes nothing about parsing: a JD
     extracted from a PDF is treated as exactly the same untrusted text as a pasted one.
     """
-    parsed: AIParsedJD = ai_provider.generate_structured(_build_prompt(raw_text), AIParsedJD)
+    # Outside any transaction (F12-07). Authentication has already opened one on this session, so
+    # without this the parse -- 98-183s against a real model -- would hold a pooled connection and
+    # a PostgreSQL snapshot for its whole duration. Nothing read before this point is needed
+    # afterwards: raw_text and profile_id are plain values, and detect_role below re-reads.
+    with outside_transaction(db):
+        parsed: AIParsedJD = ai_provider.generate_structured(_build_prompt(raw_text), AIParsedJD)
+    # Before the JobDescription row and every Requirement row below it, all of which are built
+    # straight out of this object -- role_title, each skill's `value`, each responsibility. A
+    # leak reaching them would not merely be displayed: Requirement.value is what the matching
+    # engine, the weakness computation and the preparation plan all read as a fact about the
+    # job, and career_goal_service.analyze attaches the same rows to a student's saved goal.
+    #
+    # This service deliberately has no template fallback (there is nothing honest to invent
+    # from an unparsed posting), so the leak takes the same route its other generation failures
+    # take: AIGenerationError, which app/api/jobs.py turns into the provider-agnostic 422 and
+    # career_goal_service leaves the goal untouched for.
+    leaked = leaking_field(parsed)
+    if leaked is not None:
+        raise AIGenerationError(f"Job description parse output leaked prompt scaffolding in field {leaked}")
 
     detected_role = detect_role(db, parsed.role_title)
 
@@ -535,6 +555,11 @@ def generate_preparation_plan(
 
     categories = _relevant_categories(db, jd_id, profile_id)
     role_title = job_title or jd.role_title or "this role"
+    # Plain snapshots, taken before the AI boundary below closes the session: the job summary at
+    # the end of this function still needs them, and the JobDescription and Requirement rows do
+    # not survive the boundary.
+    jd_location, jd_employment_type = jd.location, jd.employment_type
+    requirement_pairs = [(r.category, r.value) for r in requirements]
 
     category_reasons: dict = {}
     interview_questions: List[InterviewPrepQuestionRead] = []
@@ -550,7 +575,18 @@ def generate_preparation_plan(
             facts,
             project_matches,
         )
-        generated = ai_provider.generate_structured(prompt, GeneratedJobPreparationContent)
+        # Outside any transaction (F12-07). Everything the prompt needed has already been read
+        # and rendered into it, and the plan's own rows are not written until the end.
+        with outside_transaction(db):
+            candidate = ai_provider.generate_structured(prompt, GeneratedJobPreparationContent)
+        # Assigned to `generated` only once it is known safe. Guarding after the assignment
+        # would leave the leaked object in `generated` for the three _assemble_* calls below,
+        # which read it outside this try block -- the plan would fall back for the two sections
+        # built here and quietly keep the leak for the other three.
+        leaked = leaking_field(candidate)
+        if leaked is not None:
+            raise AIGenerationError(f"Preparation plan output leaked prompt scaffolding in field {leaked}")
+        generated = candidate
         for item in generated.category_reasons:
             if item.category in categories:
                 category_reasons[item.category] = item.reason
@@ -564,7 +600,7 @@ def generate_preparation_plan(
 
     gap_guidance = _assemble_gap_guidance(grounded_gaps, generated)
     resume_recommendations = _assemble_resume_recommendations(
-        facts, keywords, grounded_gaps, [r.value for r in requirements], generated
+        facts, keywords, grounded_gaps, [value for _, value in requirement_pairs], generated
     )
     project_connections = _assemble_project_connections(project_matches, generated)
 
@@ -578,11 +614,16 @@ def generate_preparation_plan(
     job_summary = JobSummaryRead(
         company_name=company_name,
         job_title=role_title,
-        experience_expectation=next((r.value for r in requirements if r.category == "experience"), None),
-        education_eligibility=next((r.value for r in requirements if r.category == "education"), None),
-        location=jd.location,
-        employment_type=jd.employment_type,
+        experience_expectation=next((v for c, v in requirement_pairs if c == "experience"), None),
+        education_eligibility=next((v for c, v in requirement_pairs if c == "education"), None),
+        location=jd_location,
+        employment_type=jd_employment_type,
     )
+
+    # Re-validated after the boundary: the plan row below carries a foreign key to the JD, which
+    # the student could have deleted while the model was working.
+    if db.get(JobDescription, jd_id) is None:
+        return None
 
     plan = JobPreparationPlan(
         jd_id=jd_id,

@@ -296,7 +296,7 @@ def _seed_full_account(db, email: str):
     ))
     db.add(ReadinessSnapshot(
         profile_id=profile.id, role_family_key="data_analyst", snapshot_date=datetime.date.today(),
-        readiness_percent=78, per_skill_confidence_percent={"sql": 80},
+        evidence_coverage_percent=78, per_skill_confidence_percent={"sql": 80},
     ))
     db.add(WeaknessRecord(profile_id=profile.id, skill_key="interview:technical_correctness", last_score=0.4))
 
@@ -492,6 +492,60 @@ def test_delete_account_succeeds_for_a_student_with_a_career_strategy_target(db_
     # The role is shared catalog data -- a student deleting their account must not remove a
     # role every other student compares against.
     assert db_session.get(Role, role.id) is not None
+
+
+def test_deleting_an_account_removes_the_jobs_that_student_typed_in(db_session):
+    """Phase 4 made job_listings hold two kinds of row with opposite privacy, and account
+    deletion has to tell them apart.
+
+    A provider advert is public content many students share, so removing it would delete
+    another student's saved job. A manually entered one is this student's own writing -- a
+    company a senior named, a description pasted out of an email -- and leaving it behind
+    would keep that text after they erased their account. It also carries a foreign key to
+    student_profiles, so leaving it would make the deletion fail outright rather than merely
+    leak.
+    """
+    from app.models.job_listing import JobListing
+    from app.models.saved_job import SavedJob
+
+    user = User(email="typed@example.com", password_hash="hashed")
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+    profile = StudentProfile(user_id=user.id, full_name="Priya")
+    db_session.add(profile)
+    db_session.commit()
+    db_session.refresh(profile)
+
+    shared = JobListing(
+        provider="adzuna",
+        provider_job_id="adz-1",
+        url="https://jobs.example.com/1",
+        title="Data Engineer",
+    )
+    mine = JobListing(
+        provider="manual",
+        provider_job_id=f"{profile.id}:abc",
+        url=None,
+        title="Campus placement -- SDE",
+        description="Told to me over email by my senior.",
+        created_by_profile_id=profile.id,
+    )
+    db_session.add_all([shared, mine])
+    db_session.commit()
+    db_session.refresh(shared)
+    db_session.refresh(mine)
+    shared_id, mine_id = shared.id, mine.id
+    db_session.add(SavedJob(profile_id=profile.id, listing_id=mine.id, status="interview"))
+    db_session.add(SavedJob(profile_id=profile.id, listing_id=shared.id, status="applied"))
+    db_session.commit()
+
+    delete_account(db_session, user, RecordingStorage())
+
+    assert db_session.get(JobListing, mine_id) is None, "the student's own text is gone"
+    assert db_session.get(JobListing, shared_id) is not None, (
+        "a provider advert is shared content and must survive one student leaving"
+    )
 
 
 # Tables that carry a student_profiles foreign key but are deliberately NOT deleted by

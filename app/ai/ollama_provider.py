@@ -9,7 +9,7 @@ import httpx
 from pydantic import ValidationError
 
 from app.ai.provider import AIGenerationError, AIProvider, T
-from app.ai.retry import call_with_retry
+from app.ai.retry import AIOperationBudget, FailureCategory, FailureVerdict
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -29,23 +29,54 @@ def _redact_validation_error(error: ValidationError) -> str:
 
 
 def _post_and_raise(base_url: str, payload: dict, timeout: float) -> httpx.Response:
-    """Split out from _call_ollama so call_with_retry can retry exactly this (the network
-    call + status check), not the JSON-shape parsing that follows it -- a malformed-but-200
-    body must never be retried, only a real network/status failure."""
+    """Split out from _call_ollama so the budget retries exactly this (the network call +
+    status check), not the JSON-shape parsing that follows it -- a malformed-but-200 body must
+    never be retried, only a real network/status failure."""
     response = httpx.post(f"{base_url}/api/generate", json=payload, timeout=timeout)
     response.raise_for_status()
     return response
 
 
-def _is_transient_ollama_error(exc: Exception) -> bool:
-    """Transient: a network-level failure with no response at all (timeout, connection
-    refused, ...), or an HTTP 429/5xx response. Anything else -- a 4xx response, or an
-    unexpected-but-200 response body -- is permanent and must not be retried. (Body-shape
-    parsing deliberately happens outside call_with_retry entirely, so a malformed 200 can
-    never even reach this classifier.)"""
+def _retry_after_seconds(response: httpx.Response) -> Optional[float]:
+    """A server's own `Retry-After`, in seconds, when it sent a usable one. Only the delta-
+    seconds form is honoured; the HTTP-date form is ignored rather than guessed at, which
+    simply leaves the budget's own fixed backoff in charge."""
+    raw = response.headers.get("Retry-After")
+    if raw is None:
+        return None
+    try:
+        return max(0.0, float(raw.strip()))
+    except (TypeError, ValueError):
+        return None
+
+
+def _classify_ollama_failure(exc: Exception) -> FailureVerdict:
+    """Which of the failure categories this is, and therefore whether repeating the identical
+    request could possibly help.
+
+    Retryable: a timeout, a network-level failure with no response at all (connection refused,
+    reset, ...), an HTTP 429, or a 5xx. Not retryable: 401/403 (no key change can come from a
+    retry), any other 4xx (an unchanged request cannot fix a malformed request or a missing
+    model), and anything unrecognised -- unknown failures default to *not* retrying, so a new
+    exception class can never silently become a retry storm.
+
+    Body-shape parsing deliberately happens outside the budget entirely, so a malformed 200 can
+    never even reach this classifier."""
     if isinstance(exc, httpx.HTTPStatusError):
-        return exc.response.status_code == 429 or exc.response.status_code >= 500
-    return isinstance(exc, httpx.HTTPError)
+        status = exc.response.status_code
+        if status == 429:
+            return FailureVerdict(FailureCategory.RATE_LIMIT, _retry_after_seconds(exc.response))
+        if status >= 500:
+            return FailureVerdict(FailureCategory.SERVER_ERROR)
+        if status in (401, 403):
+            return FailureVerdict(FailureCategory.AUTH)
+        return FailureVerdict(FailureCategory.CLIENT_ERROR)
+    # TimeoutException is a TransportError is an HTTPError, so it has to be tested first.
+    if isinstance(exc, httpx.TimeoutException):
+        return FailureVerdict(FailureCategory.TIMEOUT)
+    if isinstance(exc, httpx.HTTPError):
+        return FailureVerdict(FailureCategory.TRANSIENT_NETWORK)
+    return FailureVerdict(FailureCategory.UNKNOWN)
 
 
 def _extract_response_text(body: object) -> str:
@@ -108,31 +139,47 @@ class OllamaProvider(AIProvider):
         self.base_url = base_url or settings.ollama_base_url
         self.model = model or settings.ollama_model
 
+    def _budget(self, operation: str) -> AIOperationBudget:
+        """One budget per logical AI operation. The schema's own name is the operation name, so
+        every one of the app's AI call sites becomes individually visible in the logs without
+        any of them having to pass anything new."""
+        return AIOperationBudget(
+            operation=operation,
+            provider="ollama",
+            per_attempt_seconds=settings.ollama_timeout_seconds,
+        )
+
     def generate_structured(self, prompt: str, schema: type[T]) -> T:
         schema_json = schema.model_json_schema()
-        raw = self._call_ollama(prompt, format_schema=schema_json)
-        try:
-            return schema.model_validate_json(raw)
-        except ValidationError as first_error:
-            logger.warning(
-                "AI output failed schema validation, retrying once: %s", _redact_validation_error(first_error)
-            )
-            correction_prompt = (
-                f"{prompt}\n\n"
-                f"Your previous response did not match the required schema. "
-                f"Validation errors: {first_error}\n"
-                "Return ONLY valid JSON matching the schema, with no extra commentary."
-            )
-            raw_retry = self._call_ollama(correction_prompt, format_schema=schema_json)
+        # One budget, both stages. The schema correction below therefore draws down the same
+        # call cap and the same deadline as the initial attempt instead of starting a second
+        # independent budget -- which is the specific multiplication F12-06 was about.
+        with self._budget(schema.__name__) as budget:
+            raw = self._call_ollama(prompt, schema_json, budget, stage="initial")
             try:
-                return schema.model_validate_json(raw_retry)
-            except ValidationError as second_error:
-                raise AIGenerationError(
-                    f"AI output failed schema validation twice: {_redact_validation_error(second_error)}"
-                ) from second_error
+                return schema.model_validate_json(raw)
+            except ValidationError as first_error:
+                logger.warning(
+                    "AI output failed schema validation, retrying once: %s", _redact_validation_error(first_error)
+                )
+                correction_prompt = (
+                    f"{prompt}\n\n"
+                    f"Your previous response did not match the required schema. "
+                    f"Validation errors: {first_error}\n"
+                    "Return ONLY valid JSON matching the schema, with no extra commentary."
+                )
+                raw_retry = self._call_ollama(correction_prompt, schema_json, budget, stage="correction")
+                try:
+                    return schema.model_validate_json(raw_retry)
+                except ValidationError as second_error:
+                    budget.record(FailureCategory.SCHEMA)
+                    raise AIGenerationError(
+                        f"AI output failed schema validation twice: {_redact_validation_error(second_error)}"
+                    ) from second_error
 
     def generate_text(self, prompt: str) -> str:
-        return self._call_ollama(prompt, format_schema=None)
+        with self._budget("text") as budget:
+            return self._call_ollama(prompt, None, budget, stage="initial")
 
     def transcribe(self, audio: bytes) -> str:
         """Dev-only local STT (faster-whisper, CPU). Swap for a cloud STT provider before
@@ -166,20 +213,24 @@ class OllamaProvider(AIProvider):
         finally:
             Path(tmp_path).unlink(missing_ok=True)
 
-    def _call_ollama(self, prompt: str, format_schema: Optional[dict]) -> str:
+    def _call_ollama(
+        self, prompt: str, format_schema: Optional[dict], budget: AIOperationBudget, *, stage: str
+    ) -> str:
         payload: dict = {"model": self.model, "prompt": prompt, "stream": False}
         if format_schema is not None:
             payload["format"] = format_schema
 
-        # call_with_retry wraps only the raw HTTP call + status check: a genuinely transient
-        # failure (connection error, timeout, 429, 5xx) gets up to two bounded retries with
-        # backoff before this ever becomes an AIGenerationError. A permanent 4xx, or an
-        # unexpected-but-200 body (parsed below, outside the retry), is never retried.
+        # budget.call wraps only the raw HTTP call + status check: a genuinely transient failure
+        # (connection error, timeout, 429, 5xx) gets at most one bounded retry, and only if the
+        # retry's full timeout still fits in what the operation has left. A permanent 4xx, or an
+        # unexpected-but-200 body (parsed below, outside the budget), is never retried. The
+        # timeout comes from the budget rather than straight from settings, because it is clamped
+        # to the remaining wall clock -- that clamp is half of how the deadline is enforced.
         try:
-            response = call_with_retry(
-                lambda: _post_and_raise(self.base_url, payload, settings.ollama_timeout_seconds),
-                is_transient=_is_transient_ollama_error,
-                context="Ollama /api/generate",
+            response = budget.call(
+                lambda timeout: _post_and_raise(self.base_url, payload, timeout),
+                classify=_classify_ollama_failure,
+                stage=stage,
             )
             body = response.json()
         except httpx.HTTPError as exc:

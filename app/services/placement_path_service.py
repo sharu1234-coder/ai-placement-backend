@@ -6,6 +6,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.ai.input_guard import render_prompt
+from app.ai.output_guard import looks_like_prompt_leak
 from app.ai.provider import AIGenerationError, AIProvider
 from app.ai.schemas.placement_path import GeneratedPlacementPathExplanations
 from app.models.assessment import Assessment
@@ -22,6 +23,7 @@ from app.schemas.placement_path import (
     PlacementPathTopicRead,
 )
 from app.services import placement_path_rules as rules
+from app.services.ai_boundary import outside_transaction
 from app.services.skill_matching import latest_resume_skills
 from app.services.weakness_service import compute_weaknesses
 
@@ -100,7 +102,10 @@ def _generate_explanations(ai_provider: AIProvider, specs: List[rules.TopicSpec]
             prompt, GeneratedPlacementPathExplanations
         )
         for item in generated.explanations:
-            if item.topic_key in valid_keys:
+            # Same shape as the unrecognized-key check beside it: a leaked explanation is simply
+            # not taken, and the topic falls through to _fallback_explanation below. The path is
+            # already built from deterministic rules, so losing one sentence costs nothing.
+            if item.topic_key in valid_keys and not looks_like_prompt_leak(item.why_it_matters):
                 explanations[item.topic_key] = item.why_it_matters
     except AIGenerationError as exc:
         logger.warning("AI topic-explanation generation failed for %d topics, using template fallback: %s", len(specs), exc)
@@ -130,6 +135,17 @@ def generate_placement_path(db: Session, profile_id: int, ai_provider: AIProvide
     if not specs:
         raise NoPlacementRelevantSkillsError("No placement-relevant resume skills found")
 
+    # The AI work first, outside any transaction and before anything is read that the write needs
+    # (F12-07). `specs` is a deterministic plain structure, so the explanations need nothing else.
+    #
+    # Moving it ahead of the carry-forward reads does two things at once: the rows whose progress
+    # is carried forward are now read on the same side of the boundary as the write that uses them
+    # (so they cannot be stale, and they are not detached), and superseding the old path is no
+    # longer committed before the generation that replaces it. Previously a failure here left the
+    # student's active path superseded with nothing to take its place.
+    with outside_transaction(db):
+        explanations = _generate_explanations(ai_provider, specs)
+
     existing_active = (
         db.query(PlacementPath)
         .filter(PlacementPath.profile_id == profile_id, PlacementPath.status == "active")
@@ -142,9 +158,6 @@ def generate_placement_path(db: Session, profile_id: int, ai_provider: AIProvide
         )
         carry_forward = {(t.track_key, t.topic_key): t for t in old_topics}
         existing_active.status = "superseded"
-        db.commit()
-
-    explanations = _generate_explanations(ai_provider, specs)
 
     path = PlacementPath(
         profile_id=profile_id,
@@ -152,8 +165,9 @@ def generate_placement_path(db: Session, profile_id: int, ai_provider: AIProvide
         source_resume_id=_latest_completed_resume_id(db, profile_id),
     )
     db.add(path)
-    db.commit()
-    db.refresh(path)
+    # flush, not commit: superseding the old path, creating the new one and writing its topics are
+    # one unit of work.
+    db.flush()
 
     for spec in specs:
         carried = carry_forward.get((spec.track_key, spec.topic_key))

@@ -93,6 +93,32 @@ class CareerGoal(Base):
         String(20), nullable=False, default=CAREER_GOAL_STATUS_ACTIVE, index=True
     )
 
+    # The real-world application this goal is being pursued through. NULL is the ordinary
+    # state: a goal is an intention, and most intentions are formed before -- or without ever
+    # -- applying anywhere.
+    #
+    # This is the ONLY link between the two tables, and it is deliberately one-directional.
+    # SavedJob carries no career_goal_id: the relationship is one-to-at-most-one in both
+    # directions, so a second column would be a second source of truth that two writers could
+    # disagree about, and reconciling them would need machinery this product does not need.
+    # "Which goal is this job pursued through?" is one indexed lookup on this column instead.
+    #
+    # UNIQUE, not merely indexed, and that is load-bearing twice over. It is the product rule
+    # (one application belongs to at most one goal), and it is the concurrency arbiter for two
+    # requests linking the same job to different goals at once -- the same role
+    # interview_evaluations.interview_id's unique index plays for evaluation creation. Both
+    # SQLite and PostgreSQL permit unlimited NULLs under a UNIQUE constraint, so every
+    # unlinked goal coexists happily.
+    #
+    # ON DELETE SET NULL because job_hunt deletes a saved job outright
+    # (job_hunt.service.delete_saved_job) and account deletion removes saved_jobs BEFORE
+    # career_goals. Either would raise a foreign-key error against a plain reference. Letting
+    # the database null the pointer keeps the goal -- the student's intention outlives the
+    # tracker row, which is the honest outcome: they still want that job.
+    saved_job_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("saved_jobs.id", ondelete="SET NULL"), nullable=True, unique=True
+    )
+
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime, nullable=False, default=lambda: datetime.datetime.now(datetime.timezone.utc)
     )

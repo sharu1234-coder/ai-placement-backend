@@ -30,7 +30,7 @@ def get_career_twin(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> CareerTwinRead:
-    """The full Career Twin view: readiness, per-skill evidence breakdown, biggest gap, and
+    """The full Career Twin view: evidence coverage, per-skill evidence breakdown, biggest gap,
     the "why" behind the number. Sourced from the profile's current Career Path if one exists,
     falling back to their legacy target_role_id, and returning has_role=False (never a
     fabricated 0%) if neither is set. `reasons` is the one field this endpoint gates server-side
@@ -45,7 +45,7 @@ def get_readiness(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> CareerTwinReadinessRead:
-    """Cheap projection for the Home screen's readiness card -- same computation as GET
+    """Cheap projection for the Home screen's evidence-coverage card -- same computation as GET
     /career-twin, without the per-skill list."""
     profile = get_or_create_profile(db, current_user)
     twin = career_twin_service.get_current(db, profile)

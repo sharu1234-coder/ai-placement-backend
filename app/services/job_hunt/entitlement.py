@@ -111,7 +111,9 @@ class InvalidIdempotencyKeyError(JobHuntEntitlementError):
 
 
 def _utcnow() -> datetime.datetime:
-    return datetime.datetime.utcnow()
+    # Value-identical to the deprecated datetime.utcnow(); see job_hunt/service.py's
+    # _utcnow for why every DateTime column in this schema is naive UTC.
+    return datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
 
 
 def normalise_key(raw: Optional[str]) -> str:

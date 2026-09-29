@@ -30,7 +30,7 @@ from app.models.placement_path import PlacementPath
 from app.models.placement_path_topic import PlacementPathTopic
 from app.models.profile import StudentProfile
 from app.schemas.next_best_action import NextBestActionItem, NextBestActionRead
-from app.services import evidence_engine
+from app.services import application_outcome, evidence_engine
 from app.services.role_context import resolve_role_context
 from app.services.weakness_service import WeaknessItem, compute_weaknesses
 
@@ -349,6 +349,38 @@ def _build_candidates(
     return candidates
 
 
+def _live_interview_action(applications) -> Optional[NextBestActionItem]:
+    """The maintenance fallback, when a real application is sitting at the interview stage.
+
+    This is the ONLY place a real-world application changes what gets recommended, and it is
+    deliberately confined to the fallback -- the point at which the ranked tiers above have
+    found nothing urgent and the alternative is "keep a skill sharp". Every measured tier still
+    outranks it, because a recorded weakness is a better reason to act than a calendar event.
+
+    What it must never become: a causal claim. It says an interview stage is live and that
+    interview practice is therefore the more useful of two non-urgent options. It does NOT say
+    the student is weak, that they will fail, or that any particular skill is why -- none of
+    which this app can know from a tracker status. The reason line is phrased as the fact it is.
+
+    Reuses the existing interview_weakness destination and confidence band rather than adding a
+    tier: no new vocabulary means the Android destination table already resolves it, and no new
+    confidence band means nothing has to decide what this tier's certainty means.
+    """
+    if applications is None or applications.at_interview_stage <= 0:
+        return None
+    return _make(
+        "interview_weakness",
+        "Run a mock interview before your live one",
+        "practice",
+        [
+            # A fact from the student's own tracker, stated as a fact. Plural handled because
+            # "1 applications" reads as a bug and undermines trust in everything beside it.
+            f"You have {applications.at_interview_stage} application"
+            f"{'s' if applications.at_interview_stage > 1 else ''} at the interview stage."
+        ],
+    )
+
+
 def _maintenance_action(skills: List[str], evidence_by_skill: dict) -> NextBestActionItem:
     """Tier 9 -- nothing urgent. Keep the currently-weakest-but-fine skill sharp rather than
     fabricating a gap that doesn't exist."""
@@ -380,7 +412,13 @@ def get_actions(db: Session, profile: StudentProfile, limit: int = MAX_ACTIONS) 
     evidence_by_skill = {v.skill: v for v in evidence_engine.get_all_skill_evidence(db, profile.id, skills)}
 
     actions = _build_candidates(db, profile, context, evidence_by_skill, skills, limit)[:limit]
-    return actions or [_maintenance_action(skills, evidence_by_skill)]
+    if actions:
+        return actions
+    # Nothing measured is urgent. Only now does a live application get a say, and only to
+    # choose between two non-urgent suggestions -- one query, run on the branch that would
+    # otherwise return generic maintenance, so the common path costs nothing.
+    live = _live_interview_action(application_outcome.context_for_profile(db, profile.id))
+    return [live or _maintenance_action(skills, evidence_by_skill)]
 
 
 def get_next_best_action(db: Session, profile: StudentProfile) -> NextBestActionRead:

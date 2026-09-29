@@ -34,6 +34,7 @@ from typing import Dict, List, Optional
 from sqlalchemy.orm import Session
 
 from app.ai.input_guard import render_prompt
+from app.ai.output_guard import looks_like_prompt_leak
 from app.ai.provider import AIGenerationError, AIProvider
 from app.ai.schemas.professional_presence import GeneratedPresenceNarrative
 from app.models.external_profile_snapshot import ExternalProfileSnapshot
@@ -400,6 +401,11 @@ def generate_narrative(
         why = item.why_it_matters.strip()
         action = item.recommended_action.strip()
         if not why or not action:
+            continue
+        if looks_like_prompt_leak(why) or looks_like_prompt_leak(action):
+            # Dropped exactly like an unknown observation above: the finding still reaches the
+            # student, carrying its own hand-written action and is_template=True. An audit that
+            # is smaller is the documented outcome here; one that is wrong is not.
             continue
         narrative[key] = {"why_it_matters": why, "recommended_action": action}
     return narrative

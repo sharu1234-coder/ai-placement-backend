@@ -14,6 +14,7 @@ from app.schemas.career_goal import (
     CareerGoalAnalyzeResponse,
     CareerGoalCreate,
     CareerGoalDetailRead,
+    CareerGoalLinkApplication,
     CareerGoalListItem,
     CareerGoalUpdate,
 )
@@ -99,6 +100,59 @@ def delete_career_goal(
     profile = get_or_create_profile(db, current_user)
     try:
         career_goal_service.delete(db, profile.id, career_goal_id)
+    except career_goal_service.CareerGoalNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+
+
+# Deliberately NOT rate limited, and deliberately on this router rather than job_hunt's.
+#
+# Not limited because it runs no AI, writes one integer and cannot be made expensive: the
+# limiter exists in this app to protect provider budgets and upload bandwidth, and applying it
+# to a pointer write would only punish a student correcting a mis-link.
+#
+# On this router because the career goal is the canonical side of the relationship (see
+# CareerGoal.saved_job_id) -- the goal is what holds the link, so the goal is what changes it.
+@router.put("/{career_goal_id}/application", response_model=CareerGoalListItem)
+def link_application(
+    career_goal_id: int,
+    payload: CareerGoalLinkApplication,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> CareerGoalListItem:
+    """Link this goal to one of the student's own saved jobs.
+
+    PUT rather than POST because the operation is idempotent -- sending the same pair twice
+    leaves the same single link, which is what PUT means and what a client retrying a dropped
+    response needs.
+    """
+    profile = get_or_create_profile(db, current_user)
+    try:
+        return career_goal_service.link_saved_job(
+            db, profile.id, career_goal_id, payload.saved_job_id
+        )
+    except (
+        career_goal_service.CareerGoalNotFoundError,
+        career_goal_service.SavedJobNotFoundError,
+    ) as exc:
+        # Both are 404, and both messages name only the id the caller already sent. A goal
+        # owned by someone else and a goal that never existed are answered identically, so
+        # this endpoint cannot be used to discover which ids are real.
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    except career_goal_service.SavedJobAlreadyLinkedError as exc:
+        # 409, not 404: the student owns both rows and is entitled to be told why this failed.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+
+
+@router.delete("/{career_goal_id}/application", response_model=CareerGoalListItem)
+def unlink_application(
+    career_goal_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> CareerGoalListItem:
+    """Detach the application. Neither row is deleted -- see career_goal_service.unlink_saved_job."""
+    profile = get_or_create_profile(db, current_user)
+    try:
+        return career_goal_service.unlink_saved_job(db, profile.id, career_goal_id)
     except career_goal_service.CareerGoalNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
 

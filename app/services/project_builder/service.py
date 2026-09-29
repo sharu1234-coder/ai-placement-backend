@@ -27,6 +27,7 @@ from app.schemas.project_builder import (
     ProjectProofRead,
 )
 from app.services import github_verification_service, project_proof_service
+from app.services.ai_boundary import outside_transaction
 from app.services.project_builder.ai_generation import generate_stage_guidance
 from app.services.project_builder.stages import STAGE_ORDER, STAGE_TITLES
 from app.services.role_context import resolve_role_context
@@ -101,20 +102,30 @@ def create_build(
 ) -> ProjectBuildRead:
     context = resolve_role_context(db, profile)
     role_name = context.display_role_name if context is not None else "this role"
+    # Plain values, taken before the boundary below closes the session.
+    profile_id = profile.id
+    role_family_key = context.role_family_key if context is not None else None
+    target_role_name = context.display_role_name if context is not None else None
+
+    # The guidance for all ten stages is generated first, outside any transaction and before
+    # anything is written (F12-07). It used to run between the build's own commit and its stages',
+    # which both held a transaction across the call and meant a failure could leave a build with
+    # no stages in it -- an empty, unusable project the student could not progress.
+    with outside_transaction(db):
+        guidance = generate_stage_guidance(role_name, title, stack_summary, ai_provider)
 
     build = ProjectBuild(
-        profile_id=profile.id,
+        profile_id=profile_id,
         title=title,
-        role_family_key=context.role_family_key if context is not None else None,
-        target_role_name=context.display_role_name if context is not None else None,
+        role_family_key=role_family_key,
+        target_role_name=target_role_name,
         stack_summary=stack_summary,
         status="not_started",
     )
     db.add(build)
-    db.commit()
-    db.refresh(build)
+    # flush, not commit: the build and its ten stages are one unit of work.
+    db.flush()
 
-    guidance = generate_stage_guidance(role_name, title, stack_summary, ai_provider)
     stages = []
     for index, stage_key in enumerate(STAGE_ORDER):
         stage = ProjectBuildStage(
@@ -216,13 +227,17 @@ def complete_stage(
     db.refresh(stage)
 
     remaining_stages = _get_stages(db, build.id)
+    # Materialized before generate_proof, which runs its AI call with no transaction open (F12-07)
+    # and therefore detaches `stage`. This response is about the stage the student just completed,
+    # so it does not depend on the proof that may be generated below.
+    stage_read = _stage_read(stage)
     if all(s.status == "completed" for s in remaining_stages):
         build.status = "completed"
         build.completed_at = datetime.datetime.now(datetime.timezone.utc)
         db.commit()
         project_proof_service.generate_proof(db, build, remaining_stages, ai_provider)
 
-    return _stage_read(stage)
+    return stage_read
 
 
 def get_proof(db: Session, profile_id: int, build_id: int) -> ProjectProofRead:

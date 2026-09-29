@@ -91,7 +91,16 @@ def test_unknown_role_id_returns_422(client, auth_headers, monkeypatch):
     assert resp.status_code == 422
 
 
-def test_simulate_with_no_evidence_returns_two_honest_stretches(client, auth_headers, monkeypatch):
+def test_simulate_separates_a_measured_zero_from_an_unmeasurable_role(client, auth_headers, monkeypatch):
+    """The Phase 2F distinction, proved end to end through the API.
+
+    The two seeded roles differ in exactly the way that matters: SDE has RoleSkillWeight rows
+    (see conftest), so with no evidence its coverage is a genuine, computed 0%. Data Analyst
+    has none at all, so nothing about it can be computed.
+
+    This test previously asserted "stretch" and 0% for BOTH, which meant the API was reporting
+    a percentage it had never calculated and a verdict about a role it knew nothing about.
+    """
     _grant_premium(client, monkeypatch, auth_headers, "order_no_evidence")
     sde_id, data_analyst_id = _role_ids(client, auth_headers)
     resp = client.post(
@@ -100,8 +109,20 @@ def test_simulate_with_no_evidence_returns_two_honest_stretches(client, auth_hea
     assert resp.status_code == 200
     body = resp.json()
     assert len(body["roles"]) == 2
-    assert all(r["classification"] == "stretch" for r in body["roles"])
-    assert all(r["readiness_percent"] == 0 for r in body["roles"])
+    by_id = {r["role_id"]: r for r in body["roles"]}
+
+    measured = by_id[sde_id]
+    assert measured["evidence_coverage_percent"] == 0, "a role with weights and no evidence is a measured 0"
+    assert measured["classification"] == "stretch"
+
+    unmeasurable = by_id[data_analyst_id]
+    assert unmeasurable["evidence_coverage_percent"] is None, "a role with no weights cannot be scored"
+    assert unmeasurable["classification"] is None, "and cannot be classified"
+    assert unmeasurable["estimated_hours_to_strengthen"] is None
+
+    # The unmeasurable role sorts last rather than being ranked as though it scored zero.
+    assert body["roles"][-1]["role_id"] == data_analyst_id
+
     assert all(r["is_estimate"] is True for r in body["roles"])
     assert len(body["assumptions"]) > 0
     assert "probability" not in str(body).lower()
@@ -117,7 +138,11 @@ def test_weekly_hours_are_echoed_back_clamped(client, auth_headers, monkeypatch)
     )
     body = resp.json()
     assert body["weekly_hours_used"] == 80
-    assert all(r["estimated_weeks"] is not None for r in body["roles"])
+    # Only the measurable role gets a week estimate. Estimating weeks-to-close for a gap of
+    # unknown size would be inventing the very number this phase removed.
+    by_id = {r["role_id"]: r for r in body["roles"]}
+    assert by_id[sde_id]["estimated_weeks"] is not None
+    assert by_id[data_analyst_id]["estimated_weeks"] is None
 
 
 def test_roles_are_isolated_per_profile(client, auth_headers, monkeypatch):

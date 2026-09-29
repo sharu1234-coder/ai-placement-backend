@@ -31,14 +31,17 @@ import logging
 from typing import Dict, List, Optional, Tuple
 
 from sqlalchemy import update as sql_update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.ai.provider import AIProvider
 from app.models.career_goal import CAREER_GOAL_STATUS_ACTIVE, CareerGoal
 from app.models.interview import Interview
 from app.models.job_description import JobDescription
+from app.models.job_listing import JobListing
 from app.models.profile import StudentProfile
 from app.models.requirement import Requirement
+from app.models.saved_job import SavedJob
 from app.models.weakness_record import WeaknessRecord
 from app.schemas.career_goal import (
     CareerGoalAnalyzeResponse,
@@ -46,13 +49,20 @@ from app.schemas.career_goal import (
     CareerGoalDetailRead,
     CareerGoalListItem,
     CareerGoalUpdate,
+    GoalApplicationRead,
     GoalInterviewRiskRead,
     GoalPreparationItemRead,
     GoalProgressRead,
     GoalRequirementRead,
     GoalSkillEvidenceRead,
 )
-from app.services import evidence_engine, jd_service, next_best_action_service, weakness_service
+from app.services import (
+    application_outcome,
+    evidence_engine,
+    jd_service,
+    next_best_action_service,
+    weakness_service,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +73,25 @@ class CareerGoalNotFoundError(Exception):
     One exception for both, mapped to 404 by the router, because distinguishing them would
     turn this endpoint into an oracle for which goal ids exist -- the same convention the rest
     of this app's nested resources already follow.
+    """
+
+
+class SavedJobNotFoundError(Exception):
+    """Raised for a saved job that does not exist AND for one belonging to somebody else.
+
+    Same reasoning, and deliberately the same shape, as CareerGoalNotFoundError above: linking
+    must not become a way to discover which saved_job ids are real. job_hunt's own service
+    raises an identically-motivated error for the same reason -- this one exists separately
+    only so career_goals' router does not have to import job_hunt's exception hierarchy.
+    """
+
+
+class SavedJobAlreadyLinkedError(Exception):
+    """Raised when the saved job is already the target of a DIFFERENT career goal.
+
+    Not a 404: the student owns both rows and is entitled to know the two cannot both claim
+    the same application. Distinct from the idempotent re-link of the same pair, which
+    succeeds silently.
     """
 
 
@@ -231,6 +260,139 @@ def delete(db: Session, profile_id: int, career_goal_id: int) -> None:
     db.commit()
 
 
+# ==========================================================================================
+# The link to the real-world application
+# ==========================================================================================
+
+
+def link_saved_job(
+    db: Session, profile_id: int, career_goal_id: int, saved_job_id: int
+) -> CareerGoalListItem:
+    """Point this goal at the application the student is pursuing it through.
+
+    Runs no AI. Linking is a pointer write -- there is nothing here for a model to decide, and
+    making the student wait on a provider (or pay for one) to record which job they applied to
+    would be indefensible.
+
+    Ownership is checked on BOTH rows, separately, against the authenticated profile. The goal
+    goes through _get_owned; the saved job is re-queried with its own profile_id filter rather
+    than trusted from the request. Without the second check a student could link their own goal
+    to somebody else's application and read that person's status back out of their own goal --
+    an IDOR that would look like a feature.
+
+    Idempotent for the pair that is already linked: tapping "link" twice is not a conflict.
+
+    The database decides the contested case. career_goals.saved_job_id is UNIQUE, so two
+    requests linking the same job to two different goals cannot both win however they
+    interleave -- the loser's UPDATE hits the constraint and becomes a 409, exactly as
+    interview_evaluations.interview_id's unique index arbitrates evaluation creation. No
+    check-then-write, no in-process lock: both would be decided in this worker's memory, and
+    this app runs the same code in several.
+    """
+    goal = _get_owned(db, profile_id, career_goal_id)
+
+    saved = (
+        db.query(SavedJob)
+        .filter(SavedJob.id == saved_job_id, SavedJob.profile_id == profile_id)
+        .first()
+    )
+    if saved is None:
+        raise SavedJobNotFoundError(f"Saved job {saved_job_id} not found")
+
+    if goal.saved_job_id == saved_job_id:
+        return _list_item(db, goal)
+
+    try:
+        # execute() and commit() are BOTH inside the try, and that is not defensive padding:
+        # SQLAlchemy emits this UPDATE immediately, so the unique violation surfaces here
+        # rather than at commit time. Catching only around commit left the IntegrityError
+        # escaping as a 500 -- which is exactly what the two-goals-one-application test caught.
+        result = db.execute(
+            sql_update(CareerGoal)
+            .where(CareerGoal.id == goal.id, CareerGoal.profile_id == profile_id)
+            .values(
+                saved_job_id=saved_job_id,
+                updated_at=datetime.datetime.now(datetime.timezone.utc),
+            )
+        )
+        db.commit()
+    except IntegrityError:
+        # The unique constraint fired: another goal -- this student's own, since saved jobs are
+        # profile-scoped -- already claims this application. Rollback first, because the failed
+        # statement leaves the transaction unusable until it happens.
+        db.rollback()
+        raise SavedJobAlreadyLinkedError(
+            f"Saved job {saved_job_id} is already linked to another career goal"
+        )
+    if not result.rowcount:
+        # The goal vanished between the read and the write (a concurrent delete). Report it the
+        # same way a missing goal is reported rather than inventing a third outcome.
+        raise CareerGoalNotFoundError(f"Career goal {career_goal_id} not found")
+    db.refresh(goal)
+    logger.info(
+        "event=career_goal_linked career_goal_id=%s saved_job_id=%s", goal.id, saved_job_id
+    )
+    return _list_item(db, goal)
+
+
+def unlink_saved_job(db: Session, profile_id: int, career_goal_id: int) -> CareerGoalListItem:
+    """Detach the application, leaving both rows intact.
+
+    Unlinking never deletes anything: the goal survives (the student still wants that job) and
+    the saved job survives (they still applied). Only the pointer goes.
+
+    Idempotent -- unlinking an already-unlinked goal is a no-op, not a 404, because the caller
+    asked for a state that is already true.
+    """
+    goal = _get_owned(db, profile_id, career_goal_id)
+    if goal.saved_job_id is None:
+        return _list_item(db, goal)
+    goal.saved_job_id = None
+    _touch(goal)
+    db.commit()
+    db.refresh(goal)
+    logger.info("event=career_goal_unlinked career_goal_id=%s", goal.id)
+    return _list_item(db, goal)
+
+
+def _application(db: Session, goal: CareerGoal) -> Optional[GoalApplicationRead]:
+    """Read the linked application, or None when there is no link.
+
+    One query with a join, not two: this runs on every detail read, which already composes the
+    evidence engine, the weakness engine and the recommendation engine, and an extra round trip
+    per screen open for a handful of display fields is exactly the accumulation the batch
+    evidence path exists to prevent.
+
+    Every value is read from the SavedJob row. Nothing here is stored on the goal, so the
+    tracker and the goal are incapable of disagreeing about what stage an application is at.
+    """
+    if goal.saved_job_id is None:
+        return None
+    row = (
+        db.query(SavedJob, JobListing)
+        .join(JobListing, SavedJob.listing_id == JobListing.id)
+        .filter(SavedJob.id == goal.saved_job_id, SavedJob.profile_id == goal.profile_id)
+        .first()
+    )
+    if row is None:
+        # Defensive. ON DELETE SET NULL means a deleted saved job clears this pointer, so this
+        # should be unreachable -- but a goal that renders without its application is a far
+        # better failure than a detail screen that 500s.
+        return None
+    saved, listing = row
+    return GoalApplicationRead(
+        saved_job_id=saved.id,
+        status=saved.status,
+        outcome=application_outcome.outcome_for(saved.status),
+        is_terminal=application_outcome.is_terminal(saved.status),
+        has_applied=application_outcome.has_applied(saved.status),
+        applied_at=saved.applied_at,
+        listing_title=listing.title,
+        listing_company=listing.company,
+        listing_url=listing.url,
+    )
+
+
 def _discard_analysis(db: Session, goal: CareerGoal) -> None:
     """Detach and delete whatever parse this goal currently points at."""
     jd_id = goal.jd_id
@@ -278,9 +440,13 @@ def analyze(
     # The parse this goal pointed at when this request started. It is the compare half of the
     # compare-and-swap below, so it has to be read before the (slow) AI call, not after.
     previous_jd_id = goal.jd_id
+    # Read for the same reason, and now for a second one: parse_job_description runs its AI call
+    # with no transaction open (F12-07), which detaches this row, so everything needed from it has
+    # to be taken on this side of the call.
+    job_description = goal.job_description
 
     parsed = jd_service.parse_job_description(
-        db, profile_id, goal.job_description, ai_provider, source="career_goal"
+        db, profile_id, job_description, ai_provider, source="career_goal"
     )
 
     # Attach the new parse only if nothing changed the goal's analysis while this one was
@@ -298,7 +464,7 @@ def analyze(
     )
     result = db.execute(
         sql_update(CareerGoal)
-        .where(CareerGoal.id == goal.id, previous_matches)
+        .where(CareerGoal.id == career_goal_id, previous_matches)
         .values(jd_id=parsed.id, updated_at=datetime.datetime.now(datetime.timezone.utc))
     )
     db.commit()
@@ -313,15 +479,15 @@ def analyze(
         )
         _delete_parse(db, parsed.id)
         db.commit()
-        db.refresh(goal)
-        return _analyze_response(db, goal)
+        # Re-read rather than refreshed: the row this request started from was detached when the
+        # parse ran outside a transaction, and the winner's value is what should be returned.
+        return _analyze_response(db, _get_owned(db, profile_id, career_goal_id))
 
     # Won. The parse this one replaced is now unreachable, so it goes.
     _delete_parse(db, previous_jd_id)
     db.commit()
-    db.refresh(goal)
 
-    response = _analyze_response(db, goal)
+    response = _analyze_response(db, _get_owned(db, profile_id, career_goal_id))
     logger.info(
         "Career goal %s analyzed: %d requirements, %d matchable skills",
         career_goal_id, response.requirements_found, response.skills_found,
@@ -391,6 +557,7 @@ def get_detail(db: Session, profile: StudentProfile, career_goal_id: int) -> Car
         interview_risks=risks,
         preparation_plan=plan,
         progress=progress,
+        application=_application(db, goal),
         next_best_action=_next_best_action(db, profile),
         unavailable_evidence_sources=evidence_engine.unavailable_sources(db, profile.id),
     )
@@ -744,6 +911,14 @@ def _list_item(db: Session, goal: CareerGoal) -> CareerGoalListItem:
     # direction, and it is why the rule lives in one function that takes coverage as an argument
     # rather than being reimplemented per caller.
     state = _preparation_state(goal, None, interviews, 0)
+    # One scalar column, not the joined application: the row renders one word ("Interview
+    # stage") and loading a listing per goal to produce it would reintroduce exactly the
+    # per-row cost the paragraph above exists to avoid. The detail screen carries the rest.
+    application_status = (
+        db.query(SavedJob.status).filter(SavedJob.id == goal.saved_job_id).scalar()
+        if goal.saved_job_id is not None
+        else None
+    )
     return CareerGoalListItem(
         id=goal.id,
         title=goal.title,
@@ -752,6 +927,7 @@ def _list_item(db: Session, goal: CareerGoal) -> CareerGoalListItem:
         status=goal.status,
         is_analyzed=goal.jd_id is not None,
         preparation_state=state,
+        application_status=application_status,
         created_at=goal.created_at,
         updated_at=goal.updated_at,
     )
