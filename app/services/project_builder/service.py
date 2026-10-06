@@ -169,6 +169,20 @@ def _get_stages(db: Session, build_id: int) -> List[ProjectBuildStage]:
     )
 
 
+def read_build(db: Session, profile_id: int, build_id: int) -> Optional[ProjectBuildRead]:
+    """Like [get_build], but None instead of raising when there is nothing to read.
+
+    The replay path needs the absence of a build to be an ordinary answer rather than an
+    exception: a build the student deleted after the original request means the key no longer
+    names anything, which the guard turns into a conflict. get_build keeps raising for the
+    routes that genuinely want a 404.
+    """
+    try:
+        return get_build(db, profile_id, build_id)
+    except ProjectBuildNotFoundError:
+        return None
+
+
 def get_build(db: Session, profile_id: int, build_id: int) -> ProjectBuildRead:
     build = _get_owned_build(db, profile_id, build_id)
     stages = _get_stages(db, build.id)

@@ -1,10 +1,12 @@
-from typing import List
+import logging
+from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.ai.provider import AIProvider, get_ai_provider
 from app.api.deps import get_current_user, get_db
+from app.api.idempotency_errors import idempotency_http_error
 from app.core.rate_limit import limiter
 from app.models.user import User
 from app.schemas.project_builder import (
@@ -17,9 +19,11 @@ from app.schemas.project_builder import (
     ProjectBuildStageRead,
     ProjectProofRead,
 )
-from app.services import github_verification_service
+from app.services import github_verification_service, idempotency
 from app.services.profile_service import get_or_create_profile
 from app.services.project_builder import service as project_builder_service
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/project-builder", tags=["project-builder"])
 
@@ -29,12 +33,36 @@ router = APIRouter(prefix="/project-builder", tags=["project-builder"])
 def create_build(
     request: Request,
     payload: CreateProjectBuildRequest,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
     ai_provider: AIProvider = Depends(get_ai_provider),
 ) -> ProjectBuildRead:
     profile = get_or_create_profile(db, current_user)
-    return project_builder_service.create_build(db, profile, payload.title, payload.stack_summary, ai_provider)
+
+    def perform() -> tuple[ProjectBuildRead, int]:
+        created = project_builder_service.create_build(
+            db, profile, payload.title, payload.stack_summary, ai_provider
+        )
+        return created, created.id
+
+    try:
+        # The most expensive create in the app: one build plus ten stages, each with generated
+        # guidance, so a replay is a duplicate project *and* a second full generation pass. The
+        # claim commits before perform() runs, so Phase 19's no-transaction-across-inference
+        # rule still holds when create_build opens its own boundary.
+        return idempotency.run_once(
+            db,
+            profile.id,
+            operation="project_build.create",
+            idempotency_key=idempotency_key,
+            params={"title": payload.title, "stack_summary": payload.stack_summary},
+            perform=perform,
+            read_back=lambda rid: project_builder_service.read_build(db, profile.id, rid),
+            result_kind="project_build",
+        )
+    except idempotency.IdempotencyError as exc:
+        raise idempotency_http_error(exc, logger, "project_build.create")
 
 
 @router.get("", response_model=List[ProjectBuildListItemRead])

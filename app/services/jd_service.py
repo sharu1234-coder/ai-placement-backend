@@ -2,6 +2,7 @@ import logging
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.ai.input_guard import render_prompt
@@ -35,7 +36,7 @@ from app.schemas.job import (
     SkillGapRead,
     SkillGapStatusRead,
 )
-from app.services import jd_grounding
+from app.services import idempotency, jd_grounding
 from app.services import placement_path_rules as rules
 from app.services.ai_boundary import outside_transaction
 from app.services.matching_service import match_resume_to_job
@@ -43,6 +44,12 @@ from app.services.skill_matching import NoResumeAnalysisError
 from app.services.weakness_service import compute_weaknesses
 
 logger = logging.getLogger(__name__)
+
+#: Named once so the request claim in the route and the business claim in
+#: ensure_preparation_plan can never drift onto two different operation names -- they are
+#: two layers of protection over one operation, and a diagnostic that said otherwise would
+#: make a duplicate look like two unrelated things.
+PREPARATION_PLAN_OPERATION = "jd.preparation_plan"
 
 
 class JobDescriptionInUseError(Exception):
@@ -639,7 +646,25 @@ def generate_preparation_plan(
         resume_recommendations=resume_recommendations.model_dump(),
         project_connections=[c.model_dump() for c in project_connections],
     )
-    db.add(plan)
+    try:
+        # A savepoint rather than a bare try: an IntegrityError on a plain flush poisons the
+        # whole transaction, and this is the one place uq_job_preparation_plan_per_jd can be
+        # hit. It should be unreachable -- ensure_preparation_plan holds a generation claim for
+        # this (profile, jd) before anything gets here -- which is exactly why it is handled
+        # rather than left to raise: if a future caller ever reaches this function without the
+        # claim, the student gets the plan that does exist instead of a 500, and the constraint
+        # still refuses the duplicate row.
+        with db.begin_nested():
+            db.add(plan)
+            db.flush()
+    except IntegrityError:
+        db.rollback()
+        logger.warning(
+            "A concurrent request already stored a preparation plan for jd_id=%s; "
+            "returning the stored plan and discarding this generation",
+            jd_id,
+        )
+        return get_preparation_plan(db, jd_id, profile_id)
     db.commit()
     db.refresh(plan)
 
@@ -657,6 +682,109 @@ def generate_preparation_plan(
         resume_recommendations=resume_recommendations,
         project_connections=project_connections,
         created_at=plan.created_at,
+    )
+
+
+class _JobDescriptionVanished(Exception):
+    """The job description was deleted while its plan was being generated.
+
+    Raised rather than returned so the generation claim is released instead of being settled as
+    a success with nothing to point at -- the student may well re-parse that posting, and this
+    must not be the reason they cannot.
+    """
+
+
+def ensure_preparation_plan(
+    db: Session,
+    profile_id: int,
+    jd_id: int,
+    ai_provider: AIProvider,
+    company_name: Optional[str],
+    job_title: Optional[str],
+) -> Optional[JobPreparationPlanRead]:
+    """The authoritative preparation plan for this (profile, job description), generating it once.
+
+    The endpoint this sits behind has always meant "make sure this job description has a plan",
+    not "make me another plan": there is no regenerate route, no delete-plan route, and both
+    Android callers either read before they write or run once against a job description they
+    have only just created. Every read path takes the newest row for a (profile, jd) and
+    discards the rest, so a second plan was never something a student could see -- only a
+    duplicate row and a second model call they paid for.
+
+    Nothing enforced that. Two requests are only the same *request* if they carry the same
+    Idempotency-Key, and two that do not -- the analyse flow sending (company, title) and the
+    result screen's 404 recovery sending (null, null), two devices, a timed-out attempt the
+    student reopened from their saved list -- were each entitled to proceed. Both found no plan,
+    both ran the model, both inserted.
+
+    So the claim this takes is keyed on the resource rather than on the request, and the two
+    layers compose: the request claim in the route still collapses a transport replay of one
+    request, and this collapses two different requests that are about one plan.
+
+    Returns None only if the job description does not exist or is not this student's, which is
+    the route's 404 -- deliberately the same answer as before, so a student can never learn
+    anything about another student's job descriptions from this endpoint.
+    """
+    jd = db.get(JobDescription, jd_id)
+    if jd is None or jd.profile_id != profile_id:
+        return None
+
+    # Read before claiming. A job description that already has its plan is the overwhelmingly
+    # common case, and it is answered by one indexed query with no claim, no write and no model
+    # call -- which is what makes the guard cheap enough to sit in front of every request.
+    existing = get_preparation_plan(db, jd_id, profile_id)
+    if existing is not None:
+        return existing
+
+    def perform() -> tuple[JobPreparationPlanRead, int]:
+        plan = generate_preparation_plan(
+            db, profile_id, jd_id, ai_provider, company_name, job_title
+        )
+        if plan is None:
+            raise _JobDescriptionVanished()
+        return plan, plan.id
+
+    try:
+        return idempotency.run_business_once(
+            db,
+            profile_id,
+            operation=PREPARATION_PLAN_OPERATION,
+            # The resource, and only the resource. company_name and job_title decide what the
+            # plan says and are part of the *request* fingerprint; they do not decide which job
+            # description this is. Putting them here would be the whole defect again, with two
+            # labels for one posting splitting into two plans and two model calls.
+            identity={"jd_id": jd_id},
+            perform=perform,
+            # The result id is ignored on purpose: the plan is looked up by its identity,
+            # because the claim that recorded it is swept long before the plan goes away.
+            read_back=lambda _result_id: get_preparation_plan(db, jd_id, profile_id),
+            result_kind="job_preparation_plan",
+        )
+    except _JobDescriptionVanished:
+        return None
+
+
+def read_parsed_jd(
+    db: Session, profile_id: int, jd_id: int
+) -> Optional[JobDescriptionParseResponse]:
+    """A parsed job description as parse_job_description would have returned it, or None.
+
+    Answers a replayed parse from the JD the first attempt stored. Without this a lost response
+    leaves an orphaned JobDescription and its Requirement rows behind, and spends a second
+    model pass on text that was already read.
+    """
+    jd = db.get(JobDescription, jd_id)
+    if jd is None or jd.profile_id != profile_id:
+        return None
+    requirements = db.query(Requirement).filter(Requirement.jd_id == jd.id).all()
+    return JobDescriptionParseResponse(
+        id=jd.id,
+        role_title=jd.role_title,
+        detected_role_id=jd.detected_role_id,
+        location=jd.location,
+        employment_type=jd.employment_type,
+        parsing_confidence=jd.parsing_confidence,
+        requirements=[_requirement_read(r) for r in requirements],
     )
 
 

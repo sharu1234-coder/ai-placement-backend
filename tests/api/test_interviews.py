@@ -316,16 +316,46 @@ def test_submit_audio_answer_rejected_when_already_answered(client, auth_headers
     interview_id = client.post("/interviews", json={"mode": "voice"}, headers=auth_headers).json()["id"]
     question = client.get(f"/interviews/{interview_id}/next-question", headers=auth_headers).json()["question"]
 
-    client.post(
+    first = client.post(
         f"/interviews/{interview_id}/answer/audio",
         data={"interview_question_id": str(question["id"])},
         files={"file": ("answer.m4a", FAKE_M4A_BYTES, "audio/mp4")},
         headers=auth_headers,
     )
-    resp = client.post(
+    assert first.status_code == 200
+
+    # Phase 31: a resent recording is a replay of an answer that already committed, and the
+    # student is handed the stored transcript instead of a 409 they would be shown as a failure
+    # -- which mattered most here, because the voice screen deletes the local recording after the
+    # upload and its error state never returns to READY_TO_RECORD.
+    replay = client.post(
         f"/interviews/{interview_id}/answer/audio",
         data={"interview_question_id": str(question["id"])},
         files={"file": ("answer2.m4a", FAKE_M4A_BYTES, "audio/mp4")},
+        headers=auth_headers,
+    )
+    assert replay.status_code == 200
+    assert replay.json() == first.json()
+
+
+def test_submit_audio_answer_rejected_when_the_question_was_answered_by_text(
+    client, auth_headers, role_selected, use_fake_ai
+):
+    """The "already answered" refusal this file has always covered, through the case that is
+    still unambiguously a conflict: a typed answer is not something an audio upload can be a
+    replay of, so the mode mismatch keeps its 409."""
+    interview_id = client.post("/interviews", json={"mode": "voice"}, headers=auth_headers).json()["id"]
+    question = client.get(f"/interviews/{interview_id}/next-question", headers=auth_headers).json()["question"]
+
+    assert client.post(
+        f"/interviews/{interview_id}/answer",
+        json={"interview_question_id": question["id"], "answer_text": "Typed answer."},
+        headers=auth_headers,
+    ).status_code == 200
+    resp = client.post(
+        f"/interviews/{interview_id}/answer/audio",
+        data={"interview_question_id": str(question["id"])},
+        files={"file": ("answer.m4a", FAKE_M4A_BYTES, "audio/mp4")},
         headers=auth_headers,
     )
     assert resp.status_code == 409

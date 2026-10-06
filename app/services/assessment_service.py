@@ -73,6 +73,27 @@ def _build_skill_matrix(
     return matrix, source
 
 
+def read_blueprint(
+    db: Session, profile_id: int, blueprint_id: int
+) -> Optional[AssessmentBlueprintRead]:
+    """This student's blueprint as generate_blueprint would have returned it, or None.
+
+    Answers a replayed create from the blueprint the first attempt built, so a lost response
+    does not leave an orphaned one behind. Sections are rebuilt from the stored JSON, which is
+    the same list the original response carried. Ownership is re-checked here.
+    """
+    blueprint = db.get(AssessmentBlueprint, blueprint_id)
+    if blueprint is None or blueprint.profile_id != profile_id:
+        return None
+    return AssessmentBlueprintRead(
+        id=blueprint.id,
+        role_id=blueprint.role_id,
+        jd_id=blueprint.jd_id,
+        source=blueprint.source,
+        sections=[BlueprintSection(**s) for s in blueprint.sections],
+    )
+
+
 def generate_blueprint(
     db: Session,
     profile_id: int,

@@ -1,7 +1,7 @@
 import datetime
 from typing import Optional
 
-from sqlalchemy import JSON, DateTime, ForeignKey, String
+from sqlalchemy import JSON, DateTime, ForeignKey, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database.base import Base
@@ -33,4 +33,18 @@ class JobPreparationPlan(Base):
     project_connections: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime, nullable=False, default=lambda: datetime.datetime.now(datetime.timezone.utc)
+    )
+
+    __table_args__ = (
+        # One authoritative plan per student per job description -- the business invariant the
+        # endpoint had always behaved as if it had, and nothing enforced. Both read paths take
+        # the newest row for a (profile, jd) and discard any other, so a second row was never
+        # visible to the student; it was a duplicate the database kept and an AI call they paid
+        # for. Two requests that both find no plan now collide here instead of both inserting.
+        #
+        # Enforced in addition to, not instead of, the generation claim in idempotency.py. The
+        # claim is what stops the second expensive generation from starting; this is what makes
+        # the invariant permanent, because settled claims are swept after RETENTION while a plan
+        # is kept forever.
+        UniqueConstraint("profile_id", "jd_id", name="uq_job_preparation_plan_per_jd"),
     )

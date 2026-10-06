@@ -1,12 +1,14 @@
 import logging
+from typing import Optional
 
-from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile, status
+from fastapi import APIRouter, Depends, File, Header, HTTPException, Request, UploadFile, status
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
 from app.ai.provider import AIGenerationError, AIProvider, get_ai_provider
 from app.api.ai_errors import ai_unavailable
 from app.api.deps import get_current_user, get_db
+from app.api.idempotency_errors import idempotency_http_error
 from app.api.upload_utils import read_upload_limited
 from app.core.rate_limit import limiter
 from app.models.user import User
@@ -19,16 +21,19 @@ from app.schemas.job import (
     ParseJDRequest,
     RequirementRead,
 )
+from app.services import idempotency
 from app.services.jd_service import (
+    PREPARATION_PLAN_OPERATION,
     JobDescriptionInUseError,
     delete_job_description,
-    generate_preparation_plan,
+    ensure_preparation_plan,
     get_preparation_plan,
     get_requirements,
     list_job_descriptions,
     parse_job_description,
+    read_parsed_jd,
 )
-from app.services.matching_service import match_resume_to_job
+from app.services.matching_service import match_resume_to_job, read_match
 from app.services.profile_service import get_or_create_profile
 from app.services.resume_service import ResumeProcessingError, extract_text_from_pdf
 from app.services.skill_matching import NoResumeAnalysisError
@@ -74,22 +79,43 @@ def list_jobs(
 def create_job_description(
     request: Request,
     payload: ParseJDRequest,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
     ai_provider: AIProvider = Depends(get_ai_provider),
 ) -> JobDescriptionParseResponse:
     profile = get_or_create_profile(db, current_user)
+
+    def perform() -> tuple[JobDescriptionParseResponse, int]:
+        try:
+            parsed = parse_job_description(db, profile.id, payload.raw_text, ai_provider)
+        # JD parsing is one of the few AI paths with no template fallback in its service (there
+        # is nothing sensible to invent from an unparsed job description), so AIGenerationError
+        # reaches the route. Without this it escaped as an unhandled 500, which is the wrong
+        # answer twice over: the client cannot distinguish "provider is down, retry" from "the
+        # server is broken", and every provider blip logged a full stack trace for an expected
+        # condition. Found by driving every AI-taking route with a failing provider; this was
+        # the only one of the twenty still returning 500.
+        except AIGenerationError as exc:
+            raise ai_unavailable(exc, logger, "jobs")
+        return parsed, parsed.id
+
     try:
-        return parse_job_description(db, profile.id, payload.raw_text, ai_provider)
-    # JD parsing is one of the few AI paths with no template fallback in its service (there is
-    # nothing sensible to invent from an unparsed job description), so AIGenerationError
-    # reaches the route. Without this it escaped as an unhandled 500, which is the wrong
-    # answer twice over: the client cannot distinguish "provider is down, retry" from "the
-    # server is broken", and every provider blip logged a full stack trace for an expected
-    # condition. Found by driving every AI-taking route with a failing provider; this was the
-    # only one of the twenty still returning 500.
-    except AIGenerationError as exc:
-        raise ai_unavailable(exc, logger, "jobs")
+        # A parse writes a JobDescription plus its Requirement rows and spends a model pass on
+        # the text, so a replay leaves an orphaned JD behind and pays twice to read the same
+        # posting. Fingerprinted on the text itself, not on a client-chosen title.
+        return idempotency.run_once(
+            db,
+            profile.id,
+            operation="jd.parse",
+            idempotency_key=idempotency_key,
+            params={"raw_text": idempotency.body_digest(payload.raw_text.encode("utf-8"))},
+            perform=perform,
+            read_back=lambda rid: read_parsed_jd(db, profile.id, rid),
+            result_kind="job_description",
+        )
+    except idempotency.IdempotencyError as exc:
+        raise idempotency_http_error(exc, logger, "jd.parse")
 
 
 @router.post("/upload", response_model=JobDescriptionParseResponse, status_code=status.HTTP_201_CREATED)
@@ -97,6 +123,7 @@ def create_job_description(
 async def create_job_description_from_pdf(
     request: Request,
     file: UploadFile = File(...),
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
     ai_provider: AIProvider = Depends(get_ai_provider),
@@ -154,12 +181,32 @@ async def create_job_description_from_pdf(
         )
 
     profile = get_or_create_profile(db, current_user)
+
+    async def perform() -> tuple[JobDescriptionParseResponse, int]:
+        try:
+            parsed = await run_in_threadpool(
+                parse_job_description, db, profile.id, raw_text, ai_provider, "pdf_upload"
+            )
+        except AIGenerationError as exc:
+            raise ai_unavailable(exc, logger, "jobs")
+        return parsed, parsed.id
+
     try:
-        return await run_in_threadpool(
-            parse_job_description, db, profile.id, raw_text, ai_provider, "pdf_upload"
+        # Fingerprinted on the extracted text rather than the PDF bytes, deliberately: the same
+        # posting re-exported is the same analysis, and the text is what the parser actually
+        # receives. A digest either way -- the document itself never reaches the claims table.
+        return await idempotency.run_once_async(
+            db,
+            profile.id,
+            operation="jd.parse_pdf",
+            idempotency_key=idempotency_key,
+            params={"raw_text": idempotency.body_digest(raw_text.encode("utf-8"))},
+            perform=perform,
+            read_back=lambda rid: read_parsed_jd(db, profile.id, rid),
+            result_kind="job_description",
         )
-    except AIGenerationError as exc:
-        raise ai_unavailable(exc, logger, "jobs")
+    except idempotency.IdempotencyError as exc:
+        raise idempotency_http_error(exc, logger, "jd.parse_pdf")
 
 
 @router.get("/{jd_id}/requirements", response_model=list[RequirementRead])
@@ -178,18 +225,37 @@ def get_job_requirements(
 @router.post("/{jd_id}/match", response_model=JobMatchRead)
 def match_job(
     jd_id: int,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> JobMatchRead:
     profile = get_or_create_profile(db, current_user)
-    try:
-        result = match_resume_to_job(db, jd_id, profile.id)
-    except NoResumeAnalysisError as exc:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
 
-    if result is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job description not found")
-    return result
+    def perform() -> tuple[JobMatchRead, int]:
+        try:
+            result = match_resume_to_job(db, jd_id, profile.id)
+        except NoResumeAnalysisError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+        if result is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                                detail="Job description not found")
+        return result, result.id
+
+    try:
+        # Deterministic, so a re-run would score the same -- but it inserts a JobMatch and a
+        # fresh set of SkillGap rows each time, and those accumulate.
+        return idempotency.run_once(
+            db,
+            profile.id,
+            operation="jd.match",
+            idempotency_key=idempotency_key,
+            params={"jd_id": jd_id},
+            perform=perform,
+            read_back=lambda rid: read_match(db, profile.id, rid),
+            result_kind="job_match",
+        )
+    except idempotency.IdempotencyError as exc:
+        raise idempotency_http_error(exc, logger, "jd.match")
 
 
 @router.post("/{jd_id}/preparation-plan", response_model=JobPreparationPlanRead, status_code=status.HTTP_201_CREATED)
@@ -198,6 +264,7 @@ def create_preparation_plan(
     request: Request,
     jd_id: int,
     payload: GeneratePreparationPlanRequest,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
     ai_provider: AIProvider = Depends(get_ai_provider),
@@ -208,12 +275,40 @@ def create_preparation_plan(
     # derived from the job description alone. The service now returns a plan that names what it
     # could not assess (resume_recommendations.status == "no_resume") instead of refusing.
     # POST /{jd_id}/match above still 422s, because matching genuinely has nothing to match.
-    result = generate_preparation_plan(
-        db, profile.id, jd_id, ai_provider, payload.company_name, payload.job_title
-    )
-    if result is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job description not found")
-    return result
+    def perform() -> tuple[JobPreparationPlanRead, int]:
+        # ensure_preparation_plan, not generate_preparation_plan. The claim taken around this
+        # call is keyed on the client's Idempotency-Key and so only ever sees one request's own
+        # retransmissions; the business guard inside it is keyed on (profile, job description)
+        # and is what stops two *different* requests from both paying for a model call to build
+        # the one plan. Both layers are needed and neither replaces the other.
+        result = ensure_preparation_plan(
+            db, profile.id, jd_id, ai_provider, payload.company_name, payload.job_title
+        )
+        if result is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                                detail="Job description not found")
+        return result, result.id
+
+    try:
+        # The client already reads before it writes here (GET first, POST only on a 404), which
+        # covers the ordinary case. This covers the one it cannot see: the plan committed and
+        # the reply was lost, where a replay would spend a second model pass on the same JD.
+        return idempotency.run_once(
+            db,
+            profile.id,
+            operation=PREPARATION_PLAN_OPERATION,
+            idempotency_key=idempotency_key,
+            params={
+                "jd_id": jd_id,
+                "company_name": payload.company_name,
+                "job_title": payload.job_title,
+            },
+            perform=perform,
+            read_back=lambda _rid: get_preparation_plan(db, jd_id, profile.id),
+            result_kind="job_preparation_plan",
+        )
+    except idempotency.IdempotencyError as exc:
+        raise idempotency_http_error(exc, logger, PREPARATION_PLAN_OPERATION)
 
 
 @router.get("/{jd_id}/preparation-plan", response_model=JobPreparationPlanRead)

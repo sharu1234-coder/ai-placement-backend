@@ -148,6 +148,20 @@ def generate_roadmap(
     return _roadmap_read(db, roadmap)
 
 
+def read_roadmap(db: Session, profile_id: int, roadmap_id: int) -> Optional[RoadmapRead]:
+    """A specific roadmap of this student's, or None.
+
+    Answers a replayed generate from the roadmap the first attempt produced, so a lost response
+    costs neither a second roadmap nor a second AI generation -- which for this endpoint is
+    minutes of inference and one of the student's hourly allowance. Ownership is re-checked
+    here rather than inferred from the claim.
+    """
+    roadmap = db.get(Roadmap, roadmap_id)
+    if roadmap is None or roadmap.profile_id != profile_id:
+        return None
+    return _roadmap_read(db, roadmap)
+
+
 def get_current_roadmap(db: Session, profile_id: int, jd_id: Optional[int]) -> Optional[RoadmapRead]:
     roadmap = (
         db.query(Roadmap)

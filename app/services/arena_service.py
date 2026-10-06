@@ -90,6 +90,29 @@ def list_challenges_for_profile(db: Session, profile_id: int) -> List[ArenaChall
     return reads
 
 
+def read_attempt_start(
+    db: Session, profile_id: int, arena_attempt_id: int
+) -> Optional[ArenaAttemptStartRead]:
+    """A started attempt as start_attempt would have returned it, or None.
+
+    Worth protecting more than most: start_attempt writes three rows -- a blueprint, an
+    assessment and the attempt -- so a replay costs all three plus a second timed challenge
+    the student never began.
+    """
+    attempt = db.get(ArenaAttempt, arena_attempt_id)
+    if attempt is None or attempt.profile_id != profile_id:
+        return None
+    challenge = get_challenge(attempt.challenge_key)
+    if challenge is None:
+        return None
+    return ArenaAttemptStartRead(
+        arena_attempt_id=attempt.id,
+        assessment_id=attempt.assessment_id,
+        challenge_key=attempt.challenge_key,
+        time_limit_seconds=challenge.time_limit_seconds,
+    )
+
+
 def start_attempt(db: Session, profile_id: int, challenge_key: str) -> ArenaAttemptStartRead:
     challenge = get_challenge(challenge_key)
     if challenge is None:

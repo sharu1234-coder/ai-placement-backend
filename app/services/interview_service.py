@@ -113,10 +113,51 @@ def _question_read(question: InterviewQuestion) -> InterviewQuestionRead:
     )
 
 
+def _existing_answer(db: Session, interview_question_id: int) -> Optional[InterviewAnswer]:
+    return (
+        db.query(InterviewAnswer)
+        .filter(InterviewAnswer.interview_question_id == interview_question_id)
+        .first()
+    )
+
+
+def _is_replay_of(existing: InterviewAnswer, answer_text: str, *, transcribed: bool) -> bool:
+    """Whether `existing` is the stored result of *this* request rather than a different answer.
+
+    Phase 31. A question takes one answer and the first one is final, so a second request for an
+    already-answered question is one of two things, and they need opposite answers: a transport
+    resend of the answer that was already stored (the response was lost, and the student is owed
+    the result they earned), or an attempt to answer differently (which the product refuses).
+
+    The mode has to match before anything else. A text submission is not a resend of an audio
+    answer and vice versa -- those are different operations even for the same question, so they
+    stay a conflict.
+
+    Within the text mode the submitted text decides it, which is exact: OkHttp resends the same
+    body byte for byte, so a resend always matches and an edited answer never does.
+
+    Audio has no equivalent comparison and deliberately cannot get one: the recording is not
+    persisted (see submit_audio_answer -- "minimize stored voice data"), so the only thing the
+    server holds is a transcript, and producing one for the second request is exactly the
+    expensive duplicate work this is meant to avoid. So for audio the identity is "this question's
+    stored answer also came from audio", which is weaker than the text case and is the honest
+    limit of what existing state can prove. It is sound for the client that exists: the voice
+    screen moves to the next question on success and lands in a terminal error state otherwise,
+    so it never re-records an already-answered question. A different recording for the same
+    question is not reachable from the app -- and was refused outright before this phase, so no
+    behaviour that previously worked depends on it.
+    """
+    if existing.transcribed != transcribed:
+        return False
+    if transcribed:
+        return True
+    return existing.answer_text == answer_text
+
+
 def _insert_answer_once(
     db: Session, interview_question_id: int, answer_text: str, *, transcribed: bool
-) -> None:
-    """Persist the one answer this question is allowed, or raise if it already has one.
+) -> InterviewAnswer:
+    """Persist the one answer this question is allowed, or raise if it already has a different one.
 
     The uniqueness of an answer is enforced by the database, not by the read above the call
     site: InterviewAnswer.interview_question_id carries a unique index, and that index -- not
@@ -139,16 +180,35 @@ def _insert_answer_once(
     failure into a success -- the loser is told its answer was not taken, rather than being
     left believing it was stored.
     """
-    db.add(
-        InterviewAnswer(
-            interview_question_id=interview_question_id, answer_text=answer_text, transcribed=transcribed
-        )
+    answer = InterviewAnswer(
+        interview_question_id=interview_question_id, answer_text=answer_text, transcribed=transcribed
     )
+    db.add(answer)
     try:
         db.commit()
     except IntegrityError as exc:
         db.rollback()
+        # Lost the insert race. The winner's row is this question's one answer; if it is the same
+        # logical operation as this request (Phase 31, see _is_replay_of) the caller is handed it
+        # rather than an error, because both requests asked for the same thing and it is done.
+        existing = _existing_answer(db, interview_question_id)
+        if existing is not None and _is_replay_of(existing, answer_text, transcribed=transcribed):
+            return existing
         raise InterviewQuestionNotPendingError("This question has already been answered") from exc
+    return answer
+
+
+def read_interview(db: Session, profile_id: int, interview_id: int) -> Optional[InterviewRead]:
+    """This student's interview as start_interview would have returned it, or None.
+
+    Answers a replayed start from the interview the first attempt created, so a lost response
+    does not leave a second abandoned session in the student's history. Ownership is re-checked
+    here rather than inferred from the claim.
+    """
+    interview = db.get(Interview, interview_id)
+    if interview is None or interview.profile_id != profile_id:
+        return None
+    return _interview_read(interview)
 
 
 def start_interview(
@@ -442,17 +502,21 @@ def submit_answer(
     if question is None or question.interview_id != interview_id:
         raise InterviewNotFoundError("Interview question not found")
 
-    existing = (
-        db.query(InterviewAnswer)
-        .filter(InterviewAnswer.interview_question_id == interview_question_id)
-        .first()
-    )
+    existing = _existing_answer(db, interview_question_id)
     if existing is not None:
+        # Phase 31: a resend of the answer that was already stored gets that answer back, not a
+        # 409 for work that succeeded. Anything else about this question is still a conflict.
+        if _is_replay_of(existing, answer_text, transcribed=False):
+            return InterviewAnswerRead(
+                interview_question_id=interview_question_id, answer_text=existing.answer_text
+            )
         raise InterviewQuestionNotPendingError("This question has already been answered")
 
-    _insert_answer_once(db, interview_question_id, answer_text, transcribed=False)
+    stored = _insert_answer_once(db, interview_question_id, answer_text, transcribed=False)
 
-    return InterviewAnswerRead(interview_question_id=interview_question_id, answer_text=answer_text)
+    return InterviewAnswerRead(
+        interview_question_id=interview_question_id, answer_text=stored.answer_text
+    )
 
 
 def submit_audio_answer(
@@ -469,12 +533,16 @@ def submit_audio_answer(
     if question is None or question.interview_id != interview_id:
         raise InterviewNotFoundError("Interview question not found")
 
-    existing = (
-        db.query(InterviewAnswer)
-        .filter(InterviewAnswer.interview_question_id == interview_question_id)
-        .first()
-    )
+    existing = _existing_answer(db, interview_question_id)
     if existing is not None:
+        # Phase 31, and the reason this check stays *above* the transcription below rather than
+        # being folded into the write: a resend is answered from the stored transcript, so it
+        # costs zero model work. That was already true of the 409 this replaces -- the point is
+        # not to make it cheaper but to keep it cheap while making it a success.
+        if _is_replay_of(existing, answer_text="", transcribed=True):
+            return InterviewAnswerRead(
+                interview_question_id=interview_question_id, answer_text=existing.answer_text
+            )
         raise InterviewQuestionNotPendingError("This question has already been answered")
 
     # Outside any transaction (F12-07). Transcription is a local Whisper pass on CPU, seconds of
@@ -492,9 +560,11 @@ def submit_audio_answer(
     # write, so a concurrent duplicate paid for a Whisper pass and then died on the unique
     # index anyway. It still pays for the transcription, but now it loses cleanly with a 409
     # instead of a 500.
-    _insert_answer_once(db, interview_question_id, answer_text, transcribed=True)
+    stored = _insert_answer_once(db, interview_question_id, answer_text, transcribed=True)
 
-    return InterviewAnswerRead(interview_question_id=interview_question_id, answer_text=answer_text)
+    return InterviewAnswerRead(
+        interview_question_id=interview_question_id, answer_text=stored.answer_text
+    )
 
 
 def synthesize_question_audio(

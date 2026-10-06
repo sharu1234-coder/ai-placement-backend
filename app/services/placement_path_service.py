@@ -2,7 +2,8 @@ import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from sqlalchemy import func
+from sqlalchemy import func, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.ai.input_guard import render_prompt
@@ -22,6 +23,7 @@ from app.schemas.placement_path import (
     PlacementPathStageRead,
     PlacementPathTopicRead,
 )
+from app.services import idempotency
 from app.services import placement_path_rules as rules
 from app.services.ai_boundary import outside_transaction
 from app.services.skill_matching import latest_resume_skills
@@ -44,6 +46,12 @@ TOPIC_PASS_THRESHOLD = 0.7
 PRACTICE_QUESTION_COUNT = 3
 
 _BLUEPRINT_SOURCE = "placement_path"
+
+#: Named once so the request claim in the route and the business claim in ensure_placement_path
+#: cannot drift onto two different operation names. They are two layers of protection over one
+#: operation, and a diagnostic that said otherwise would make a duplicate look like two
+#: unrelated things.
+PLACEMENT_PATH_OPERATION = "placement_path.generate"
 
 
 class NoPlacementRelevantSkillsError(Exception):
@@ -158,16 +166,42 @@ def generate_placement_path(db: Session, profile_id: int, ai_provider: AIProvide
         )
         carry_forward = {(t.track_key, t.topic_key): t for t in old_topics}
         existing_active.status = "superseded"
+        # Flushed here, before the INSERT below, and not left to the same flush. SQLAlchemy's
+        # unit of work emits INSERTs ahead of UPDATEs, so a single flush would offer the database
+        # a second active row while the first was still active -- which
+        # uq_placement_path_one_active_per_profile correctly refuses. The constraint is what
+        # turned this from an invisible ordering detail into a required one.
+        db.flush()
 
     path = PlacementPath(
         profile_id=profile_id,
         status="active",
         source_resume_id=_latest_completed_resume_id(db, profile_id),
     )
-    db.add(path)
-    # flush, not commit: superseding the old path, creating the new one and writing its topics are
-    # one unit of work.
-    db.flush()
+    try:
+        # A savepoint rather than a bare try: an IntegrityError on a plain flush poisons the whole
+        # transaction. This should be unreachable -- ensure_placement_path holds a generation
+        # claim for this profile before anything gets here -- which is exactly why it is handled
+        # rather than left to raise. If a future caller ever reaches this function without the
+        # claim, the student is shown the path that does exist instead of a 500.
+        with db.begin_nested():
+            db.add(path)
+            db.flush()
+    except IntegrityError:
+        # A full rollback, not just the savepoint. The savepoint alone would leave the supersede
+        # above committed-in-transaction, and the student would end up with no active path at all
+        # -- strictly worse than the duplicate this is refusing.
+        db.rollback()
+        logger.warning(
+            "A concurrent generation already holds the active placement path for profile_id=%s; "
+            "returning the stored path and discarding this generation", profile_id,
+        )
+        winner = get_current_placement_path(db, profile_id)
+        if winner is None:
+            # Nothing active after all, so the rejection is not the race this handles. Say so
+            # rather than return a path that does not exist.
+            raise
+        return winner
 
     for spec in specs:
         carried = carry_forward.get((spec.track_key, spec.topic_key))
@@ -191,10 +225,77 @@ def generate_placement_path(db: Session, profile_id: int, ai_provider: AIProvide
     return _path_read(db, path, profile_id)
 
 
+def ensure_placement_path(
+    db: Session, profile_id: int, ai_provider: AIProvider
+) -> PlacementPathRead:
+    """Generate this student's placement path, collapsing requests that overlap one generation.
+
+    Deliberately *not* shaped like ensure_preparation_plan. That one reads first and returns the
+    existing resource, because a job description has one plan and every caller means "make sure
+    it exists". Here generation is the point: this endpoint is documented as "creates the
+    student's first placement path, or regenerates it ... the same operation either way", and
+    both Android callers mean it -- onboarding generates the first one, and the Placement Path
+    screen's button is an explicit regenerate. A read-first fast path would therefore not be an
+    optimisation, it would remove the feature.
+
+    So what the claim collapses is *overlap*, not repetition. Two requests that are in flight at
+    the same time are one generation; a request that arrives after the previous one finished is a
+    new one and is allowed to supersede. idempotency.REGENERATE is what encodes that, and it
+    decides it from whether this request waited rather than from a clock.
+
+    The claim is keyed on the profile, which is the whole business identity: a placement path is
+    built from the student's resume skills and is tied to no role, goal, job or role family --
+    generate_placement_path takes no target, and the table carries none.
+    """
+    def perform() -> tuple[PlacementPathRead, int]:
+        created = generate_placement_path(db, profile_id, ai_provider)
+        return created, created.id
+
+    return idempotency.run_business_once(
+        db,
+        profile_id,
+        operation=PLACEMENT_PATH_OPERATION,
+        identity={"profile_id": profile_id},
+        perform=perform,
+        # By result id, not by "whatever is active now". A waiter is owed the row produced by the
+        # generation it watched, and reading the active path instead would hand it whatever a
+        # later regeneration had since put there.
+        read_back=lambda result_id: (
+            read_placement_path(db, profile_id, result_id) if result_id is not None else None
+        ),
+        result_kind="placement_path",
+        on_settled=idempotency.REGENERATE,
+    )
+
+
+def read_placement_path(
+    db: Session, profile_id: int, path_id: int
+) -> Optional[PlacementPathRead]:
+    """A specific placement path of this student's, or None.
+
+    Answers a replayed generate from the path the first attempt built. Worth the care: a
+    generation was measured at ~163s against a local model, so a duplicate is both a superseded
+    path and the longest wasted AI call in the app.
+    """
+    path = db.get(PlacementPath, path_id)
+    if path is None or path.profile_id != profile_id:
+        return None
+    return _path_read(db, path, profile_id)
+
+
 def get_current_placement_path(db: Session, profile_id: int) -> Optional[PlacementPathRead]:
+    """The student's one active path.
+
+    Ordered, although the partial unique index now means there is at most one row to order. The
+    unordered .first() this replaces was the reason a duplicate was not merely wasteful but
+    arbitrary: with two active rows the database chose which roadmap the student opened, and it
+    could choose differently on the next request. Newest-first is also what the migration keeps,
+    so a database that had duplicates before the constraint reads the same way after it.
+    """
     path = (
         db.query(PlacementPath)
         .filter(PlacementPath.profile_id == profile_id, PlacementPath.status == "active")
+        .order_by(PlacementPath.id.desc())
         .first()
     )
     if path is None:
@@ -287,10 +388,43 @@ def get_or_create_practice_blueprint(db: Session, profile_id: int, topic_id: int
         sections=[section.model_dump()],
     )
     db.add(blueprint)
-    db.commit()
-    db.refresh(blueprint)
+    # Flushed, not committed: the insert and the link below are one transaction, so a request
+    # that loses the link leaves nothing behind at all. Committing here first (which is what this
+    # did) made the row durable before anything pointed at it, and the window between the two
+    # commits is where an overlapping replay landed -- see the conditional UPDATE's comment.
+    db.flush()
 
-    topic.practice_blueprint_id = blueprint.id
+    # Atomic conditional UPDATE, not "load, mutate, commit" -- the same primitive, for the same
+    # class of race, as mission_service.complete and subscription_service._activate_paid.
+    #
+    # The race is reachable from one tap. OkHttp re-sends a request whose connection failed after
+    # it was written, because it cannot tell that from a connection that was already dead
+    # (NonResentRequests.kt in the Android app records why that retry has to stay), so the resend
+    # can overlap the original. Both requests then read practice_blueprint_id as NULL, both build
+    # a blueprint, and the second link overwrites the first -- leaving a blueprint no topic points
+    # at, which one of the two requests has already sent the student off to start an assessment
+    # against. Finishing that assessment can never mark the topic practised, because the
+    # completion path reads the topic's link.
+    #
+    # Career Path's get_or_create_practice_blueprint carries the same guard. It is deliberately
+    # its own copy, not a shared helper: Career Path must not depend on Roadmap's code, which is
+    # why these two functions were independent to begin with.
+    linked = db.execute(
+        update(PlacementPathTopic)
+        .where(
+            PlacementPathTopic.id == topic.id,
+            PlacementPathTopic.practice_blueprint_id.is_(None),
+        )
+        .values(practice_blueprint_id=blueprint.id)
+    ).rowcount
+    if not linked:
+        # An overlapping request linked its own blueprint first. Roll back this one -- it is
+        # unreachable by construction -- and hand back the blueprint the topic actually points
+        # at, so both requests start the same assessment.
+        db.rollback()
+        db.refresh(topic)
+        return topic.practice_blueprint_id
+
     if topic.status == "not_started":
         topic.status = "in_progress"
     db.commit()

@@ -1,10 +1,12 @@
+import logging
 from typing import List, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.ai.provider import AIProvider, get_ai_provider
 from app.api.deps import get_current_user, get_db
+from app.api.idempotency_errors import idempotency_http_error
 from app.core.rate_limit import limiter
 from app.models.user import User
 from app.schemas.career_path import (
@@ -18,9 +20,12 @@ from app.schemas.career_path import (
     UpdateProjectRequest,
     UpdateSkillItemRequest,
 )
+from app.services import idempotency
 from app.services.career_path import service as career_path_service
 from app.services.career_path.role_catalog import CATEGORY_LIST, ROLE_FAMILIES
 from app.services.profile_service import get_or_create_profile
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/career-path", tags=["career-path"])
 
@@ -151,6 +156,7 @@ def set_current(
 def refresh(
     request: Request,
     path_id: int,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
     ai_provider: AIProvider = Depends(get_ai_provider),
@@ -158,10 +164,30 @@ def refresh(
     """Regenerates this path's content in place, carrying forward completion by stable key.
     Never changes which path is primary."""
     profile = get_or_create_profile(db, current_user)
+
+    def perform() -> tuple[CareerPathRead, int]:
+        try:
+            refreshed = career_path_service.refresh(db, profile.id, path_id, ai_provider)
+        except career_path_service.CareerPathNotFoundError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+        return refreshed, refreshed.id
+
     try:
-        return career_path_service.refresh(db, profile.id, path_id, ai_provider)
-    except career_path_service.CareerPathNotFoundError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+        # The one Career Path flow that always re-calls the model (force_regenerate=True), so a
+        # replay is a second full role-definition and explanation pass. Phase 14's generation
+        # path is untouched -- this is the refresh of an existing path, not select_role().
+        return idempotency.run_once(
+            db,
+            profile.id,
+            operation="career_path.refresh",
+            idempotency_key=idempotency_key,
+            params={"path_id": path_id},
+            perform=perform,
+            read_back=lambda rid: career_path_service.read_path(db, profile.id, rid),
+            result_kind="career_path",
+        )
+    except idempotency.IdempotencyError as exc:
+        raise idempotency_http_error(exc, logger, "career_path.refresh")
 
 
 @router.get("/{path_id}/skills", response_model=List[SkillItemRead])
@@ -258,3 +284,9 @@ def apply_jd(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
     except career_path_service.JobDescriptionNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+    except idempotency.IdempotencyError as exc:
+        # The merge is claimed per (path, job description) -- see apply_jd's docstring. The claim
+        # normally resolves by waiting, because the merge is a handful of queries with no model
+        # call in it, but a request that waits out the deadline must still get the 409 every other
+        # claimed route answers with rather than an uncaught 500.
+        raise idempotency_http_error(exc, logger, "career_path.apply_jd")

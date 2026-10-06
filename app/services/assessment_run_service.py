@@ -104,6 +104,22 @@ def _get_owned_assessment(db: Session, assessment_id: int, profile_id: int) -> A
     return assessment
 
 
+def read_assessment(db: Session, profile_id: int, assessment_id: int) -> Optional[AssessmentRead]:
+    """This student's assessment as start_assessment would have returned it, or None.
+
+    Used to answer a replayed start request from the row the first attempt created, rather than
+    from a cached response -- so the status is whatever it is *now*, and an assessment the
+    student has since deleted reports as gone instead of being invented. Ownership is checked
+    here and not assumed from the claim, so a result id can never be read across profiles.
+    """
+    assessment = db.get(Assessment, assessment_id)
+    if assessment is None or assessment.profile_id != profile_id:
+        return None
+    return AssessmentRead(
+        id=assessment.id, blueprint_id=assessment.blueprint_id, status=assessment.status
+    )
+
+
 def start_assessment(db: Session, profile_id: int, blueprint_id: int) -> AssessmentRead:
     blueprint = db.get(AssessmentBlueprint, blueprint_id)
     if blueprint is None or blueprint.profile_id != profile_id:
@@ -247,6 +263,48 @@ def get_next_question(
     return NextQuestionResponse(completed=False, question=_question_read(question))
 
 
+def _stored_answer_result(
+    db: Session, assessment_id: int, question_id: int, student_answer: str
+) -> Optional[AnswerResult]:
+    """This question's already-stored result, but only when the request is a resend of it.
+
+    Phase 31. The whole response is reconstructible from durable state -- `is_correct` and `score`
+    are columns on the attempt and `explanation` belongs to the question -- so a resend can be
+    answered without regrading anything and without a second row.
+
+    `student_answer` is what decides identity, and it is exact: OkHttp resends the same body byte
+    for byte, so a resend always matches, while an attempt to answer differently never does and
+    keeps getting the conflict it got before. `time_taken_seconds` is deliberately not compared --
+    it is metadata about the attempt, not what the mutation stored a judgement of, and a request
+    that differs only there is still the same answer to the same question.
+
+    Scoped to this assessment and question, and only ever reached after the caller has checked
+    that this assessment belongs to this profile, so a matching id alone can never surface
+    somebody else's answer.
+    """
+    answered = (
+        db.query(QuestionAttempt)
+        .populate_existing()
+        .filter(
+            QuestionAttempt.assessment_id == assessment_id,
+            QuestionAttempt.question_id == question_id,
+            QuestionAttempt.student_answer.isnot(None),
+        )
+        .first()
+    )
+    if answered is None or answered.student_answer != student_answer:
+        return None
+    question = db.get(Question, question_id)
+    if question is None:
+        return None
+    return AnswerResult(
+        question_id=question_id,
+        is_correct=bool(answered.is_correct),
+        score=answered.score,
+        explanation=question.explanation,
+    )
+
+
 def submit_answer(
     db: Session,
     profile_id: int,
@@ -268,6 +326,13 @@ def submit_answer(
         .first()
     )
     if attempt is None:
+        # Phase 31: nothing is pending, so either this answer was already stored and the response
+        # was lost, or the student is trying to answer a question they have already answered. The
+        # first is owed its result; the second is still refused. Checked here, before any grading,
+        # so a resend costs no model work.
+        replayed = _stored_answer_result(db, assessment_id, question_id, student_answer)
+        if replayed is not None:
+            return replayed
         raise QuestionNotPendingError("No pending question with this id for this assessment")
 
     question = db.get(Question, question_id)
@@ -352,6 +417,13 @@ def submit_answer(
     )
     db.commit()
     if not result.rowcount:
+        # Lost the atomic UPDATE race. The winner's grade is this question's grade, and the
+        # loser's -- however it was computed -- is discarded, exactly as before. What changed in
+        # Phase 31 is the answer given back when the two requests asked the same thing: the
+        # winner's stored result rather than a 409.
+        replayed = _stored_answer_result(db, assessment_id, question_id, student_answer)
+        if replayed is not None:
+            return replayed
         raise QuestionNotPendingError("No pending question with this id for this assessment")
 
     return AnswerResult(

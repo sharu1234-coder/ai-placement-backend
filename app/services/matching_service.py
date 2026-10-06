@@ -13,6 +13,30 @@ _REQUIRED_POINTS = 2
 _PREFERRED_POINTS = 1
 
 
+def read_match(db: Session, profile_id: int, match_id: int) -> Optional[JobMatchRead]:
+    """A stored match as match_resume_to_job would have returned it, or None.
+
+    Answers a replayed match from the row the first attempt scored. Matching is deterministic,
+    so re-running it would produce the same numbers -- but it would also insert a second
+    JobMatch and a second set of SkillGap rows, which is what this prevents.
+    """
+    match = db.get(JobMatch, match_id)
+    if match is None or match.profile_id != profile_id:
+        return None
+    gaps = db.query(SkillGap).filter(SkillGap.jd_id == match.jd_id).all()
+    return JobMatchRead(
+        id=match.id,
+        matching_skills=match.matching_skills,
+        missing_skills=match.missing_skills,
+        match_score=match.match_score,
+        skill_gaps=[
+            SkillGapRead(id=g.id, skill_name=g.skill_name, gap_severity=g.gap_severity,
+                         source=g.source)
+            for g in gaps
+        ],
+    )
+
+
 def match_resume_to_job(db: Session, jd_id: int, profile_id: int) -> Optional[JobMatchRead]:
     """Deterministic (non-AI) skill matching -- explainable, fast, and testable. This is
     our own product logic per GITHUB_REFERENCES.md section 6, not delegated to the AI

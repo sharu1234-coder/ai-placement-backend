@@ -95,6 +95,20 @@ class DuplicatePaymentError(SubscriptionError):
     clean, expected error instead of a 500."""
 
 
+def read_order(db: Session, profile_id: int, subscription_id: int) -> Optional[Subscription]:
+    """This student's subscription row, or None.
+
+    Used to answer a replayed checkout from the order the first attempt already created, so a
+    lost response cannot become a second live order at the payment provider. Ownership is
+    re-checked here rather than inferred from the claim, so an order can never be read across
+    profiles.
+    """
+    subscription = db.get(Subscription, subscription_id)
+    if subscription is None or subscription.profile_id != profile_id:
+        return None
+    return subscription
+
+
 def create_order(db: Session, profile_id: int, plan: str) -> Subscription:
     plan_def = PLAN_CATALOG.get(plan)
     if plan_def is None:

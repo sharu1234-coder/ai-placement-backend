@@ -1,9 +1,11 @@
-from typing import List
+import logging
+from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_db
+from app.api.idempotency_errors import idempotency_http_error
 from app.core.rate_limit import limiter
 from app.models.user import User
 from app.schemas.arena import (
@@ -13,8 +15,10 @@ from app.schemas.arena import (
     ArenaChallengeRead,
     CompleteArenaAttemptRequest,
 )
-from app.services import arena_service
+from app.services import arena_service, idempotency
 from app.services.profile_service import get_or_create_profile
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/arena", tags=["arena"])
 
@@ -32,14 +36,35 @@ def list_challenges(
 def start_attempt(
     request: Request,
     challenge_key: str,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> ArenaAttemptStartRead:
     profile = get_or_create_profile(db, current_user)
+
+    def perform() -> tuple[ArenaAttemptStartRead, int]:
+        try:
+            created = arena_service.start_attempt(db, profile.id, challenge_key)
+        except arena_service.ChallengeNotFoundError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+        return created, created.arena_attempt_id
+
     try:
-        return arena_service.start_attempt(db, profile.id, challenge_key)
-    except arena_service.ChallengeNotFoundError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+        # Three rows per call -- a blueprint, an assessment and the attempt -- so a replay is
+        # the most expensive duplicate of the non-AI endpoints, and leaves a timed challenge
+        # the student never started.
+        return idempotency.run_once(
+            db,
+            profile.id,
+            operation="arena.start_attempt",
+            idempotency_key=idempotency_key,
+            params={"challenge_key": challenge_key},
+            perform=perform,
+            read_back=lambda rid: arena_service.read_attempt_start(db, profile.id, rid),
+            result_kind="arena_attempt",
+        )
+    except idempotency.IdempotencyError as exc:
+        raise idempotency_http_error(exc, logger, "arena.start_attempt")
 
 
 @router.post("/attempts/{arena_attempt_id}/complete", response_model=ArenaAttemptResultRead)

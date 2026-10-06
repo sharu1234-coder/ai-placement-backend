@@ -495,6 +495,22 @@ def analyze(
     return response
 
 
+def read_analysis(
+    db: Session, profile_id: int, career_goal_id: int
+) -> Optional[CareerGoalAnalyzeResponse]:
+    """The goal's current analysis, as analyze() would have described it, or None.
+
+    Answers a replayed analyze without running the model again. The compare-and-swap inside
+    analyze() already keeps concurrent taps from leaving orphaned parses behind, so what this
+    adds is narrower and still worth having: a transport replay no longer pays for a second
+    parse whose result the swap would immediately discard.
+    """
+    goal = db.get(CareerGoal, career_goal_id)
+    if goal is None or goal.profile_id != profile_id:
+        return None
+    return _analyze_response(db, goal)
+
+
 def _analyze_response(db: Session, goal: CareerGoal) -> CareerGoalAnalyzeResponse:
     """Built from what is actually stored, not from what this call computed -- which is what
     lets the loser of the swap above describe the winner's analysis truthfully."""
@@ -888,6 +904,19 @@ def _next_best_action(db: Session, profile: StudentProfile):
 # ==========================================================================================
 # List rows
 # ==========================================================================================
+
+
+def read_goal(db: Session, profile_id: int, career_goal_id: int) -> Optional[CareerGoalListItem]:
+    """This student's goal as create() would have returned it, or None.
+
+    Answers a replayed create from the goal the first attempt saved, so a lost response does
+    not leave the student with the same target job listed twice -- a duplicate they would have
+    to spot and delete by hand. Ownership is re-checked here, never inferred from the claim.
+    """
+    goal = db.get(CareerGoal, career_goal_id)
+    if goal is None or goal.profile_id != profile_id:
+        return None
+    return _list_item(db, goal)
 
 
 def _list_item(db: Session, goal: CareerGoal) -> CareerGoalListItem:

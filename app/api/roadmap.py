@@ -1,16 +1,17 @@
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.ai.provider import AIGenerationError, AIProvider, get_ai_provider
 from app.api.ai_errors import ai_unavailable
 from app.api.deps import get_current_user, get_db
+from app.api.idempotency_errors import idempotency_http_error
 from app.core.rate_limit import limiter
 from app.models.user import User
 from app.schemas.roadmap import GenerateRoadmapRequest, RoadmapRead, RoadmapTaskRead, UpdateRoadmapTaskRequest
-from app.services import roadmap_service
+from app.services import idempotency, roadmap_service
 from app.services.profile_service import get_or_create_profile
 
 logger = logging.getLogger(__name__)
@@ -23,19 +24,43 @@ router = APIRouter(prefix="/roadmap", tags=["roadmap"])
 def generate_roadmap(
     request: Request,
     payload: GenerateRoadmapRequest,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
     ai_provider: AIProvider = Depends(get_ai_provider),
 ) -> RoadmapRead:
     profile = get_or_create_profile(db, current_user)
+
+    def perform() -> tuple[RoadmapRead, int]:
+        try:
+            created = roadmap_service.generate_roadmap(
+                db, profile.id, payload.jd_id, payload.duration_days, ai_provider
+            )
+        except roadmap_service.InvalidRoadmapRequestError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+        except roadmap_service.NoWeaknessDataError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+        except AIGenerationError as exc:
+            raise ai_unavailable(exc, logger, "roadmap")
+        return created, created.id
+
     try:
-        return roadmap_service.generate_roadmap(db, profile.id, payload.jd_id, payload.duration_days, ai_provider)
-    except roadmap_service.InvalidRoadmapRequestError as exc:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
-    except roadmap_service.NoWeaknessDataError as exc:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
-    except AIGenerationError as exc:
-        raise ai_unavailable(exc, logger, "roadmap")
+        # generate_roadmap supersedes the student's current roadmap and builds a new one from a
+        # full model pass, so a replayed request is both a second plan and a second AI call.
+        # The claim commits before perform() runs -- Phase 19's rule that no transaction may be
+        # open across inference still holds, because the claim is finished business by then.
+        return idempotency.run_once(
+            db,
+            profile.id,
+            operation="roadmap.generate",
+            idempotency_key=idempotency_key,
+            params={"jd_id": payload.jd_id, "duration_days": payload.duration_days},
+            perform=perform,
+            read_back=lambda rid: roadmap_service.read_roadmap(db, profile.id, rid),
+            result_kind="roadmap",
+        )
+    except idempotency.IdempotencyError as exc:
+        raise idempotency_http_error(exc, logger, "roadmap.generate")
 
 
 @router.get("/current", response_model=Optional[RoadmapRead])
@@ -70,16 +95,36 @@ def update_task(
 def reassess(
     request: Request,
     roadmap_id: int,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
     ai_provider: AIProvider = Depends(get_ai_provider),
 ) -> RoadmapRead:
     profile = get_or_create_profile(db, current_user)
+
+    def perform() -> tuple[RoadmapRead, int]:
+        try:
+            created = roadmap_service.reassess_roadmap(db, profile.id, roadmap_id, ai_provider)
+        except roadmap_service.RoadmapNotFoundError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+        except roadmap_service.NoWeaknessDataError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+        except AIGenerationError as exc:
+            raise ai_unavailable(exc, logger, "roadmap")
+        return created, created.id
+
     try:
-        return roadmap_service.reassess_roadmap(db, profile.id, roadmap_id, ai_provider)
-    except roadmap_service.RoadmapNotFoundError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
-    except roadmap_service.NoWeaknessDataError as exc:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
-    except AIGenerationError as exc:
-        raise ai_unavailable(exc, logger, "roadmap")
+        # reassess_roadmap delegates straight to generate_roadmap, so this is the same cost as
+        # the route above: a new roadmap and a full model pass per arrival.
+        return idempotency.run_once(
+            db,
+            profile.id,
+            operation="roadmap.reassess",
+            idempotency_key=idempotency_key,
+            params={"roadmap_id": roadmap_id},
+            perform=perform,
+            read_back=lambda rid: roadmap_service.read_roadmap(db, profile.id, rid),
+            result_kind="roadmap",
+        )
+    except idempotency.IdempotencyError as exc:
+        raise idempotency_http_error(exc, logger, "roadmap.reassess")

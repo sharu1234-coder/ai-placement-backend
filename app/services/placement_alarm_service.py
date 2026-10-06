@@ -287,6 +287,24 @@ def submit_challenge_answer(
     question = db.get(Question, question_id)
     is_correct = student_answer.strip().lower() == question.expected_answer_or_rubric.strip().lower()
 
+    # attempt_count is the one write in this app that a replay moves, and it is deliberately left
+    # that way (Phase 30 classified every mutating endpoint; this was the only unguarded counter).
+    # Three things decide that:
+    #
+    #  - Nothing reads it. It appears in this file and in its own column definition, and nowhere
+    #    else -- no schema, no response, no Android code. A replayed wrong answer therefore leaves
+    #    the challenge, the stored answer and is_correct identical and moves a number no one sees.
+    #  - A guard cannot tell a replay from the behaviour the column exists to count. The product is
+    #    "the same question until correct", so a student deliberately resending the same wrong
+    #    answer *should* increment it; only a request-level key could separate the two, and keying
+    #    the alarm path to protect an unread number is not a trade worth making.
+    #  - Everything else here is already replay-safe by construction: last_student_answer is an
+    #    absolute assignment of the submitted value, is_correct only ever goes false -> true, a
+    #    replay of a *correct* answer is refused above by QuestionAlreadyCorrectError, and the
+    #    challenge's completion is guarded by its own status check below.
+    #
+    # If this number ever becomes something a student is shown, it needs a correctness mechanism
+    # first -- it does not have one now.
     attempt.attempt_count += 1
     attempt.last_student_answer = student_answer
     if is_correct:

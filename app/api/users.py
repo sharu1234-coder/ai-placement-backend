@@ -1,9 +1,12 @@
 import datetime
+import logging
+from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_db
+from app.api.idempotency_errors import idempotency_http_error
 from app.core.rate_limit import limiter
 from app.core.security import verify_password
 from app.models.certification import Certification
@@ -33,9 +36,12 @@ from app.schemas.profile_items import (
     SkillRead,
 )
 from app.schemas.user import AccountDeleteRequest
+from app.services import idempotency
 from app.services.account_service import delete_account
 from app.services.profile_service import get_or_create_profile, profile_read
 from app.storage.provider import StorageProvider, get_storage_provider
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["users"])
 
@@ -189,15 +195,40 @@ def delete_education(
 @router.post("/users/me/skills", response_model=SkillRead, status_code=status.HTTP_201_CREATED)
 def add_skill(
     payload: SkillCreate,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> Skill:
     profile = get_or_create_profile(db, current_user)
-    item = Skill(profile_id=profile.id, **payload.model_dump())
-    db.add(item)
-    db.commit()
-    db.refresh(item)
-    return item
+
+    def perform() -> tuple[Skill, int]:
+        item = Skill(profile_id=profile.id, **payload.model_dump())
+        db.add(item)
+        db.commit()
+        db.refresh(item)
+        return item, item.id
+
+    def read_back(skill_id: int) -> Optional[Skill]:
+        existing = db.get(Skill, skill_id)
+        # Ownership re-checked rather than inferred from the claim, so a result id can never be
+        # read across profiles even if a key were somehow shared.
+        return existing if existing is not None and existing.profile_id == profile.id else None
+
+    try:
+        # Nothing deduplicates skills, so a replay leaves the same skill listed twice on the
+        # student's profile -- visible, and theirs to clean up.
+        return idempotency.run_once(
+            db,
+            profile.id,
+            operation="profile.add_skill",
+            idempotency_key=idempotency_key,
+            params=payload.model_dump(),
+            perform=perform,
+            read_back=read_back,
+            result_kind="skill",
+        )
+    except idempotency.IdempotencyError as exc:
+        raise idempotency_http_error(exc, logger, "profile.add_skill")
 
 
 @router.get("/users/me/skills", response_model=list[SkillRead])

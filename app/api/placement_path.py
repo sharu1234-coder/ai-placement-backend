@@ -1,10 +1,12 @@
+import logging
 from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.ai.provider import AIProvider, get_ai_provider
 from app.api.deps import get_current_user, get_db
+from app.api.idempotency_errors import idempotency_http_error
 from app.core.rate_limit import limiter
 from app.models.user import User
 from app.schemas.placement_path import (
@@ -13,9 +15,11 @@ from app.schemas.placement_path import (
     PracticeHandoffRead,
     UpdatePlacementPathTopicRequest,
 )
-from app.services import placement_path_service
+from app.services import idempotency, placement_path_service
 from app.services.profile_service import get_or_create_profile
 from app.services.skill_matching import NoResumeAnalysisError
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/placement-path", tags=["placement-path"])
 
@@ -24,6 +28,7 @@ router = APIRouter(prefix="/placement-path", tags=["placement-path"])
 @limiter.limit("10/hour")
 def generate(
     request: Request,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
     ai_provider: AIProvider = Depends(get_ai_provider),
@@ -31,12 +36,39 @@ def generate(
     """Creates the student's first placement path, or regenerates it (superseding the
     previous one, never deleting it) -- the same operation either way."""
     profile = get_or_create_profile(db, current_user)
+
+    def perform() -> tuple[PlacementPathRead, int]:
+        try:
+            # ensure_placement_path, not generate_placement_path. The claim around this call
+            # is keyed on the client's Idempotency-Key and so only ever collapses one request's
+            # own retransmissions; the business guard inside it is keyed on the profile and is
+            # what stops two *different* requests from both paying for a 163-second generation
+            # and both leaving an active path behind.
+            created = placement_path_service.ensure_placement_path(db, profile.id, ai_provider)
+        except NoResumeAnalysisError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+        except placement_path_service.NoPlacementRelevantSkillsError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+        return created, created.id
+
     try:
-        return placement_path_service.generate_placement_path(db, profile.id, ai_provider)
-    except NoResumeAnalysisError as exc:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
-    except placement_path_service.NoPlacementRelevantSkillsError as exc:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+        # The longest AI call in the app -- ~163s measured against a local model -- and it
+        # supersedes the student's current path, so a replay is both a wasted generation and a
+        # second path retiring the first.
+        return idempotency.run_once(
+            db,
+            profile.id,
+            operation=placement_path_service.PLACEMENT_PATH_OPERATION,
+            idempotency_key=idempotency_key,
+            params={},
+            perform=perform,
+            read_back=lambda rid: placement_path_service.read_placement_path(db, profile.id, rid),
+            result_kind="placement_path",
+        )
+    except idempotency.IdempotencyError as exc:
+        raise idempotency_http_error(
+            exc, logger, placement_path_service.PLACEMENT_PATH_OPERATION
+        )
 
 
 @router.get("/current", response_model=Optional[PlacementPathRead])

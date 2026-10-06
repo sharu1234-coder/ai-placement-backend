@@ -472,18 +472,31 @@ def test_answer_rejected_when_no_pending_question(client, auth_headers, blueprin
     question = client.get(
         f"/assessments/{assessment_id}/next-question", headers=auth_headers
     ).json()["question"]
-    client.post(
+    first = client.post(
         f"/assessments/{assessment_id}/answer",
         json={"question_id": question["id"], "student_answer": "Structured Query Language"},
         headers=auth_headers,
     )
+    assert first.status_code == 200
 
-    resp = client.post(
+    # Phase 31 reclassified exactly one of the two cases this used to lump together. Resending
+    # the *same* answer is a transport replay of a mutation that already succeeded, so it now
+    # gets that answer's stored result rather than a 409 the client would show as a failure.
+    replay = client.post(
         f"/assessments/{assessment_id}/answer",
         json={"question_id": question["id"], "student_answer": "Structured Query Language"},
         headers=auth_headers,
     )
-    assert resp.status_code == 409
+    assert replay.status_code == 200
+    assert replay.json() == first.json()
+
+    # Answering *differently* is still refused, which is what this test was really protecting.
+    changed = client.post(
+        f"/assessments/{assessment_id}/answer",
+        json={"question_id": question["id"], "student_answer": "Simple Query Language"},
+        headers=auth_headers,
+    )
+    assert changed.status_code == 409
 
 
 def test_result_requires_completed_assessment(client, auth_headers, blueprint_id, use_fake_ai):

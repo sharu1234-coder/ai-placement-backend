@@ -1,12 +1,13 @@
 import logging
-from typing import List
+from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.ai.provider import AIGenerationError, AIProvider, get_ai_provider
 from app.api.ai_errors import ai_unavailable
 from app.api.deps import get_current_user, get_db
+from app.api.idempotency_errors import idempotency_http_error
 from app.api.jobs import JD_PARSE_LIMIT, JD_PARSE_SCOPE
 from app.core.rate_limit import limiter
 from app.models.user import User
@@ -18,7 +19,7 @@ from app.schemas.career_goal import (
     CareerGoalListItem,
     CareerGoalUpdate,
 )
-from app.services import career_goal_service
+from app.services import career_goal_service, idempotency
 from app.services.profile_service import get_or_create_profile
 
 logger = logging.getLogger(__name__)
@@ -40,16 +41,40 @@ def list_career_goals(
 @router.post("", response_model=CareerGoalListItem, status_code=status.HTTP_201_CREATED)
 def create_career_goal(
     payload: CareerGoalCreate,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> CareerGoalListItem:
     """Save a target job. No AI runs here, so this cannot fail because a provider is down --
     the student's pasted job description is always kept and can be analyzed afterwards."""
     profile = get_or_create_profile(db, current_user)
+
+    def perform() -> tuple[CareerGoalListItem, int]:
+        try:
+            created = career_goal_service.create(db, profile.id, payload)
+        except career_goal_service.TooManyCareerGoalsError as exc:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+        return created, created.id
+
     try:
-        return career_goal_service.create(db, profile.id, payload)
-    except career_goal_service.TooManyCareerGoalsError as exc:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
+        # create() caps the number of goals but does not deduplicate them, so a replay adds a
+        # second copy of the same target job to the student's list.
+        return idempotency.run_once(
+            db,
+            profile.id,
+            operation="career_goal.create",
+            idempotency_key=idempotency_key,
+            params={
+                "title": payload.title.strip(),
+                "company": payload.company.strip(),
+                "job_description": payload.job_description,
+            },
+            perform=perform,
+            read_back=lambda rid: career_goal_service.read_goal(db, profile.id, rid),
+            result_kind="career_goal",
+        )
+    except idempotency.IdempotencyError as exc:
+        raise idempotency_http_error(exc, logger, "career_goal.create")
 
 
 @router.get("/{career_goal_id}", response_model=CareerGoalDetailRead)
@@ -166,6 +191,7 @@ def unlink_application(
 def analyze_career_goal(
     request: Request,
     career_goal_id: int,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
     ai_provider: AIProvider = Depends(get_ai_provider),
@@ -176,10 +202,30 @@ def analyze_career_goal(
     anything, so it happens when the student asks for it, not every time they open the screen.
     """
     profile = get_or_create_profile(db, current_user)
+
+    def perform() -> tuple[CareerGoalAnalyzeResponse, int]:
+        try:
+            analysed = career_goal_service.analyze(db, profile.id, career_goal_id, ai_provider)
+        except career_goal_service.CareerGoalNotFoundError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+        return analysed, career_goal_id
+
     try:
-        return career_goal_service.analyze(db, profile.id, career_goal_id, ai_provider)
-    except career_goal_service.CareerGoalNotFoundError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+        # analyze() already resolves concurrent taps by compare-and-swap, deleting the losing
+        # parse. This is the window that leaves: a replay after the swap committed, which would
+        # otherwise pay for a parse whose result is discarded a moment later.
+        return idempotency.run_once(
+            db,
+            profile.id,
+            operation="career_goal.analyze",
+            idempotency_key=idempotency_key,
+            params={"career_goal_id": career_goal_id},
+            perform=perform,
+            read_back=lambda rid: career_goal_service.read_analysis(db, profile.id, rid),
+            result_kind="career_goal_analysis",
+        )
+    except idempotency.IdempotencyError as exc:
+        raise idempotency_http_error(exc, logger, "career_goal.analyze")
     # The goal is untouched by a provider failure: no partial parse is stored and the previous
     # analysis, if any, is still attached. ai_unavailable logs server-side and returns a fixed,
     # provider-agnostic message, so nothing about which model failed reaches the client.

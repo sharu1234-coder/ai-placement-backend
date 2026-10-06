@@ -146,6 +146,20 @@ def _role_name(db: Session, profile: StudentProfile) -> str:
     return context.display_role_name if context is not None else "the target role"
 
 
+def read_session(
+    db: Session, profile_id: int, session_id: int
+) -> Optional[RecruiterAttackSessionRead]:
+    """This student's session as start_session would have returned it, or None.
+
+    Answers a replayed start from the session the first attempt created, so a lost response
+    does not leave a second abandoned recruiter session in their history.
+    """
+    session = db.get(RecruiterAttackSession, session_id)
+    if session is None or session.profile_id != profile_id:
+        return None
+    return _session_read(session)
+
+
 def start_session(
     db: Session,
     profile: StudentProfile,
@@ -301,6 +315,11 @@ def answer_turn(
     if turn is None or turn.session_id != session.id:
         raise RecruiterAttackNotFoundError("Recruiter attack turn not found")
     if turn.answer_text is not None:
+        # Phase 31: a resend of the answer already stored is handed that answer back rather than
+        # a 409 for work that succeeded. An attempt to answer differently stays a conflict --
+        # the first answer is final here, which is the point of an attack session.
+        if turn.answer_text == answer_text:
+            return _turn_read(turn)
         raise TurnNotPendingError("This question has already been answered")
 
     # Atomic conditional UPDATE (not "load, mutate, commit") -- same shape as
@@ -315,9 +334,15 @@ def answer_turn(
         .values(answer_text=answer_text)
     )
     db.commit()
-    if not result.rowcount:
-        raise TurnNotPendingError("This question has already been answered")
     db.refresh(turn)
+    if not result.rowcount:
+        # Lost the race. The winner's answer is this turn's answer; if both requests submitted the
+        # same text they asked for the same thing and it is done, so the loser is given the stored
+        # turn instead of an error. The guard above is untouched: still exactly one mutation, and
+        # a loser carrying different text is still refused (Phase 30's M11 covers that).
+        if turn.answer_text == answer_text:
+            return _turn_read(turn)
+        raise TurnNotPendingError("This question has already been answered")
 
     if turn.order_index == _TURNS_PER_SESSION - 1:
         session.status = "completed"

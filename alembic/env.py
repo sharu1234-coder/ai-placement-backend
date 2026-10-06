@@ -13,6 +13,7 @@ from app.models.arena_attempt import ArenaAttempt  # noqa: F401
 from app.models.assessment import Assessment  # noqa: F401
 from app.models.assessment_blueprint import AssessmentBlueprint  # noqa: F401
 from app.models.assessment_result import AssessmentResult  # noqa: F401
+from app.models.career_goal import CareerGoal  # noqa: F401
 from app.models.career_path import CareerPath  # noqa: F401
 from app.models.career_path_phase import CareerPathPhase  # noqa: F401
 from app.models.career_path_project import CareerPathProject  # noqa: F401
@@ -37,6 +38,7 @@ from app.models.job_saved_search import JobSavedSearch  # noqa: F401
 from app.models.job_search_profile import JobSearchProfile  # noqa: F401
 from app.models.mission import Mission  # noqa: F401
 from app.models.notification_event import NotificationEvent  # noqa: F401
+from app.models.operation_claim import OperationClaim  # noqa: F401
 from app.models.password_reset_token import PasswordResetToken  # noqa: F401
 from app.models.placement_alarm_challenge import PlacementAlarmChallenge  # noqa: F401
 from app.models.placement_alarm_question_attempt import PlacementAlarmQuestionAttempt  # noqa: F401

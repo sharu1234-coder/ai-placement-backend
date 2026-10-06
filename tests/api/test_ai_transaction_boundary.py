@@ -33,11 +33,17 @@ from app.ai.schemas.career_path import (
     GeneratedRoleSkill,
 )
 from app.ai.schemas.jd import AIParsedJD, JDRequirementItem
+from app.ai.schemas.job_preparation_plan import GeneratedJobPreparationContent
+from app.ai.schemas.placement_path import (
+    GeneratedPlacementPathExplanations,
+    GeneratedTopicExplanation,
+)
 from app.ai.schemas.resume import ParsedResume
 from app.ai.schemas.resume_ats_check import GeneratedAtsCheckContent
 from app.ai.schemas.roadmap import GeneratedRoadmap, GeneratedRoadmapTask
 from app.core.config import settings
 from app.main import app
+from tests.api.test_jobs import SAMPLE_PREP_CONTENT
 
 # --------------------------------------------------------------------------------------
 # the probe
@@ -267,6 +273,16 @@ class ProbingAI(AIProvider):
             return GeneratedCareerPathExplanations(explanations=[])
         if schema is AnswerGrade:
             return SAMPLE_ANSWER_GRADE
+        if schema is GeneratedJobPreparationContent:
+            return SAMPLE_PREP_CONTENT
+        if schema is GeneratedPlacementPathExplanations:
+            return GeneratedPlacementPathExplanations(
+                explanations=[
+                    GeneratedTopicExplanation(
+                        topic_key="sql_basics", why_it_matters="Core SQL skill."
+                    )
+                ]
+            )
         raise AssertionError(f"Unexpected schema requested in test: {schema}")
 
     def generate_text(self, prompt):
@@ -366,6 +382,91 @@ def test_job_description_parse_makes_no_ai_call_inside_a_transaction(client, aut
     resp = client.post("/jobs", json={"raw_text": "We need a data analyst with SQL."}, headers=auth_headers)
     assert resp.status_code == 201
     assert_no_transaction_during_ai(probe, "POST /jobs")
+
+
+def _seed_parsed_resume(skills):
+    """A completed resume with parsed skills, written directly.
+
+    Placement path generation refuses without one, and uploading a PDF here would add a second AI
+    call to a probe that is measuring a specific one.
+    """
+    from app.api.deps import get_db
+    from app.models.profile import StudentProfile
+    from app.models.resume import Resume
+    from app.models.resume_analysis import ResumeAnalysis
+    from app.models.user import User
+
+    db = next(app.dependency_overrides[get_db]())
+    try:
+        user = db.query(User).filter(User.email == "txn@example.com").one()
+        profile = db.query(StudentProfile).filter(StudentProfile.user_id == user.id).first()
+        if profile is None:
+            profile = StudentProfile(user_id=user.id)
+            db.add(profile)
+            db.commit()
+            db.refresh(profile)
+        resume = Resume(
+            profile_id=profile.id, file_path="x.pdf", raw_text="text", parse_status="completed"
+        )
+        db.add(resume)
+        db.commit()
+        db.refresh(resume)
+        db.add(
+            ResumeAnalysis(
+                resume_id=resume.id,
+                extracted_skills=skills,
+                extracted_education=[],
+                extracted_experience=[],
+                extracted_projects=[],
+                extracted_certifications=[],
+                ats_score=70.0,
+                weak_sections=[],
+                extraction_confidence=0.9,
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_placement_path_generation_makes_no_ai_call_inside_a_transaction(
+    client, auth_headers, ai, probe
+):
+    """The longest AI call in the app -- ~163s measured -- and the one Phase 26 added a claim to.
+
+    `GeneratedPlacementPathExplanations` was missing from ProbingAI, so this call site had only
+    the static audit below. A transaction held across a 163-second generation is the worst case
+    Phase 19 exists to prevent, and taking a business claim immediately before it is exactly the
+    kind of write that could have reopened one.
+    """
+    client.get("/users/me", headers=auth_headers)
+    _seed_parsed_resume(["SQL", "Python", "Data Structures"])
+    probe.snapshots.clear()
+
+    resp = client.post("/placement-path/generate", headers=auth_headers)
+
+    assert resp.status_code == 201, resp.text
+    assert_no_transaction_during_ai(probe, "POST /placement-path/generate")
+
+
+def test_preparation_plan_makes_no_ai_call_inside_a_transaction(client, auth_headers, ai, probe):
+    """The route this file did not previously reach, and the one Phase 25 added a claim to.
+
+    `GeneratedJobPreparationContent` was missing from ProbingAI, so the static audit below was the
+    only thing covering this call site. It matters more now: Phase 25 takes a business claim before
+    the model runs, and a claim is a write. If taking it left a transaction open -- or if it were
+    taken inside one -- the model call would run inside a transaction that spans the whole
+    generation, which is exactly the regression Phase 19 exists to prevent.
+    """
+    jd_id = client.post(
+        "/jobs", json={"raw_text": "We need SQL, Excel and Power BI."}, headers=auth_headers
+    ).json()["id"]
+    probe.snapshots.clear()
+
+    resp = client.post(f"/jobs/{jd_id}/preparation-plan", json={}, headers=auth_headers)
+
+    assert resp.status_code == 201, resp.text
+    assert_no_transaction_during_ai(probe, "POST /jobs/{id}/preparation-plan")
 
 
 @pytest.fixture()

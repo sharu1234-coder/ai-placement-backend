@@ -14,6 +14,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
+from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -44,6 +45,7 @@ from app.schemas.career_path import (
     SkillGapItemRead,
     SkillItemRead,
 )
+from app.services import idempotency
 from app.services.ai_boundary import outside_transaction
 from app.services.career_path import ai_generation, rules
 from app.services.career_path.ai_generation import ExplainerSkillInput
@@ -61,6 +63,9 @@ _explaining_lock = threading.Lock()
 
 PRACTICE_QUESTION_COUNT = 3
 _BLUEPRINT_SOURCE = "career_path"
+
+#: The claim operation for apply_jd -- see its docstring for why the merge needs one.
+APPLY_JD_OPERATION = "career_path.apply_jd"
 _GENERIC_ASSESSMENT_TYPE = "technical"
 
 # Safety cap, not a product pagination feature (disclosed gap -- see assessment_service.py's
@@ -1073,6 +1078,19 @@ def list_all(db: Session, profile_id: int) -> List[CareerPathSummaryRead]:
     return [_to_summary_read(db, p) for p in paths]
 
 
+def read_path(db: Session, profile_id: int, path_id: int) -> Optional[CareerPathRead]:
+    """Like [get_path], but None instead of raising when there is nothing to read.
+
+    The replay path needs a missing path to be an ordinary answer: refresh() is the one Career
+    Path flow that always re-calls the model, so a replayed refresh must hand back the content
+    the first attempt generated rather than paying for it twice.
+    """
+    try:
+        return get_path(db, profile_id, path_id)
+    except CareerPathNotFoundError:
+        return None
+
+
 def get_path(db: Session, profile_id: int, path_id: int) -> CareerPathRead:
     path = _get_owned_path(db, profile_id, path_id)
     return _to_read(db, path)
@@ -1119,10 +1137,39 @@ def get_or_create_practice_blueprint(db: Session, profile_id: int, skill_item_id
         sections=[section.model_dump()],
     )
     db.add(blueprint)
-    db.commit()
-    db.refresh(blueprint)
+    # Flushed, not committed: the insert and the link below are one transaction, so a request
+    # that loses the link leaves nothing behind at all. Committing here first (which is what this
+    # did) made the row durable before anything pointed at it, and the window between the two
+    # commits is where an overlapping replay landed -- see the conditional UPDATE's comment.
+    db.flush()
 
-    item.practice_blueprint_id = blueprint.id
+    # Atomic conditional UPDATE, not "load, mutate, commit" -- the same primitive, for the same
+    # class of race, as mission_service.complete and subscription_service._activate_paid.
+    #
+    # The race is reachable from one tap. OkHttp re-sends a request whose connection failed after
+    # it was written, because it cannot tell that from a connection that was already dead
+    # (NonResentRequests.kt in the Android app records why that retry has to stay), so the resend
+    # can overlap the original. Both requests then read practice_blueprint_id as NULL, both build
+    # a blueprint, and the second link overwrites the first -- leaving a blueprint no skill item
+    # points at, which one of the two requests has already sent the student off to start an
+    # assessment against. Finishing that assessment can never mark the skill practised, because
+    # the completion path reads the skill item's link.
+    linked = db.execute(
+        update(CareerPathSkillItem)
+        .where(
+            CareerPathSkillItem.id == item.id,
+            CareerPathSkillItem.practice_blueprint_id.is_(None),
+        )
+        .values(practice_blueprint_id=blueprint.id)
+    ).rowcount
+    if not linked:
+        # An overlapping request linked its own blueprint first. Roll back this one -- it is
+        # unreachable by construction -- and hand back the blueprint the skill item actually
+        # points at, so both requests start the same assessment.
+        db.rollback()
+        db.refresh(item)
+        return item.practice_blueprint_id
+
     if item.status == "not_started":
         item.status = "in_progress"
     db.commit()
@@ -1184,10 +1231,55 @@ def apply_jd(db: Session, profile_id: int, path_id: int, jd_id: int) -> CareerPa
     """ "Update my Career Path using this JD" -- merges a JD's required/preferred skill and
     tool requirements into the path's "core_skills" phase as new skill items (skills already
     represented among the path's existing skill items are left alone, never duplicated).
-    Never touches JobPreparationPlan or any placement_path table."""
-    path = _get_owned_path(db, profile_id, path_id)
+    Never touches JobPreparationPlan or any placement_path table.
+
+    Claimed per (path, job description), through the same operation_claims table every other
+    collapsed mutation in this app uses. The merge below is a check-then-act -- it reads which
+    skills the path already has, then inserts the ones it does not -- and career_path_skill_items
+    has no unique constraint to fall back on, so two overlapping requests both find the same
+    requirement missing and both add it. The generated skill_key is deterministic, so the result
+    is not two distinguishable rows but the same skill listed twice in the student's plan, with
+    nothing to remove it.
+
+    A sequential replay never needed this: by then the first request's items are committed and
+    every one of them is skipped, so `added` is zero and nothing is even written. What needs it is
+    a resend that overlaps the original, which is the case the transport produces -- OkHttp cannot
+    tell "the connection was already dead" from "the request arrived and the reply was lost".
+
+    The identity is the resource, not the request: which path, and which job description. There is
+    no request body, and nothing else decides what this operation does. Collapsing on it does not
+    cost a legitimate repeat, because a repeat is already a no-op -- a given job description's
+    requirements are extracted once, when it is parsed, and do not change afterwards.
+    """
+    _get_owned_path(db, profile_id, path_id)
     jd = db.query(JobDescription).filter(JobDescription.id == jd_id).first()
     if jd is None or jd.profile_id != profile_id:
+        raise JobDescriptionNotFoundError(f"Job description {jd_id} not found")
+
+    def perform() -> "tuple[CareerPathRead, Optional[int]]":
+        # Re-read inside the claim: run_business_once commits the claim before calling this, which
+        # expires anything loaded above it.
+        return _merge_jd_requirements(db, profile_id, path_id, jd_id), path_id
+
+    return idempotency.run_business_once(
+        db,
+        profile_id,
+        operation=APPLY_JD_OPERATION,
+        identity={"path_id": path_id, "jd_id": jd_id},
+        perform=perform,
+        # The result id is ignored on purpose: the path is looked up by its identity, because the
+        # claim that recorded it is swept long before the path goes away -- the same reasoning as
+        # jd_service's preparation plan.
+        read_back=lambda _result_id: get_path(db, profile_id, path_id),
+        result_kind="career_path",
+    )
+
+
+def _merge_jd_requirements(db: Session, profile_id: int, path_id: int, jd_id: int) -> CareerPathRead:
+    """[apply_jd]'s merge, with the claim above it holding off any overlapping copy of itself."""
+    path = _get_owned_path(db, profile_id, path_id)
+    jd = db.query(JobDescription).filter(JobDescription.id == jd_id).first()
+    if jd is None:
         raise JobDescriptionNotFoundError(f"Job description {jd_id} not found")
 
     requirements = db.query(Requirement).filter(Requirement.jd_id == jd_id, Requirement.category.in_(["skill", "tool"])).all()

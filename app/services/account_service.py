@@ -33,6 +33,7 @@ from app.models.job_saved_search import JobSavedSearch
 from app.models.job_search_profile import JobSearchProfile
 from app.models.mission import Mission
 from app.models.notification_event import NotificationEvent
+from app.models.operation_claim import OperationClaim
 from app.models.password_reset_token import PasswordResetToken
 from app.models.placement_alarm_challenge import PlacementAlarmChallenge
 from app.models.placement_alarm_question_attempt import PlacementAlarmQuestionAttempt
@@ -172,6 +173,13 @@ def delete_account(db: Session, user: User, storage: StorageProvider) -> None:
         # is per account, so a new signup gets a new one; closing that would need identity
         # beyond an email address, and is flagged in the report rather than assumed.)
         db.query(JobHuntUsage).filter(JobHuntUsage.profile_id == pid).delete(
+            synchronize_session=False
+        )
+        # Replay-safety claims (Phase 24-B). Another pure leaf, and nothing a student would
+        # ever ask about: it holds only operation keys and fingerprints, no content. Deleting it
+        # cannot resurrect a mutation, because the rows it protected are being erased by this
+        # same deletion.
+        db.query(OperationClaim).filter(OperationClaim.profile_id == pid).delete(
             synchronize_session=False
         )
         db.query(NotificationEvent).filter(NotificationEvent.profile_id == pid).delete(synchronize_session=False)

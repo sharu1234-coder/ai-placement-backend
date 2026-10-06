@@ -1,16 +1,29 @@
+import logging
 from typing import Optional
 
-from fastapi import APIRouter, Depends, File, HTTPException, Request, Response, UploadFile, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Header,
+    HTTPException,
+    Request,
+    Response,
+    UploadFile,
+    status,
+)
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
 from app.ai.provider import AIProvider, get_ai_provider
 from app.api.deps import get_current_user, get_db
+from app.api.idempotency_errors import idempotency_http_error
 from app.api.upload_utils import read_upload_limited
 from app.core.rate_limit import limiter
 from app.models.user import User
 from app.schemas.resume import ResumeAnalysisRead, ResumeSummaryRead, ResumeUploadResponse
 from app.schemas.resume_ats_check import AtsCheckListItemRead, AtsCheckReportRead, CreateAtsCheckRequest
+from app.services import idempotency
 from app.services.ats_check_service import generate_ats_check, get_ats_check, list_ats_checks
 from app.services.profile_service import get_or_create_profile
 from app.services.resume_service import (
@@ -21,8 +34,11 @@ from app.services.resume_service import (
     get_resume_analysis,
     get_resume_file,
     process_resume_upload,
+    read_uploaded_resume,
 )
 from app.storage.provider import StorageProvider, get_storage_provider
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/resumes", tags=["resumes"])
 
@@ -39,6 +55,7 @@ async def upload_resume(
     db: Session = Depends(get_db),
     ai_provider: AIProvider = Depends(get_ai_provider),
     storage: StorageProvider = Depends(get_storage_provider),
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
 ) -> ResumeUploadResponse:
     if file.content_type not in _ALLOWED_CONTENT_TYPES:
         raise HTTPException(
@@ -60,24 +77,49 @@ async def upload_resume(
 
     profile = get_or_create_profile(db, current_user)
 
+    async def perform() -> tuple[object, int]:
+        try:
+            # process_resume_upload does blocking PDF parsing + a blocking AI call; this route
+            # is async (needed for `await file.read()`), and an async route runs directly on
+            # the event loop rather than being auto-threadpooled the way a plain `def` route
+            # is -- see the identical fix in app/api/interviews.py's submit_audio_answer for
+            # the full explanation (found via live testing: a concurrent request froze while
+            # this ran uncovered).
+            created = await run_in_threadpool(
+                process_resume_upload,
+                db,
+                profile.id,
+                file.filename or "resume.pdf",
+                file_bytes,
+                ai_provider,
+                storage,
+            )
+        except ResumeProcessingError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+        return created, created.id
+
     try:
-        # process_resume_upload does blocking PDF parsing + a blocking AI call; this route
-        # is async (needed for `await file.read()`), and an async route runs directly on
-        # the event loop rather than being auto-threadpooled the way a plain `def` route
-        # is -- see the identical fix in app/api/interviews.py's submit_audio_answer for
-        # the full explanation (found via live testing: a concurrent request froze while
-        # this ran uncovered).
-        return await run_in_threadpool(
-            process_resume_upload,
+        # The fingerprint is a digest of the file, never the file. A resume is the largest body
+        # this API accepts and the most sensitive thing a student sends, so storing it in a
+        # deduplication table would be both wasteful and a liability; 64 hex characters identify
+        # the same upload just as well. Re-uploading a *different* resume under the same key is
+        # then a conflict rather than a silent no-op, which is the honest answer.
+        result = await idempotency.run_once_async(
             db,
             profile.id,
-            file.filename or "resume.pdf",
-            file_bytes,
-            ai_provider,
-            storage,
+            operation="resume.upload",
+            idempotency_key=idempotency_key,
+            params={
+                "filename": file.filename or "resume.pdf",
+                "body": idempotency.body_digest(file_bytes),
+            },
+            perform=perform,
+            read_back=lambda rid: read_uploaded_resume(db, profile.id, rid),
+            result_kind="resume",
         )
-    except ResumeProcessingError as exc:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+    except idempotency.IdempotencyError as exc:
+        raise idempotency_http_error(exc, logger, "resume.upload")
+    return result
 
 
 @router.get("/me/latest", response_model=Optional[ResumeSummaryRead])
@@ -169,16 +211,38 @@ def create_ats_check_endpoint(
     request: Request,
     resume_id: int,
     payload: CreateAtsCheckRequest,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
     ai_provider: AIProvider = Depends(get_ai_provider),
     storage: StorageProvider = Depends(get_storage_provider),
 ) -> AtsCheckReportRead:
     profile = get_or_create_profile(db, current_user)
-    report = generate_ats_check(db, profile.id, resume_id, payload.target_role, ai_provider, storage)
-    if report is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Resume not found")
-    return report
+
+    def perform() -> tuple[AtsCheckReportRead, int]:
+        report = generate_ats_check(
+            db, profile.id, resume_id, payload.target_role, ai_provider, storage
+        )
+        if report is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Resume not found")
+        return report, report.id
+
+    try:
+        # A paid, server-side AI analysis that writes a report row. Phase 24 found the screen's
+        # own rotation guard covers the common case but not process death; this closes the
+        # window underneath it, where the transport replays a request that already committed.
+        return idempotency.run_once(
+            db,
+            profile.id,
+            operation="resume.ats_check",
+            idempotency_key=idempotency_key,
+            params={"resume_id": resume_id, "target_role": payload.target_role},
+            perform=perform,
+            read_back=lambda rid: get_ats_check(db, rid, profile.id),
+            result_kind="resume_ats_check",
+        )
+    except idempotency.IdempotencyError as exc:
+        raise idempotency_http_error(exc, logger, "resume.ats_check")
 
 
 @router.delete("/{resume_id}", status_code=status.HTTP_204_NO_CONTENT)

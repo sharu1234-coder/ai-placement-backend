@@ -1,11 +1,12 @@
 import json
 import logging
-from typing import List
+from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_db
+from app.api.idempotency_errors import idempotency_http_error
 from app.core.app_check import verify_app_check_token
 from app.core.config import settings
 from app.core.rate_limit import limiter
@@ -17,7 +18,7 @@ from app.schemas.subscription import (
     SubscriptionStatusRead,
     VerifyPaymentRequest,
 )
-from app.services import subscription_service
+from app.services import idempotency, subscription_service
 from app.services.profile_service import get_or_create_profile
 
 logger = logging.getLogger(__name__)
@@ -54,6 +55,7 @@ def get_status(
 def create_checkout(
     request: Request,
     payload: CheckoutRequest,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> CheckoutResponse:
@@ -61,14 +63,35 @@ def create_checkout(
     from the server-side PLAN_CATALOG (see subscription_service.py) keyed by `payload.plan`
     -- there is no field on this request the client could use to influence the price."""
     profile = get_or_create_profile(db, current_user)
+
+    def perform() -> tuple[object, int]:
+        try:
+            created = subscription_service.create_order(db, profile.id, payload.plan)
+        except subscription_service.UnknownPlanError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+        except subscription_service.RazorpayNotConfiguredError as exc:
+            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc))
+        except subscription_service.RazorpayApiError as exc:
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc))
+        return created, created.id
+
     try:
-        subscription = subscription_service.create_order(db, profile.id, payload.plan)
-    except subscription_service.UnknownPlanError as exc:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
-    except subscription_service.RazorpayNotConfiguredError as exc:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc))
-    except subscription_service.RazorpayApiError as exc:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc))
+        # The claim commits before perform() runs, which is what keeps a replay away from the
+        # provider entirely: create_order() calls Razorpay *before* it writes anything, so a
+        # second arrival that got as far as the provider would leave a second live order behind.
+        # A duplicate now resolves to the claim -- in progress, or the order already made.
+        subscription = idempotency.run_once(
+            db,
+            profile.id,
+            operation="subscription.checkout",
+            idempotency_key=idempotency_key,
+            params={"plan": payload.plan},
+            perform=perform,
+            read_back=lambda rid: subscription_service.read_order(db, profile.id, rid),
+            result_kind="subscription",
+        )
+    except idempotency.IdempotencyError as exc:
+        raise idempotency_http_error(exc, logger, "subscription.checkout")
 
     return CheckoutResponse(
         razorpay_order_id=subscription.razorpay_order_id,

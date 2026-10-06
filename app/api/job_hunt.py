@@ -22,9 +22,12 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, s
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_current_user, get_db
+from app.api.idempotency_errors import idempotency_http_error
 from app.core.rate_limit import limiter
+from app.models.job_alert import JobAlert
 from app.models.job_listing import JobListing
 from app.models.job_saved_search import JobSavedSearch
+from app.models.saved_job import SavedJob
 from app.models.user import User
 from app.schemas.job_hunt import (
     ApplicationReadinessRead,
@@ -57,6 +60,7 @@ from app.schemas.job_hunt import (
     SkillProvenanceRead,
     UpdateSavedJobRequest,
 )
+from app.services import idempotency
 from app.services.job_hunt import alerts as job_alerts
 from app.services.job_hunt import entitlement, matching, readiness, service
 from app.services.job_hunt import provenance as job_provenance
@@ -532,6 +536,7 @@ def _to_match_read(
 @router.post("/listings", response_model=SavedJobRead, status_code=status.HTTP_201_CREATED)
 def create_manual_listing(
     payload: ManualJobCreate,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> SavedJobRead:
@@ -551,10 +556,41 @@ def create_manual_listing(
     tracker row it needs next in the same round trip.
     """
     profile = get_or_create_profile(db, current_user)
+
+    def perform() -> tuple[SavedJobRead, int]:
+        saved = _add_manual(db, profile.id, payload)
+        return _to_saved_read(db, profile.id, saved), saved.id
+
+    def read_back(saved_job_id: int) -> Optional[SavedJobRead]:
+        existing = db.get(SavedJob, saved_job_id)
+        if existing is None or existing.profile_id != profile.id:
+            return None
+        return _to_saved_read(db, profile.id, existing)
+
+    try:
+        # add_manual_job writes a JobListing and the SavedJob that tracks it, so a replay puts
+        # the same job in the student's tracker twice.
+        return idempotency.run_once(
+            db,
+            profile.id,
+            operation="job_hunt.manual_listing",
+            idempotency_key=idempotency_key,
+            params={"title": payload.title, "company": payload.company, "url": payload.url,
+                    "location": payload.location, "status": payload.status},
+            perform=perform,
+            read_back=read_back,
+            result_kind="saved_job",
+        )
+    except idempotency.IdempotencyError as exc:
+        raise idempotency_http_error(exc, logger, "job_hunt.manual_listing")
+
+
+def _add_manual(db: Session, profile_id: int, payload: ManualJobCreate):
+    """The original create, unchanged, lifted out so the guard can wrap it."""
     try:
         saved = service.add_manual_job(
             db,
-            profile.id,
+            profile_id,
             title=payload.title,
             company=payload.company,
             location=payload.location,
@@ -568,7 +604,7 @@ def create_manual_listing(
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
     except service.InvalidStatusError as exc:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
-    return _to_saved_read(db, profile.id, saved)
+    return saved
 
 
 @router.post("/saved", response_model=SavedJobRead, status_code=status.HTTP_201_CREATED)
@@ -751,6 +787,7 @@ def _stored_match_read(match) -> Optional[JobMatchRead]:
 @router.post("/saved-searches", response_model=SavedSearchRead, status_code=status.HTTP_201_CREATED)
 def create_saved_search(
     payload: SavedSearchCreate,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> SavedSearchRead:
@@ -759,14 +796,39 @@ def create_saved_search(
     # Refused at the point of storing as well as at the point of running, so a free student is
     # told now rather than handed a saved search that fails every time they tap it.
     _refuse_premium_filters(db, profile.id, filters)
-    saved_search = service.create_saved_search(
-        db,
-        profile.id,
-        name=payload.name,
-        filters=filters,
-        notify_enabled=payload.notify_enabled,
-    )
-    return SavedSearchRead.model_validate(saved_search)
+
+    def perform() -> tuple[SavedSearchRead, int]:
+        saved_search = service.create_saved_search(
+            db,
+            profile.id,
+            name=payload.name,
+            filters=filters,
+            notify_enabled=payload.notify_enabled,
+        )
+        return SavedSearchRead.model_validate(saved_search), saved_search.id
+
+    def read_back(search_id: int) -> Optional[SavedSearchRead]:
+        existing = db.get(JobSavedSearch, search_id)
+        if existing is None or existing.profile_id != profile.id:
+            return None
+        return SavedSearchRead.model_validate(existing)
+
+    try:
+        # Nothing deduplicates saved searches, so a replay leaves the student with the same
+        # search listed twice -- visible on their own screen and theirs to delete.
+        return idempotency.run_once(
+            db,
+            profile.id,
+            operation="job_hunt.save_search",
+            idempotency_key=idempotency_key,
+            params={"name": payload.name, "filters": filters,
+                    "notify_enabled": payload.notify_enabled},
+            perform=perform,
+            read_back=read_back,
+            result_kind="job_saved_search",
+        )
+    except idempotency.IdempotencyError as exc:
+        raise idempotency_http_error(exc, logger, "job_hunt.save_search")
 
 
 @router.get("/saved-searches", response_model=List[SavedSearchRead])
@@ -1188,6 +1250,7 @@ def job_alert_history(
 @router.post("/alerts", response_model=JobAlertRead, status_code=status.HTTP_201_CREATED)
 def create_job_alert(
     payload: JobAlertCreate,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> JobAlertRead:
@@ -1198,29 +1261,59 @@ def create_job_alert(
     # was stored.)
     if payload.filters is not None:
         _refuse_premium_filters(db, profile.id, payload.filters.model_dump(exclude_none=True))
+
+    def perform() -> tuple[JobAlertRead, int]:
+        try:
+            alert = job_alerts.create_alert(
+                db,
+                profile.id,
+                name=payload.name,
+                saved_search_id=payload.saved_search_id,
+                filters=payload.filters.model_dump(exclude_none=True) if payload.filters else None,
+                frequency=payload.frequency,
+                day_of_week=payload.day_of_week,
+                hour_local=payload.hour_local,
+                quiet_hours_start=payload.quiet_hours_start,
+                quiet_hours_end=payload.quiet_hours_end,
+                is_enabled=payload.is_enabled,
+            )
+        except job_alerts.AlertNotFoundError as exc:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
+        except job_alerts.AlertLimitReachedError as exc:
+            # 403 and not 409: this is an entitlement ceiling, and the client routes it to the
+            # upgrade prompt rather than to a retry.
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
+        except job_alerts.InvalidAlertError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+        return _to_alert_read(db, alert), alert.id
+
+    def read_back(alert_id: int) -> Optional[JobAlertRead]:
+        existing = db.get(JobAlert, alert_id)
+        if existing is None or existing.profile_id != profile.id:
+            return None
+        return _to_alert_read(db, existing)
+
     try:
-        alert = job_alerts.create_alert(
+        # create_alert already returns the existing alert for a repeat on the same saved
+        # search, but the client's savedSearchId defaults to null and *that* path inserts
+        # unconditionally -- so a replay of a filters-only alert means duplicate notifications.
+        return idempotency.run_once(
             db,
             profile.id,
-            name=payload.name,
-            saved_search_id=payload.saved_search_id,
-            filters=payload.filters.model_dump(exclude_none=True) if payload.filters else None,
-            frequency=payload.frequency,
-            day_of_week=payload.day_of_week,
-            hour_local=payload.hour_local,
-            quiet_hours_start=payload.quiet_hours_start,
-            quiet_hours_end=payload.quiet_hours_end,
-            is_enabled=payload.is_enabled,
+            operation="job_hunt.create_alert",
+            idempotency_key=idempotency_key,
+            params={
+                "name": payload.name,
+                "saved_search_id": payload.saved_search_id,
+                "filters": payload.filters.model_dump(exclude_none=True) if payload.filters else None,
+                "frequency": payload.frequency,
+            },
+            perform=perform,
+            read_back=read_back,
+            result_kind="job_alert",
         )
-    except job_alerts.AlertNotFoundError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc))
-    except job_alerts.AlertLimitReachedError as exc:
-        # 403 and not 409: this is an entitlement ceiling, and the client routes it to the
-        # upgrade prompt rather than to a retry.
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc))
-    except job_alerts.InvalidAlertError as exc:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
-    return _to_alert_read(db, alert)
+    except idempotency.IdempotencyError as exc:
+        raise idempotency_http_error(exc, logger, "job_hunt.create_alert")
 
 
 @router.patch("/alerts/{alert_id}", response_model=JobAlertRead)

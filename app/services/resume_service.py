@@ -154,6 +154,24 @@ def process_resume_upload(
     )
 
 
+def read_uploaded_resume(db: Session, profile_id: int, resume_id: int) -> Optional[ResumeUploadResponse]:
+    """An earlier upload as process_resume_upload would have returned it, or None.
+
+    Used to answer a replayed upload from the Resume the first attempt created, so a lost
+    response costs neither a second row nor a second parse-and-analyse pass. Re-read rather than
+    cached, so the parse_status reported is whatever it is now. Ownership is re-checked here and
+    never inferred from the claim.
+    """
+    resume = db.get(Resume, resume_id)
+    if resume is None or resume.profile_id != profile_id:
+        return None
+    return ResumeUploadResponse(
+        id=resume.id,
+        parse_status=resume.parse_status,
+        analysis=get_resume_analysis(db, resume.id, profile_id),
+    )
+
+
 def get_latest_resume(db: Session, profile_id: int) -> Optional[ResumeSummaryRead]:
     resume = (
         db.query(Resume)

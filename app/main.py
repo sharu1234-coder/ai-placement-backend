@@ -1,4 +1,6 @@
 import logging
+from collections.abc import Sequence
+from typing import Any
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.encoders import jsonable_encoder
@@ -179,6 +181,39 @@ def readiness_check(db: Session = Depends(get_db)) -> JSONResponse:
     )
 
 
+def _validation_errors_without_input(errors: Sequence[Any]) -> list[dict[str, Any]]:
+    """Pydantic's validation errors, minus the value the client actually submitted.
+
+    Each error Pydantic produces carries an `input` key holding the offending value verbatim.
+    Echoing it back is how `POST /auth/signup` with a too-short password answered 422 with that
+    password in the response body -- and the same shape would return a pasted job description, a
+    resume excerpt, or anything else a student typed into a field that failed validation.
+
+    FastAPI materialises these errors into plain dicts before the handler sees them, so Pydantic's
+    own `errors(include_input=False)` is not reachable here (`ValidationException.errors()` takes
+    no arguments); the stripping has to happen on the dicts.
+
+    What stays is everything a client needs to correct the request: `type`, `loc`, `msg` and the
+    schema-side constraint metadata in `ctx` (`min_length`, `pattern`, ...). The one `ctx` key
+    dropped is `error`, which holds the raised exception object rather than schema metadata --
+    `jsonable_encoder` would render it to a string, and for a custom validator that string is
+    whatever the validator chose to say about the input. Its text is already reproduced in `msg`,
+    so nothing diagnostic is lost.
+    """
+    safe: list[dict[str, Any]] = []
+    for error in errors:
+        if not isinstance(error, dict):
+            # Not a shape this function can reason about, so it is dropped rather than passed
+            # through: an unknown object here could carry the input in a field this never saw.
+            continue
+        cleaned = {key: value for key, value in error.items() if key != "input"}
+        ctx = cleaned.get("ctx")
+        if isinstance(ctx, dict):
+            cleaned["ctx"] = {k: v for k, v in ctx.items() if k != "error"}
+        safe.append(cleaned)
+    return safe
+
+
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
     return JSONResponse(
@@ -186,7 +221,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         content=jsonable_encoder(
             {
                 "detail": "Validation failed",
-                "errors": exc.errors(),
+                "errors": _validation_errors_without_input(exc.errors()),
                 "request_id": getattr(request.state, "request_id", None),
             }
         ),

@@ -1,6 +1,17 @@
 import logging
+from typing import Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Request,
+    UploadFile,
+    status,
+)
 from fastapi.responses import Response
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
@@ -8,6 +19,7 @@ from starlette.concurrency import run_in_threadpool
 from app.ai.provider import AIGenerationError, AIProvider, get_ai_provider
 from app.api.ai_errors import ai_unavailable
 from app.api.deps import get_current_user, get_db
+from app.api.idempotency_errors import idempotency_http_error
 from app.api.upload_utils import read_upload_limited
 from app.core.rate_limit import limiter
 from app.models.user import User
@@ -20,7 +32,7 @@ from app.schemas.interview import (
     StartInterviewRequest,
     SubmitInterviewAnswerRequest,
 )
-from app.services import interview_service
+from app.services import idempotency, interview_service
 from app.services.profile_service import get_or_create_profile
 
 logger = logging.getLogger(__name__)
@@ -46,14 +58,36 @@ _ALLOWED_AUDIO_CONTENT_TYPES = {"audio/mp4", "audio/m4a", "audio/x-m4a"}
 @router.post("", response_model=InterviewRead, status_code=status.HTTP_201_CREATED)
 def start_interview(
     payload: StartInterviewRequest,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> InterviewRead:
     profile = get_or_create_profile(db, current_user)
+
+    def perform() -> tuple[InterviewRead, int]:
+        try:
+            created = interview_service.start_interview(
+                db, profile.id, payload.type, payload.mode, payload.jd_id
+            )
+        except interview_service.InvalidInterviewRequestError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+        return created, created.id
+
     try:
-        return interview_service.start_interview(db, profile.id, payload.type, payload.mode, payload.jd_id)
-    except interview_service.InvalidInterviewRequestError as exc:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+        # start_interview inserts unconditionally, so a replayed start would leave a second
+        # half-finished interview in the student's history for one tap.
+        return idempotency.run_once(
+            db,
+            profile.id,
+            operation="interview.start",
+            idempotency_key=idempotency_key,
+            params={"type": payload.type, "mode": payload.mode, "jd_id": payload.jd_id},
+            perform=perform,
+            read_back=lambda rid: interview_service.read_interview(db, profile.id, rid),
+            result_kind="interview",
+        )
+    except idempotency.IdempotencyError as exc:
+        raise idempotency_http_error(exc, logger, "interview.start")
 
 
 @router.get("/{interview_id}/next-question", response_model=NextInterviewQuestionResponse)
