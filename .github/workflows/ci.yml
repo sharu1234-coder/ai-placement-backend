@@ -133,7 +133,15 @@ jobs:
           alembic downgrade base
           alembic upgrade head
 
-      - name: Run API tests against PostgreSQL
+      # `tests/api` was the whole of this step, which left a hole: the business-claim
+      # concurrency tests live in `tests/unit` and so had never run against PostgreSQL
+      # anywhere -- not in CI, and not locally, where no authorised disposable database is
+      # configured. They are exactly the tests that cannot be trusted from SQLite alone,
+      # because SQLite serialises writers with one database-level lock while PostgreSQL
+      # arbitrates per row, and the post-conflict re-read depends on READ COMMITTED taking a
+      # fresh snapshot per statement. Named explicitly rather than widening to `tests/unit`,
+      # so adding a slow unit suite to this PostgreSQL run stays a deliberate act.
+      - name: Run API and claim-concurrency tests against PostgreSQL
         env:
           TEST_DATABASE_URL: postgresql+psycopg2://postgres:postgres@localhost:5432/aiplacement_test
-        run: pytest -q tests/api
+        run: pytest -q tests/api tests/unit/test_business_claim.py

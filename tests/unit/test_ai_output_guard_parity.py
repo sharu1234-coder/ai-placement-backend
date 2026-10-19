@@ -64,6 +64,17 @@ _NON_TEXT_PROVIDER_METHODS: Dict[str, str] = {
         "Returns audio bytes, not text, and its input is InterviewQuestion.question_text -- "
         "already guarded at generation by interview_service before it was ever persisted."
     ),
+    "supports": (
+        "Capability introspection added in VA-0.5. Returns a bool about this provider's own "
+        "declared capabilities; it never contacts a model, so there is no model output."
+    ),
+    "require": (
+        "The raising counterpart of supports(), added in VA-0.5. Returns None or raises "
+        "AICapabilityError, whose message is composed entirely from the provider name and "
+        "capability enum -- no model is contacted and no generated text is involved. It is "
+        "how app/api/ai_deps.py refuses a voice route before any generation happens, which is "
+        "why that module appears to touch a provider without guarding output."
+    ),
 }
 
 # Modules that call a generation method but are the AI layer itself rather than a consumer of it.

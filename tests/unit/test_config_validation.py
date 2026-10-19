@@ -589,3 +589,61 @@ class TestGitHubOAuthGuards:
         with pytest.raises(RuntimeError) as caught:
             validate_for_production()
         assert secret not in str(caught.value)
+
+
+class TestDevelopmentOnlySpeechAdapters:
+    """The owner's standing decision is that speech adapters stay development-only.
+
+    Both settings default to `none`, so production cannot acquire one by omission -- but it can
+    by someone copying a developer's `.env`, and nothing else in the system would complain. The
+    adapters are the reason it has to fail closed: faster-whisper runs CPU inference inside the
+    request path, and pyttsx3 drives a host engine that is Windows-only as used here and
+    explicitly unproven on Linux.
+    """
+
+    def test_the_approved_default_passes(self, monkeypatch) -> None:
+        _production_base(monkeypatch)
+        _production_ready_ai(monkeypatch)
+        monkeypatch.setattr(settings, "stt_provider", "none")
+        monkeypatch.setattr(settings, "tts_provider", "none")
+
+        validate_for_production()  # must not raise
+
+    def test_a_development_recogniser_is_refused_in_production(self, monkeypatch) -> None:
+        _production_base(monkeypatch)
+        _production_ready_ai(monkeypatch)
+        monkeypatch.setattr(settings, "stt_provider", "faster-whisper")
+        monkeypatch.setattr(settings, "tts_provider", "none")
+
+        with pytest.raises(RuntimeError, match="STT_PROVIDER/TTS_PROVIDER"):
+            validate_for_production()
+
+    def test_a_development_synthesizer_is_refused_in_production(self, monkeypatch) -> None:
+        _production_base(monkeypatch)
+        _production_ready_ai(monkeypatch)
+        monkeypatch.setattr(settings, "stt_provider", "none")
+        monkeypatch.setattr(settings, "tts_provider", "pyttsx3")
+
+        with pytest.raises(RuntimeError, match="STT_PROVIDER/TTS_PROVIDER"):
+            validate_for_production()
+
+    def test_development_may_use_them_freely(self, monkeypatch) -> None:
+        """The whole point: the connected voice path is demonstrable locally. The guard is about
+        where those adapters may run, not whether they may exist."""
+        monkeypatch.setattr(settings, "environment", "development")
+        monkeypatch.setattr(settings, "stt_provider", "faster-whisper")
+        monkeypatch.setattr(settings, "tts_provider", "pyttsx3")
+
+        validate_for_production()  # returns early for development
+
+    def test_the_refusal_names_both_settings_and_neither_secret(self, monkeypatch) -> None:
+        _production_base(monkeypatch)
+        _production_ready_ai(monkeypatch)
+        monkeypatch.setattr(settings, "stt_provider", "faster-whisper")
+        monkeypatch.setattr(settings, "tts_provider", "pyttsx3")
+
+        with pytest.raises(RuntimeError) as caught:
+            validate_for_production()
+        message = str(caught.value)
+        assert "faster-whisper" in message and "pyttsx3" in message
+        assert settings.jwt_secret_key not in message

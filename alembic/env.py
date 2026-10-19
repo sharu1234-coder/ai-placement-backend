@@ -20,6 +20,8 @@ from app.models.career_path_project import CareerPathProject  # noqa: F401
 from app.models.career_path_skill_item import CareerPathSkillItem  # noqa: F401
 from app.models.career_strategy_target import CareerStrategyTarget  # noqa: F401
 from app.models.certification import Certification  # noqa: F401
+from app.models.conversation import Conversation  # noqa: F401
+from app.models.conversation import ConversationTurn  # noqa: F401
 from app.models.education import Education  # noqa: F401
 from app.models.evidence_state_snapshot import EvidenceStateSnapshot  # noqa: F401
 from app.models.experience import Experience  # noqa: F401

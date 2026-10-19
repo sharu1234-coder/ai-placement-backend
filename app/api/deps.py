@@ -21,16 +21,25 @@ def get_db() -> Generator[Session, None, None]:
         db.close()
 
 
-def get_current_user(
-    request: Request,
-    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
-    db: Session = Depends(get_db),
-) -> User:
+def authenticate_access_token(token: str, db: Session) -> User:
+    """Validate a bearer access token and return its user, or raise 401.
+
+    Extracted from :func:`get_current_user` in VA-2 so the WebSocket gateway
+    (``app/api/voice_session.py``) authenticates through exactly this code rather than a second
+    implementation. A realtime connection that drifted from the HTTP rules -- accepting a
+    refresh token, or one issued before a logout -- would be an authentication bypass that no
+    HTTP test could see.
+
+    Raises:
+        HTTPException: 401, with the same opaque detail for every cause. Which check failed is
+            not the caller's business; distinguishing them turns the endpoint into an oracle
+            for whether a user id exists or is active.
+    """
     credentials_error = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token"
     )
     try:
-        payload = decode_token(credentials.credentials)
+        payload = decode_token(token)
     except jwt.PyJWTError:
         raise credentials_error
 
@@ -50,6 +59,16 @@ def get_current_user(
         # logout/password-reset (app/api/auth.py's logout endpoint,
         # app/services/password_reset_service.py's reset_password both bump token_version).
         raise credentials_error
+
+    return user
+
+
+def get_current_user(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+    db: Session = Depends(get_db),
+) -> User:
+    user = authenticate_access_token(credentials.credentials, db)
 
     # Rate-limit identity, published only now -- past every check above, so it can never be set
     # for a request whose token was forged, expired, revoked, of the wrong type, or belongs to

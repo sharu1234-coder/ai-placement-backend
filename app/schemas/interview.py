@@ -1,7 +1,7 @@
 import datetime
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class StartInterviewRequest(BaseModel):
@@ -72,6 +72,21 @@ class NextInterviewQuestionResponse(BaseModel):
 class SubmitInterviewAnswerRequest(BaseModel):
     interview_question_id: int
     answer_text: str = Field(max_length=5_000)
+
+
+class SubmitSpokenTurnRequest(BaseModel):
+    """VA-9. One spoken turn: the question that was asked, and what the student said.
+
+    `extra="forbid"` so an invented field -- a `profile_id`, a `score`, a `completed` -- is a
+    422 rather than something quietly ignored. The transcript shares `answer_text`'s ceiling
+    because it *is* an answer; a voice path that accepted a longer one would mean the two modes
+    disagree about what a valid answer is.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    interview_question_id: int = Field(gt=0)
+    transcript: str = Field(min_length=1, max_length=5_000)
 
 
 class InterviewAnswerRead(BaseModel):

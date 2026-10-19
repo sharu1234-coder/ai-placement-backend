@@ -9,6 +9,12 @@ venv/
 env/
 
 .env
+# Backups and local variants of .env hold the same live credentials as .env itself.
+# .env.bak-203116 was found holding a real Razorpay key and secret, a GitHub OAuth client
+# secret and the token encryption key, while being untracked-but-NOT-ignored -- one blanket
+# `git add` away from being published. Only .env.example, which holds placeholders, is tracked.
+.env.*
+!.env.example
 *.db
 *.sqlite3
 /uploads/

@@ -86,9 +86,13 @@ class AnthropicProvider(AIProvider):
 
     transcribe()/synthesize_speech() are intentionally not implemented here -- production
     STT/TTS is separate provider work (this class covers only generate_structured/
-    generate_text, i.e. text generation), so both fall through to AIProvider's
-    NotImplementedError default until that work lands.
+    generate_text, i.e. text generation). That absence is now declared in `capabilities`
+    rather than only discovered by calling: with AI_PROVIDER=anthropic the voice routes are
+    refused while the request is still being set up (see provider.requires_ai) instead of
+    failing part-way through, which is what used to happen.
     """
+
+    name = "anthropic"
 
     def __init__(self, api_key: Optional[str] = None, model: Optional[str] = None) -> None:
         key = api_key or settings.anthropic_api_key

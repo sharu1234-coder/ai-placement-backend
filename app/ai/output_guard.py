@@ -37,6 +37,8 @@ from typing import Any, Mapping, Optional
 
 from pydantic import BaseModel
 
+from app.ai.input_guard import contains_marker
+
 _LEAK_MARKERS = (
     "security rule",
     "untrusted data",
@@ -51,10 +53,30 @@ _LEAK_MARKERS = (
 
 def looks_like_prompt_leak(text: Optional[str]) -> bool:
     """True if `text` contains a high-precision marker indicating the model echoed prompt
-    scaffolding instead of producing genuine subject-matter content."""
+    scaffolding instead of producing genuine subject-matter content.
+
+    The phrase list above is deliberately narrow. Delimiter syntax is checked separately via
+    input_guard's own regex rather than by adding more phrases: a `<<<MARKER>>>` token has no
+    legitimate place in a sentence shown to a student, so it is unambiguous, and reusing that
+    regex means the two halves of the guard cannot drift apart over what a marker looks like.
+    Added in VA-0.5 after an adversarial presence-audit test showed prose carrying a forged
+    `<<<OBSERVATIONS>>>` reaching the student -- it could not invent a finding (the closed
+    code vocabulary prevents that), but it should not be displayed either.
+    """
     if not text:
         return False
-    lowered = text.lower()
+    # Flattened *here*, inside the detector, rather than at the call sites. Every multi-word
+    # phrase below is defeated by a single newline inside it ("security\nrule"), and wrapped
+    # text is the ordinary shape of model output, not an exotic case. `normalize_whitespace`
+    # was written for precisely this and had no caller anywhere in the application, so every
+    # guarded field in the codebase was only ever matched against unwrapped text. Doing it
+    # here means no present or future call site can forget it. Both forms are checked for
+    # markers because flattening cannot repair a delimiter broken mid-token, while the raw
+    # form cannot match a phrase broken across a line.
+    flattened = normalize_whitespace(text)
+    if contains_marker(flattened) or contains_marker(text):
+        return True
+    lowered = flattened.lower()
     return any(marker in lowered for marker in _LEAK_MARKERS)
 
 
@@ -62,8 +84,11 @@ _WHITESPACE_RE = re.compile(r"\s+")
 
 
 def normalize_whitespace(text: str) -> str:
-    """Collapses newlines/repeated whitespace -- used so marker checks aren't defeated by a
-    line-wrapped phrase (e.g. "security\\nrule")."""
+    """Collapse newlines and repeated whitespace into single spaces.
+
+    Applied by `looks_like_prompt_leak` to everything it checks, so a marker phrase broken
+    across a line (e.g. "security\\nrule") reads the same as the unwrapped one. Defined below
+    its caller, which is fine: the name resolves at call time, not at definition time."""
     return _WHITESPACE_RE.sub(" ", text).strip()
 
 

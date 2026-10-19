@@ -15,6 +15,7 @@ from app.models.career_path_project import CareerPathProject
 from app.models.career_path_skill_item import CareerPathSkillItem
 from app.models.career_strategy_target import CareerStrategyTarget
 from app.models.certification import Certification
+from app.models.conversation import Conversation, ConversationTurn
 from app.models.education import Education
 from app.models.evidence_state_snapshot import EvidenceStateSnapshot
 from app.models.experience import Experience
@@ -492,6 +493,84 @@ def test_delete_account_succeeds_for_a_student_with_a_career_strategy_target(db_
     # The role is shared catalog data -- a student deleting their account must not remove a
     # role every other student compares against.
     assert db_session.get(Role, role.id) is not None
+
+
+def test_delete_account_succeeds_for_a_student_who_held_a_voice_session(db_session):
+    """The unified conversation store, in the same shape as the F-01 regression above.
+
+    `conversations.profile_id` is NOT NULL with no ondelete, and `delete_account` did not
+    mention the table at all when it was added with the realtime voice agent. The
+    consequences were two, and the second is the serious one:
+
+    1. a student's spoken transcripts -- career-coach conversations and mock-interview
+       answers, in their own words -- would have survived the deletion of their account;
+    2. they would not actually have survived it, because `db.delete(profile)` at the end of
+       `delete_account` would raise IntegrityError first. Account deletion was broken outright
+       for every student who had ever held a voice session, which after the voice agent
+       shipped is the ordinary case rather than an edge one.
+
+    The source-parity guard below catches the omission, but only by grepping the function for
+    a model name -- it cannot tell whether the rows genuinely go, or whether the delete is
+    ordered early enough to precede `interviews`. This test seeds both tables and asserts the
+    outcome, so the ordering is covered too.
+    """
+    user = User(email="voice-session@example.com", password_hash="hashed")
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+
+    profile = StudentProfile(user_id=user.id, full_name="Arun")
+    db_session.add(profile)
+    db_session.commit()
+    db_session.refresh(profile)
+
+    # A mock-interview conversation, because that is the variant that also carries an
+    # interview_id -- the reference that forces conversations to be deleted before interviews.
+    interview = Interview(profile_id=profile.id, type="technical", mode="voice", status="completed")
+    db_session.add(interview)
+    db_session.commit()
+    db_session.refresh(interview)
+
+    conversation = Conversation(
+        profile_id=profile.id,
+        kind="mock_interview",
+        session_key="voice-deletion-test",
+        interview_id=interview.id,
+        status="completed",
+    )
+    db_session.add(conversation)
+    db_session.commit()
+    db_session.refresh(conversation)
+
+    turn = ConversationTurn(
+        conversation_id=conversation.id,
+        seq=1,
+        role="user",
+        # NOT NULL: the gateway's own turn id, which with (conversation_id, role) is the
+        # unique key that makes a replayed turn a no-op rather than a duplicate.
+        turn_id="turn-1",
+        text="I led the migration of our billing service.",
+    )
+    db_session.add(turn)
+    db_session.commit()
+    db_session.refresh(turn)
+    conversation_id, turn_id, interview_id = conversation.id, turn.id, interview.id
+
+    delete_account(db_session, user, RecordingStorage())
+
+    assert db_session.get(User, user.id) is None
+    assert db_session.get(StudentProfile, profile.id) is None
+    # The transcript itself, which is the student's own speech and the whole point of erasure.
+    assert db_session.get(ConversationTurn, turn_id) is None
+    assert db_session.get(Conversation, conversation_id) is None
+    # Counted rather than fetched: `delete_account` removes interviews with a bulk delete and
+    # `synchronize_session=False`, so the Interview this test seeded is still in the session's
+    # identity map, and `get()` would try to refresh a row that no longer exists and raise
+    # ObjectDeletedError instead of returning None. A fresh SELECT answers the real question.
+    #
+    # The ordering it covers: the conversation references this interview, so if conversations
+    # were deleted after interviews, delete_account would already have failed above.
+    assert db_session.query(Interview).filter(Interview.id == interview_id).count() == 0
 
 
 def test_deleting_an_account_removes_the_jobs_that_student_typed_in(db_session):

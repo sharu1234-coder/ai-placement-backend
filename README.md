@@ -81,6 +81,90 @@ A `CloudProvider` implementation is added when a production AI service is chosen
 dev-only STT/TTS -- see Status below for details and why these must not ship to production
 as-is.
 
+### Provider capabilities
+
+A provider declares what it can do, and a route that needs a capability the configured
+provider lacks is refused when the request is set up rather than part-way through. `capabilities`
+is derived automatically from the methods a provider implements (`AIProvider.__init_subclass__`),
+so it cannot drift out of step with the code and cannot over-claim.
+
+| Provider | structured | text | transcribe | synthesize |
+|---|---|---|---|---|
+| `ollama` | yes | yes | yes (faster-whisper) | yes (pyttsx3 — see below) |
+| `anthropic` | yes | yes | **no** | **no** |
+
+With `AI_PROVIDER=anthropic`, `POST /interviews/{id}/answer/audio` and
+`GET /interviews/{id}/questions/{id}/audio` answer **503** with a fixed message; every
+non-voice route is unaffected. Previously those routes accepted the request and then failed
+inside the call site, after reading the upload. Text-only providers are therefore a supported
+configuration, not a broken one.
+
+### Server-side TTS (eSpeak on Linux)
+
+`synthesize_speech` calls `pyttsx3.init()` with no driver name, so it uses the platform
+default: **sapi5** on Windows, **nsss** on macOS, **espeak** on Linux. The code is not
+Windows-specific, but the host decides whether it works.
+
+**On Linux, the `espeak-ng` OS package is required.** The espeak driver loads `libespeak`
+through `ctypes`, so pip cannot install it and `requirements.txt` cannot express it:
+
+```
+apt-get install -y espeak-ng
+```
+
+This must be added to the deployment image when one is created — there is no Dockerfile in
+this repository yet, so the dependency currently has nowhere to be declared except here.
+
+**Status: NOT PROVEN on Linux.** `pyttsx3`'s documentation does not state whether the espeak
+driver supports `save_to_file`, and it has not been run on Linux. `tests/unit/test_tts_linux_contract.py`
+is the test that resolves it — it verifies initialisation, `save_to_file`, a valid WAV
+container, non-zero duration, and PCM parameters the Android `MediaPlayer` path accepts. It
+**skips** on non-Linux hosts, so a green run on Windows is not evidence. Run it on Linux with
+`espeak-ng` installed before claiming server-side TTS works.
+
+If the driver cannot be initialised, or produces no usable WAV, the provider raises
+`AICapabilityError` (a subclass of `AIGenerationError`) naming the reason, so the existing
+interview-audio API contract is preserved — the route answers its usual AI-unavailable
+response rather than a 500, and the operator gets the actual cause in the logs.
+
+### Provider-neutral speech layer (`app/speech`, VA-3)
+
+Separate from `AIProvider` and **additive**: nothing above changed. `AIProvider.transcribe` /
+`synthesize_speech` and the two interview audio endpoints behave exactly as documented above.
+
+The layer exists so a real STT/TTS provider can be adopted without its payloads leaking into
+the domain logic, and so an unsupported request is refused *before* work starts rather than at
+the call site. It declares capabilities (formats, sample rates, languages, streaming,
+confidence) and refuses a provider whose declaration contradicts its own code.
+
+```
+STT_PROVIDER=none | faster-whisper      TTS_PROVIDER=none | pyttsx3
+```
+
+Both default to `none`, which is a supported state: the text features do not need speech. **No
+production provider is selected** — `faster-whisper` is CPU-only here and English-only on a
+`.en` model, and `pyttsx3` depends on whatever speech engine the host has. The candidate
+research, the audio-format matrix, the measured numbers and the open questions are in
+[`docs/speech-provider-evaluation.md`](docs/speech-provider-evaluation.md).
+
+Audio conversion (`app/speech/audio.py`) goes through PyAV's FFmpeg `swresample`, which is
+already installed as a faster-whisper dependency. That matters because the Android-side
+resampler is documented as unsuitable for feeding a recogniser; this one is tested on the
+property that distinguishes them — a tone above the new Nyquist is attenuated rather than
+folded into the speech band.
+
+### Interview record retention
+
+Interview answers and evaluations are kept so a student can review what they said. Retention
+is **until the student deletes it**: `DELETE /interviews/{interview_id}` removes one
+interview with its questions, answers and evaluation, and account deletion removes all of
+them. There is **no automatic expiry**, and no purge schedule — adding one is a product
+decision, not an implementation detail.
+
+Raw audio is never stored. An audio answer is transcribed in memory and the recording is
+discarded; `interview_answers.audio_url` stays NULL by design. Transcripts are not used for
+model training.
+
 ## Status
 
 **Real bug found via reproduction: malformed Ollama response crashed instead of failing

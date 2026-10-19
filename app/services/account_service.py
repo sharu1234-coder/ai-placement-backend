@@ -13,6 +13,7 @@ from app.models.career_path_project import CareerPathProject
 from app.models.career_path_skill_item import CareerPathSkillItem
 from app.models.career_strategy_target import CareerStrategyTarget
 from app.models.certification import Certification
+from app.models.conversation import Conversation, ConversationTurn
 from app.models.education import Education
 from app.models.evidence_state_snapshot import EvidenceStateSnapshot
 from app.models.experience import Experience
@@ -264,6 +265,27 @@ def delete_account(db: Session, user: User, storage: StorageProvider) -> None:
         db.query(InterviewQuestion).filter(
             InterviewQuestion.interview_id.in_(db.query(Interview.id).filter(Interview.profile_id == pid))
         ).delete(synchronize_session=False)
+
+        # -- conversation_turns, then conversations: the unified voice transcript store added
+        # with the realtime voice agent. Turns first, because there is no DB-level cascade
+        # between them (conversation_history.delete_conversation deletes turns first for the
+        # same reason).
+        #
+        # Their position is forced from both sides. `conversations.interview_id` nullably
+        # references `interviews.id`, so they must precede the Interview delete immediately
+        # below; and `conversations.profile_id` is NOT NULL, so omitting them would not merely
+        # leave a student's spoken transcripts behind -- it would make the student_profiles
+        # delete at the end of this function fail outright with a foreign-key violation, which
+        # is to say account deletion would be broken for every student who had ever held a
+        # voice session. -------------------------------------------------------------------
+        db.query(ConversationTurn).filter(
+            ConversationTurn.conversation_id.in_(
+                db.query(Conversation.id).filter(Conversation.profile_id == pid)
+            )
+        ).delete(synchronize_session=False)
+        db.query(Conversation).filter(Conversation.profile_id == pid).delete(
+            synchronize_session=False
+        )
 
         # -- Mid-level: referenced by the leaves above, and themselves reference resumes/
         # assessment_blueprints/job_descriptions below -- must go before those parents. ----

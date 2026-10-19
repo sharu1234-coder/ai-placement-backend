@@ -22,6 +22,60 @@ class Settings(BaseSettings):
 
     ai_provider: str = "ollama"
 
+    # Load the local speech-to-text model at startup instead of on the first spoken answer.
+    #
+    # Measured on 2026-10-18: the faster-whisper model takes 2.09s to load and 0.000s once
+    # cached, and that 2.09s was being paid by whichever student happened to submit the first
+    # voice answer after a restart. Moving it to startup does not make the model faster; it
+    # moves a one-off cost off a student's critical path and onto the server's own boot.
+    #
+    # Only affects the local `ollama` provider, which is the only one that loads speech models
+    # in-process. Default on, because the cost of being wrong is a background thread that
+    # loads a model slightly earlier than it otherwise would; set false on a machine where
+    # memory at boot matters more than the first answer's latency.
+    warm_speech_models_on_startup: bool = True
+
+    # Which voice the local text-to-speech driver should speak with: "female", "male", or
+    # "system" to keep whatever the host's default is.
+    #
+    # Default "female" because the product's voice companion is specified as a warm female
+    # career coach, and nothing previously asked the driver for a voice at all -- so it used
+    # the host default, which on the development machine is "Microsoft David Desktop", a male
+    # voice measured at a median fundamental near 110 Hz. The female voice was already
+    # installed; it was simply never selected.
+    #
+    # This is a *preference*, not a guarantee: a host with no matching voice keeps its default
+    # rather than failing synthesis. Expressed as a gender rather than a voice name so the
+    # setting still means something on a Linux host running espeak-ng, whose voice ids are
+    # entirely different. See `select_voice` in app/speech/voice_selection.py -- which is now
+    # the single implementation. It used to live in app/ai/ollama_provider.py only, which is
+    # why this setting had no effect on the Voice Career Coach: that path runs through
+    # app/speech/pyttsx3_tts.py, which never selected a voice at all.
+    tts_voice_gender: str = "female"
+
+    # Whether an unsatisfiable `tts_voice_gender` is an error or a downgrade.
+    #
+    # False keeps the established behaviour: a host with no matching voice speaks with its
+    # default, because a student would rather hear the wrong voice than silence. The fallback
+    # is now logged as a warning and reported by `/api/v1/diagnostics/voice` either way -- it
+    # is the silence about it, not the fallback itself, that hid this defect.
+    #
+    # Set True on a deployment where speaking in the wrong voice is worse than failing the
+    # turn; synthesis then raises a typed `SpeechUnavailable` naming the real cause.
+    tts_voice_required: bool = False
+
+    # Speaking rate passed to the driver, or 0 to keep its default.
+    #
+    # 0, because the default was measured and is already fine. On this host with Zira, the
+    # driver default (SAPI rate 200) renders the 12-word technical test line at **167 wpm**;
+    # forcing rate 175 gives **149 wpm**. Conversational English is about 150-180 wpm, so the
+    # default already sits inside that band and overriding it would be an aesthetic
+    # preference dressed up as a fix -- and one nobody here can verify without listening.
+    #
+    # The setting exists so the rate can be tuned from configuration once somebody has
+    # actually listened, without another code change.
+    tts_voice_rate: int = 0
+
     # The hard wall-clock ceiling on ONE logical AI operation -- every attempt, every retry,
     # every backoff and the one schema correction, added together (see app/ai/retry.py). It is
     # the only number in this system that was already a statement about how long a person will
@@ -56,8 +110,17 @@ class Settings(BaseSettings):
     anthropic_timeout_seconds: int = 120
 
     # Dev-only local STT for OllamaProvider.transcribe -- swap for a cloud STT provider
-    # before real user testing (see CloudProvider note in README).
+    # before real user testing (see CloudProvider note in README). Also the default model for
+    # the VA-3 speech layer's faster-whisper adapter; ".en" in the name is what makes that
+    # adapter declare English-only, because it is a property of the weights.
     whisper_model_size: str = "tiny.en"
+
+    # VA-3 speech providers (app/speech). Default "none" on purpose: the text features must
+    # work with voice switched off, and no provider has been measured well enough to be a
+    # production default -- see docs/speech-provider-evaluation.md. Accepted values are in
+    # app/speech/selection.py; an unknown name raises rather than falling back silently.
+    stt_provider: str = "none"
+    tts_provider: str = "none"
 
     upload_dir: str = "uploads"
 
@@ -237,6 +300,12 @@ def _is_loopback_url(url: str) -> bool:
 # against a different string. Anyone could then mint a token for any user.
 #
 # Any new placeholder written into a committed file belongs in this set.
+#: Speech adapters that exist for local development only. Both settings default to "none", so
+#: these are opt-in; `validate_for_production` refuses them outside development because the
+#: owner's decision keeps every production speech provider unapproved.
+_DEVELOPMENT_ONLY_STT = frozenset({"faster-whisper"})
+_DEVELOPMENT_ONLY_TTS = frozenset({"pyttsx3"})
+
 _PUBLISHED_JWT_SECRETS = frozenset(
     {
         "dev-only-insecure-secret-change-in-production",  # Settings default
@@ -369,6 +438,20 @@ def validate_for_production() -> None:
             "ANTHROPIC_API_KEY), or, if you genuinely self-host Ollama, set OLLAMA_BASE_URL "
             "to its real reachable address (a hostname or service address the API can dial) "
             "-- from inside a container, localhost is the API container itself, not Ollama."
+        )
+    if settings.stt_provider in _DEVELOPMENT_ONLY_STT or settings.tts_provider in _DEVELOPMENT_ONLY_TTS:
+        # The owner's standing decision is that speech adapters stay development-only: no
+        # production STT or TTS provider is approved. Both settings default to "none", so a
+        # production deployment cannot acquire one by accident -- but it could acquire one by
+        # copying a developer's .env, and nothing else would complain. The adapters themselves
+        # are the reason this must fail closed: faster-whisper runs CPU inference inside the
+        # request path, and pyttsx3 drives a host speech engine that is Windows-only as used
+        # here and unproven on Linux (tests/unit/test_tts_linux_contract.py skips, saying so).
+        raise RuntimeError(
+            "STT_PROVIDER/TTS_PROVIDER are set to development-only speech adapters "
+            f"(stt={settings.stt_provider!r}, tts={settings.tts_provider!r}) and no production "
+            "speech provider has been approved. Leave both at 'none' outside development, or "
+            "obtain approval for a production provider first."
         )
     if settings.razorpay_key_id is not None and settings.razorpay_key_id.startswith("rzp_test_"):
         # Unlike the checks above, a missing/None razorpay_key_id is left alone here -- that

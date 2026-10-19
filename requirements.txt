@@ -64,6 +64,11 @@ python-multipart==0.0.32
 # Voice (Stage 10) -- dev-only local STT/TTS for OllamaProvider. Swap for a cloud provider
 # before real user testing (see README).
 faster-whisper==1.2.1
+# pyttsx3 picks the platform's default driver: sapi5 (Windows), nsss (macOS), espeak
+# (Linux). NOT a Windows-only package -- but on Linux it needs the espeak-ng OS package,
+# which pip cannot install and this file cannot express. Declare it in the deployment image;
+# see README "Server-side TTS (eSpeak on Linux)". Until that path is tested on Linux, treat
+# server-side TTS as unproven there.
 pyttsx3==2.99
 pywin32==312; sys_platform == "win32"  # pyttsx3's SAPI5 driver needs this on Windows
 

@@ -109,6 +109,34 @@ class TestSelection:
 
 
 class TestBatchIsolation:
+    @pytest.fixture(autouse=True)
+    def _frozen_clock(self, monkeypatch):
+        """Pin the batch's clock, because every test in this class depends on one.
+
+        `main()` calls `_utcnow()` itself rather than taking a time, so unlike the
+        `_due_alerts` tests above -- which pass `NOW` explicitly -- these ran against the
+        machine's real clock. `alerts.is_due` returns False while `now.hour <
+        alert.hour_local`, and every alert seeded here uses the helper's default
+        `hour_local=9`, so nothing in this class was due unless the suite happened to run at
+        or after 09:00 **UTC**.
+
+        That was not a theoretical window. A full run on 2026-10-18 at 07:18-08:33 UTC failed
+        `test_one_failing_alert_does_not_stop_the_others` with `0 == 1`, while the run before
+        it at 21:19-22:29 UTC passed -- the same code, the same assertions, a different hour
+        of the day.
+
+        Freezing the clock makes these assertions stronger, not weaker. The failure above was
+        the loud half; the quiet half is that
+        `test_an_alert_whose_profile_vanished_is_skipped_not_fatal` and
+        `test_a_dry_run_changes_nothing` both assert that `run_alert` is *never* called, which
+        an empty due-list satisfies for the wrong reason. Before this fixture they passed
+        vacuously for most of the day without exercising the paths they name.
+
+        NOW is 18:00, comfortably past the seeded hour, so "due" is decided by the rule under
+        test rather than by when the suite was started.
+        """
+        monkeypatch.setattr(run_due_alerts, "_utcnow", lambda: NOW)
+
     def test_one_failing_alert_does_not_stop_the_others(self, db, monkeypatch):
         """The production-critical property. A batch that aborts on its first unexpected error
         silently delivers nothing to everyone else that night."""

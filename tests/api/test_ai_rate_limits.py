@@ -55,6 +55,18 @@ class FakeAIProvider(AIProvider):
     def generate_text(self, prompt):
         return "fake text"
 
+    # The two voice methods exist so this double is voice-capable, which the audio rate-limit
+    # tests below need: capabilities are derived from the methods a provider implements
+    # (app/ai/provider.py), and a provider that does not implement these is now refused with
+    # 503 when the request is set up -- before the route body, and so before the rate limit
+    # these tests are actually about. Neither is called here: both audio tests use a
+    # nonexistent interview, so the route 404s on ownership first.
+    def transcribe(self, audio):
+        return "fake transcript"
+
+    def synthesize_speech(self, text):
+        return b"RIFF" + b"\x00" * 64
+
 
 @pytest.fixture(autouse=True)
 def isolated_upload_dir(tmp_path, monkeypatch):

@@ -16,6 +16,7 @@ import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine
@@ -36,6 +37,32 @@ IDENTITY = {"jd_id": 7}
 
 @pytest.fixture()
 def engine(tmp_path):
+    """The database these concurrency tests actually run against -- and what that is worth.
+
+    **On SQLite (the default here, and what every result in this file was produced on.)** A file
+    rather than `:memory:`, so a second session on a second thread is a genuinely separate
+    connection, and `timeout=30` lets a writer wait for the database lock instead of failing
+    instantly. That is enough to exercise the real code paths: two connections racing the same
+    `UNIQUE (profile_id, idempotency_key)` insert, the loser's `IntegrityError`, the savepoint
+    rollback, the re-read, and the polling wait. The deterministic coalescing proof above holds
+    here.
+
+    What SQLite cannot establish is how the race is *arbitrated*. SQLite serialises writers with
+    a single database-level lock, so the loser of the insert race has typically been made to wait
+    for the winner's whole transaction. PostgreSQL arbitrates per row: a concurrent insert of the
+    same key blocks on the uncommitted tuple and then raises on the winner's commit, and the
+    re-read after `db.rollback()` only sees the winner's row because READ COMMITTED takes a fresh
+    snapshot per statement -- under REPEATABLE READ it would not. The production code is written
+    for that model (see `_insert`, which rolls back explicitly and says why), but *written for*
+    is not *tested on*.
+
+    **So: PostgreSQL concurrency is NOT PROVEN by this file.** Not "probably fine" -- untested.
+    Running it there needs one environment variable and nothing else: set `TEST_DATABASE_URL` and
+    this fixture uses PostgreSQL with a 15 s `lock_timeout`. As of 2026-10-14 a server is
+    listening on this host's port 5432, but no `TEST_DATABASE_URL` is set and credentials are
+    never probed for, which is the same reason
+    `tests/scripts/test_backup_restore_roundtrip.py` skips.
+    """
     if _TEST_DATABASE_URL:
         eng = create_engine(_TEST_DATABASE_URL, poolclass=NullPool,
                             connect_args={"options": "-c lock_timeout=15000"})
@@ -176,6 +203,76 @@ def await_generation(resource, timeout=60):
     while resource.generations == 0:
         assert time.monotonic() < limit, "no generation ever started"
         time.sleep(0.01)
+
+
+class WaiterWatch:
+    """Witnesses the moment a request registers as waiting on an in-flight claim.
+
+    ## Why this exists
+
+    These tests used to release the owner after `time.sleep(0.4)`, with a comment saying it was
+    "long enough for the waiter to have found the claim taken and entered the wait". It was not
+    always long enough. `test_concurrent_requests_generate_once_and_a_later_one_generates_again`
+    failed once in a full suite run and in 1 of 15 isolated runs, reporting "three overlapping
+    requests generated 2 times" -- and both numbers were *correct answers to different
+    questions*. A follower that reaches the claim check after the owner has settled is not a
+    concurrent duplicate; for `on_settled=REGENERATE` it is a new deliberate request, and
+    generating again is the documented policy, pinned separately by
+    `test_a_request_arriving_after_settlement_regenerates`. The old test could not tell the two
+    situations apart, so it asserted the coalescing property while sometimes exercising the
+    regeneration one.
+
+    ## What is intercepted, and why this is not a mock of the contract
+
+    `run_business_once` calls `time.sleep` from exactly one place: the branch it takes after
+    reading the claim as `claimed` and not stale, immediately before setting its own `waited`
+    flag. Entering that sleep is therefore not a scheduling artefact to be guessed at -- it *is*
+    the production act these tests need to witness, the point at which a request has joined the
+    owner's generation and so is owed the owner's result.
+
+    Nothing about the concurrency contract is replaced or simulated. The module's clock is
+    swapped for one that reports each thread's first arrival in the wait and then sleeps for
+    real, merely briefly, so the test is not paced by the production poll interval. Swapping the
+    module's `time` rather than the global one keeps the interception inside the code under test.
+    """
+
+    def __init__(self, monkeypatch, cap=0.01):
+        self._joined = threading.Semaphore(0)
+        self._seen = set()
+        self._lock = threading.Lock()
+        real_sleep, real_monotonic = time.sleep, time.monotonic
+
+        def observed_sleep(seconds):
+            thread = threading.get_ident()
+            with self._lock:
+                first = thread not in self._seen
+                self._seen.add(thread)
+            if first:
+                self._joined.release()
+            real_sleep(min(seconds, cap))
+
+        monkeypatch.setattr(
+            idempotency,
+            "time",
+            SimpleNamespace(sleep=observed_sleep, monotonic=real_monotonic),
+        )
+
+    def await_joined(self, count, timeout=60):
+        """Block until `count` distinct requests have joined the in-flight claim.
+
+        Fails rather than proceeding if they never do. A test that released the owner anyway
+        would be back to asserting coalescing while exercising something else.
+        """
+        for index in range(count):
+            assert self._joined.acquire(timeout=timeout), (
+                "only %d of %d requests registered as waiting on the in-flight claim, so this "
+                "test is not exercising the coalescing branch at all" % (index, count)
+            )
+
+    @property
+    def joined(self):
+        with self._lock:
+            return len(self._seen)
 
 
 def claims(db, profile_id):
@@ -412,7 +509,7 @@ class TestRecovery:
         the owner commits, so it really does go round the polling branch rather than arriving
         after the fact and reading a finished resource.
         """
-        monkeypatch.setattr(idempotency, "BUSINESS_POLL_FIRST", 0.05)
+        watch = WaiterWatch(monkeypatch)
         setup = sessions()
         profile = make_profile(setup)
         resource = Resource()
@@ -423,12 +520,15 @@ class TestRecovery:
             owner = pool.submit(run, owner_session, profile.id, resource)
             await_generation(resource)
             waiter = pool.submit(run, waiter_session, profile.id, resource)
-            # Long enough for the waiter to have found the claim taken and entered the wait.
-            time.sleep(0.4)
-            resource.gate.set()
+            try:
+                # Not a sleep: the owner is released once the waiter has provably joined.
+                watch.await_joined(1)
+            finally:
+                resource.gate.set()
             assert owner.result(timeout=60) == "result #1"
             assert waiter.result(timeout=60) == "result #1"
 
+        assert watch.joined == 1, "the waiter never went round the polling branch"
         assert resource.generations == 1, "the waiter must not have generated anything"
 
     def test_a_resource_deleted_after_it_was_generated_can_be_generated_again(self, db):
@@ -532,7 +632,7 @@ class TestRegenerate:
         The waiter overlapped the owner, so it is a duplicate and gets the owner's result. It must
         not start a second generation, and it must not be handed a *later* one either.
         """
-        monkeypatch.setattr(idempotency, "BUSINESS_POLL_FIRST", 0.05)
+        watch = WaiterWatch(monkeypatch)
         setup = sessions()
         profile = make_profile(setup)
         resource = Repeatable()
@@ -543,39 +643,93 @@ class TestRegenerate:
             owner = pool.submit(regenerate, owner_session, profile.id, resource)
             await_generation(resource)
             waiter = pool.submit(regenerate, waiter_session, profile.id, resource)
-            # Long enough for the waiter to have found the claim taken and entered the wait.
-            time.sleep(0.4)
-            resource.gate.set()
+            try:
+                watch.await_joined(1)
+            finally:
+                resource.gate.set()
             assert owner.result(timeout=60) == "result #1"
             assert waiter.result(timeout=60) == "result #1"
 
+        # Load-bearing for REGENERATE: the waiter is owed the owner's result *because* it
+        # overlapped, and this is the assertion that proves it overlapped.
+        assert watch.joined == 1, "the waiter never went round the polling branch"
         assert resource.generations == 1, "the waiter must not have generated anything"
 
-    def test_concurrent_requests_generate_once_and_a_later_one_generates_again(self, sessions):
-        """Both halves in one run, because getting one right by breaking the other is the trap."""
+    def test_concurrent_requests_that_all_joined_generate_once(self, sessions, monkeypatch):
+        """Three requests that provably overlap collapse to one generation.
+
+        The old version of this test used a start barrier and then released the owner the moment
+        it entered `perform`, which is the instant *before* the followers have read the claim.
+        When the scheduler cooperated it passed; when it did not, a follower arrived after
+        settlement and correctly regenerated, and the test reported that as a failure of
+        coalescing. It failed in 1 of 15 isolated runs and once in a full suite run.
+
+        A start barrier cannot fix that, because what matters is not when the followers *start*
+        but whether they reach the claim check while the claim is still in flight. So the owner
+        is now held until both followers have registered as waiting -- see [WaiterWatch] for why
+        that signal is the production act rather than a proxy for it.
+        """
+        watch = WaiterWatch(monkeypatch)
         setup = sessions()
         profile = make_profile(setup)
         resource = Repeatable()
         resource.gate = threading.Event()
-        started = threading.Barrier(3, timeout=60)
 
         def attempt():
-            own = sessions()
-            started.wait()
-            return regenerate(own, profile.id, resource)
+            return regenerate(sessions(), profile.id, resource)
 
         with ThreadPoolExecutor(max_workers=3) as pool:
             futures = [pool.submit(attempt) for _ in range(3)]
-            await_generation(resource)
-            resource.gate.set()
+            try:
+                await_generation(resource)
+                # One owner inside `perform`, two followers that have each read the claim as in
+                # flight. Only now may the owner settle.
+                watch.await_joined(2)
+            finally:
+                resource.gate.set()
             results = [f.result(timeout=60) for f in futures]
 
-        assert resource.generations == 1, f"three overlapping requests generated {resource.generations} times"
+        # Asserted before the count, because it is what makes the count mean anything: without
+        # it, "generated once" could equally describe a run in which two requests never
+        # overlapped at all.
+        assert watch.joined == 2, (
+            f"{watch.joined} of 2 followers joined the owner's generation, so this run did not "
+            "exercise coalescing"
+        )
+        assert resource.generations == 1, (
+            f"three overlapping requests generated {resource.generations} times"
+        )
         assert results == ["result #1"] * 3
 
+        # Both halves in one run, as the original test intended: coalescing three overlapping
+        # requests must not have left the resource unable to regenerate for a later deliberate
+        # one. Getting one right by breaking the other is the trap.
         resource.gate = None
         assert regenerate(sessions(), profile.id, resource) == "result #2"
         assert resource.generations == 2, "and the race must not have frozen the resource"
+
+    def test_a_request_arriving_after_settlement_regenerates(self, sessions):
+        """The other half, kept separate: a request that did not overlap is not a duplicate.
+
+        This is the behaviour the old test intermittently caught and mislabelled a bug. It is the
+        documented `on_settled=REGENERATE` policy -- the student pressed Generate again and is
+        owed a new generation, not a replay of the old one -- and it is deterministic here
+        because the owner is fully settled before the second request is submitted.
+        """
+        setup = sessions()
+        profile = make_profile(setup)
+        resource = Repeatable()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(regenerate, sessions(), profile.id, resource)
+            assert first.result(timeout=60) == "result #1"
+            # Settled, not merely started: no overlap is possible from here.
+            assert [c.status for c in claims(setup, profile.id)] == ["succeeded"]
+
+            second = pool.submit(regenerate, sessions(), profile.id, resource)
+            assert second.result(timeout=60) == "result #2"
+
+        assert resource.generations == 2, "a request that never overlapped must generate again"
 
     def test_a_failed_generation_is_still_retryable(self, db):
         profile = make_profile(db)

@@ -567,14 +567,37 @@ def submit_audio_answer(
     )
 
 
-def synthesize_question_audio(
-    db: Session, profile_id: int, interview_id: int, question_id: int, ai_provider: AIProvider
-) -> bytes:
-    _get_owned_interview(db, interview_id, profile_id)
+def owned_question(
+    db: Session, profile_id: int, interview_id: int, question_id: int
+) -> InterviewQuestion:
+    """One question, after both ownership checks. Public because VA-9's voice-turn controller
+    needs exactly this pair and a second copy of the rule is a second thing to drift.
 
+    Raises `InterviewNotFoundError` for a question that does not exist *and* for one belonging
+    to another interview, which is the same undisclosing answer every other check here gives.
+    """
+    _get_owned_interview(db, interview_id, profile_id)
     question = db.get(InterviewQuestion, question_id)
     if question is None or question.interview_id != interview_id:
         raise InterviewNotFoundError("Interview question not found")
+    return question
+
+
+def answer_text_for(db: Session, interview_question_id: int) -> Optional[str]:
+    """The stored answer for a question, or None. A read, so it creates nothing.
+
+    VA-9 uses it to tell a first submission from a resend of the same answer -- both of which
+    `submit_answer` answers with success, deliberately, so the distinction is not visible in
+    its return value.
+    """
+    existing = _existing_answer(db, interview_question_id)
+    return None if existing is None else existing.answer_text
+
+
+def synthesize_question_audio(
+    db: Session, profile_id: int, interview_id: int, question_id: int, ai_provider: AIProvider
+) -> bytes:
+    question = owned_question(db, profile_id, interview_id, question_id)
 
     # Outside any transaction (F12-07). Speech synthesis writes nothing, so the whole of the rest
     # of this request is the provider call -- there is no reason to hold a connection for it.
@@ -911,3 +934,52 @@ def get_evaluation(
         )
 
     return _evaluation_read(evaluation)
+
+
+def delete_interview(db: Session, profile_id: int, interview_id: int) -> None:
+    """Delete one of this student's interviews and everything recorded under it.
+
+    Why this exists (VA-0.5 item 0.5-5). Interview answers are retained deliberately, so a
+    student can review what they said and how it was evaluated -- that is the feature, not an
+    oversight. But retention without a way out is not a policy, it is just accumulation, and
+    until now the only way to remove a transcript was to delete the entire account
+    (account_service.delete_account). This is the narrow version of that: one interview, at
+    the student's own request.
+
+    Retention behaviour, stated because it is now a product promise rather than an accident:
+
+      * Answers and evaluations persist until the student deletes them, or deletes their
+        account. There is NO automatic expiry -- none is implemented here, and none should be
+        inferred from this function's existence.
+      * Raw audio is never stored at any point, so there is none to delete. The recording is
+        transcribed in memory and discarded; `interview_answers.audio_url` stays NULL by
+        design (see submit_audio_answer). Deleting the row therefore removes everything the
+        server ever held about that answer.
+
+    Ownership is checked first and by the same helper every other interview operation uses,
+    so another student's interview is indistinguishable from one that does not exist.
+
+    Deletion order is child-to-parent because `tests/conftest.py` enables
+    PRAGMA foreign_keys=ON for SQLite and production is PostgreSQL, which enforces foreign
+    keys on every statement -- deleting the interview first would be rejected by both.
+    """
+    interview = _get_owned_interview(db, interview_id, profile_id)
+
+    question_ids = [
+        row[0]
+        for row in db.query(InterviewQuestion.id)
+        .filter(InterviewQuestion.interview_id == interview.id)
+        .all()
+    ]
+    if question_ids:
+        db.query(InterviewAnswer).filter(
+            InterviewAnswer.interview_question_id.in_(question_ids)
+        ).delete(synchronize_session=False)
+    db.query(InterviewEvaluation).filter(
+        InterviewEvaluation.interview_id == interview.id
+    ).delete(synchronize_session=False)
+    db.query(InterviewQuestion).filter(
+        InterviewQuestion.interview_id == interview.id
+    ).delete(synchronize_session=False)
+    db.query(Interview).filter(Interview.id == interview.id).delete(synchronize_session=False)
+    db.commit()

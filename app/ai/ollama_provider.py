@@ -8,7 +8,7 @@ from typing import Optional
 import httpx
 from pydantic import ValidationError
 
-from app.ai.provider import AIGenerationError, AIProvider, T
+from app.ai.provider import AICapability, AICapabilityError, AIGenerationError, AIProvider, T
 from app.ai.retry import AIOperationBudget, FailureCategory, FailureVerdict
 from app.core.config import settings
 
@@ -115,6 +115,11 @@ def _extract_response_text(body: object) -> str:
 _whisper_model = None
 _whisper_model_lock = threading.Lock()
 
+# A WAV file is a 44-byte canonical header plus samples, so anything at or under that is a
+# header with no audio in it -- which is what a driver that "succeeded" without synthesising
+# anything leaves behind.
+_MIN_WAV_BYTES = 45
+
 
 def _get_whisper_model():
     global _whisper_model
@@ -134,7 +139,38 @@ def _get_whisper_model():
     return _whisper_model
 
 
+def _select_voice(engine) -> Optional[str]:
+    """Point the local speech driver at a voice matching the configured preference.
+
+    Thin wrapper over `app.core.voice_selection.select_voice`, kept because this module's
+    call site reads better with a one-argument helper and because the name appears in
+    existing tests.
+
+    The logic used to live here in full, and that was the defect. This was the *only* place
+    that selected a voice, and it is on the AI-provider path -- reached by the Mock Interview
+    question-speaking call in `app/services/interview_service.py`. The Voice Career Coach runs
+    through `app/voice/turn_runtime.py` -> `app/speech/pyttsx3_tts.py`, which had no selection
+    at all, so it kept speaking in the host default. Both paths now share one implementation.
+
+    Returns the chosen voice's name for the caller to record, or None when the host default
+    was kept. The full typed outcome is logged by `select_voice`; a caller that needs to act
+    on *why* a preference went unmet should call it directly rather than reading this None.
+    """
+    from app.core.voice_selection import log_choice, select_voice
+
+    choice = select_voice(engine)
+    log_choice(choice, where="ollama synthesize_speech")
+    return choice.voice_name
+
+
 class OllamaProvider(AIProvider):
+    # Capabilities are derived from the methods below (see AIProvider.__init_subclass__):
+    # transcribe() via faster-whisper, synthesize_speech() via pyttsx3. Whether the TTS
+    # driver is actually usable on the host is a separate, runtime question -- see
+    # synthesize_speech below, which raises AICapabilityError with the reason rather than
+    # letting a missing OS package surface as a generic failure.
+    name = "ollama"
+
     def __init__(self, base_url: Optional[str] = None, model: Optional[str] = None) -> None:
         self.base_url = base_url or settings.ollama_base_url
         self.model = model or settings.ollama_model
@@ -197,21 +233,63 @@ class OllamaProvider(AIProvider):
             Path(tmp_path).unlink(missing_ok=True)
 
     def synthesize_speech(self, text: str) -> bytes:
-        """Dev-only local TTS (Windows SAPI5 via pyttsx3). Swap for a cloud TTS provider
-        before real user testing -- voice quality is robotic, not production-grade."""
+        """Dev-only local TTS via pyttsx3. Swap for a cloud TTS provider before real user
+        testing -- voice quality is robotic, not production-grade.
+
+        `pyttsx3.init()` is called without a driverName, so it selects the platform default:
+        sapi5 on Windows, nsss on macOS, espeak on everything else including Linux. The code
+        is not Windows-specific; the *host* is what decides whether this works. The Linux
+        espeak driver loads libespeak through ctypes, so the espeak-ng OS package must be
+        installed -- pip cannot supply it, and requirements.txt therefore cannot express it.
+        See README "Server-side TTS (eSpeak on Linux)".
+
+        An unusable driver is reported as AICapabilityError, not as a generic failure: the
+        two need different responses (install a package / investigate the request), and only
+        the typed error says which. VERIFIED on Windows; the Linux path is NOT YET TESTED --
+        tests/unit/test_tts_linux_contract.py holds the test that resolves it.
+        """
         import pyttsx3
 
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             tmp_path = tmp.name
         try:
-            engine = pyttsx3.init()
+            try:
+                engine = pyttsx3.init()
+            except Exception as exc:
+                # The driver could not be loaded at all. On Linux this is what a missing
+                # espeak-ng looks like; pyttsx3 surfaces it as an OSError from ctypes or as
+                # its own EngineError, so the type is not reliable enough to match on.
+                raise AICapabilityError(
+                    self.name,
+                    AICapability.SYNTHESIZE,
+                    reason=f"the local text-to-speech driver could not be initialised: {exc}",
+                ) from exc
+
+            _select_voice(engine)
             engine.save_to_file(text, tmp_path)
             engine.runAndWait()
-            return Path(tmp_path).read_bytes()
+            audio = Path(tmp_path).read_bytes()
+        except AICapabilityError:
+            raise
         except Exception as exc:
             raise AIGenerationError(f"Could not synthesize speech: {exc}") from exc
         finally:
             Path(tmp_path).unlink(missing_ok=True)
+
+        # A driver that loads but writes nothing is the other half of the same problem: the
+        # espeak driver's save_to_file support is not documented per-driver, so an empty or
+        # header-only file must not be returned to the client as if it were audio. Android's
+        # MediaPlayer would fail to prepare it and the student would see a silent failure.
+        if len(audio) < _MIN_WAV_BYTES or audio[:4] != b"RIFF":
+            raise AICapabilityError(
+                self.name,
+                AICapability.SYNTHESIZE,
+                reason=(
+                    "the local text-to-speech driver produced no usable WAV output "
+                    f"({len(audio)} bytes)"
+                ),
+            )
+        return audio
 
     def _call_ollama(
         self, prompt: str, format_schema: Optional[dict], budget: AIOperationBudget, *, stage: str

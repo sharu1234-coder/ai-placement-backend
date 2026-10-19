@@ -1,4 +1,7 @@
+import contextlib
 import logging
+import threading
+import time
 from collections.abc import Sequence
 from typing import Any
 
@@ -14,6 +17,8 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
+from app.ai.provider import AICapabilityError
+from app.api.actions import router as actions_router
 from app.api.arena import router as arena_router
 from app.api.assessments import router as assessments_router
 from app.api.auth import router as auth_router
@@ -22,6 +27,8 @@ from app.api.career_goals import router as career_goals_router
 from app.api.career_path import router as career_path_router
 from app.api.career_strategy import router as career_strategy_router
 from app.api.career_twin import router as career_twin_router
+from app.api.coach import router as coach_router
+from app.api.conversations import router as conversations_router
 from app.api.deps import get_db
 from app.api.interviews import router as interviews_router
 from app.api.job_hunt import router as job_hunt_router
@@ -41,6 +48,7 @@ from app.api.roadmap import router as roadmap_router
 from app.api.skill_passport import router as skill_passport_router
 from app.api.subscriptions import router as subscriptions_router
 from app.api.users import router as users_router
+from app.api.voice_session import router as voice_session_router
 from app.api.weaknesses import router as weaknesses_router
 from app.core.app_check import verify_app_check_token
 from app.core.body_size_limit import MaxBodySizeMiddleware
@@ -56,7 +64,50 @@ logger = logging.getLogger(__name__)
 
 validate_for_production()
 
-app = FastAPI(title=settings.app_name)
+@contextlib.asynccontextmanager
+async def _lifespan(_: FastAPI):
+    """Warm the local speech model so the first student to speak does not pay for loading it.
+
+    On a background daemon thread, and that is the whole design:
+
+    - **Not awaited.** `WhisperModel(...)` is blocking CPU work. Awaiting it here would hold
+      the event loop and delay the port opening by ~2s, trading a cost on one request for a
+      cost on every restart.
+    - **Daemon.** The process must still be able to exit while this is running; a non-daemon
+      thread would hold shutdown open for the length of a model load.
+    - **Failure is logged and ignored.** This is an optimisation, not a dependency. If the
+      model cannot be loaded here it will fail the same way on the first transcription, where
+      the error already has a request to be reported on and a typed error to carry it. Making
+      startup fail would turn a slow first answer into a server that will not boot.
+
+    `_get_whisper_model()` holds a lock and returns the cached instance, so a student who
+    submits an answer while this is still running waits for the same load rather than starting
+    a second one.
+    """
+    if settings.warm_speech_models_on_startup and settings.ai_provider == "ollama":
+
+        def warm() -> None:
+            try:
+                from app.ai.ollama_provider import _get_whisper_model
+
+                started = time.perf_counter()
+                _get_whisper_model()
+                logger.info(
+                    "speech model warmed in %.2fs", time.perf_counter() - started
+                )
+            except Exception as exc:
+                # Type only, never the exception text: a model path can contain a local
+                # filesystem layout, and this line goes to the application log.
+                logger.warning(
+                    "speech model warm-up skipped (%s); the first spoken answer will load it",
+                    type(exc).__name__,
+                )
+
+        threading.Thread(target=warm, name="warm-speech-model", daemon=True).start()
+    yield
+
+
+app = FastAPI(title=settings.app_name, lifespan=_lifespan)
 
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
@@ -96,6 +147,7 @@ app.include_router(jobs_router, dependencies=_app_check_dep)
 app.include_router(job_hunt_router, dependencies=_app_check_dep)
 app.include_router(assessments_router, dependencies=_app_check_dep)
 app.include_router(interviews_router, dependencies=_app_check_dep)
+app.include_router(conversations_router, dependencies=_app_check_dep)
 app.include_router(roadmap_router, dependencies=_app_check_dep)
 app.include_router(progress_router, dependencies=_app_check_dep)
 app.include_router(legal_router)
@@ -114,6 +166,8 @@ app.include_router(weaknesses_router, dependencies=_app_check_dep)
 app.include_router(project_builder_router, dependencies=_app_check_dep)
 app.include_router(recruiter_attack_router, dependencies=_app_check_dep)
 app.include_router(arena_router, dependencies=_app_check_dep)
+app.include_router(actions_router, dependencies=_app_check_dep)
+app.include_router(coach_router, dependencies=_app_check_dep)
 # NOT router-level here: subscriptions_router also owns POST /subscriptions/webhook, called
 # by Razorpay's own servers (never the Android app), which will never carry an
 # X-Firebase-AppCheck header -- see the per-route dependency on every other route in
@@ -125,6 +179,12 @@ app.include_router(subscriptions_router)
 # GitHub has neither, so router-level App Check would 401 every successful authorisation. Every
 # other route on that router carries the dependency per-route -- see app/api/professional_presence.py.
 app.include_router(professional_presence_router)
+# Third exception, and a structural one rather than a caller quirk: voice_session_router owns a
+# WebSocket route, and a router-level HTTP dependency that raises HTTPException has no defined
+# behaviour on a WebSocket handshake. It calls verify_app_check_token itself, before accepting
+# the socket, so attestation is enforced through the same function and simply fails the upgrade
+# instead of raising into a protocol that cannot carry the error. See app/api/voice_session.py.
+app.include_router(voice_session_router)
 
 
 @app.get("/health")
@@ -212,6 +272,36 @@ def _validation_errors_without_input(errors: Sequence[Any]) -> list[dict[str, An
             cleaned["ctx"] = {k: v for k, v in ctx.items() if k != "error"}
         safe.append(cleaned)
     return safe
+
+
+@app.exception_handler(AICapabilityError)
+async def ai_capability_exception_handler(request: Request, exc: AICapabilityError) -> JSONResponse:
+    """A capability refusal is a server misconfiguration, not the student's fault.
+
+    This handler exists because `requires_ai` raises during dependency resolution, which is
+    outside the route body and therefore outside the `except AIGenerationError` that every AI
+    route already has. Without it the refusal would reach the bare-Exception handler and be
+    reported as a 500, which is both the wrong status and the wrong signal to an operator.
+
+    503 rather than 422: nothing about the request is wrong, and the condition is fixed by
+    configuring the server. The client message is fixed and provider-agnostic for the same
+    reason as app/api/ai_errors.py -- the exception text names the provider and the missing
+    capability, and that belongs in the log, not in a response any caller can trigger.
+    """
+    request_id = getattr(request.state, "request_id", None)
+    logger.error(
+        "AI provider cannot serve this route (provider=%s capability=%s reason=%s) "
+        "on %s %s [request_id=%s]",
+        exc.provider, exc.capability.value, exc.reason or "not declared",
+        request.method, request.url.path, request_id,
+    )
+    return JSONResponse(
+        status_code=503,
+        content={
+            "detail": "This feature is temporarily unavailable on the server.",
+            "request_id": request_id,
+        },
+    )
 
 
 @app.exception_handler(RequestValidationError)
