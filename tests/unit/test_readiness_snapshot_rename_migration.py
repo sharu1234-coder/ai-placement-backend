@@ -29,13 +29,17 @@ import uuid
 
 import pytest
 from alembic.config import Config
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import inspect, text
 from sqlalchemy.engine import make_url
 
 from alembic import command
 from app.core.config import settings
+from tests import db_safety
 
-_TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
+# Supplied by tests/db_safety.py, never read from the environment here: that module
+# refuses a target it cannot prove is disposable, and it does so at import time -- before
+# any fixture in this file can drop a table.
+_TEST_DATABASE_URL = db_safety.resolve_test_database_url()
 
 _TABLE = "readiness_snapshots"
 _PREVIOUS_REVISION = "9a2f7be31c04"
@@ -55,15 +59,20 @@ def migration_target(tmp_path, monkeypatch):
     if _TEST_DATABASE_URL:
         base = make_url(_TEST_DATABASE_URL)
         name = f"snapshot_rename_migration_test_{uuid.uuid4().hex[:8]}"
-        admin = create_engine(base.set(database="postgres"), isolation_level="AUTOCOMMIT")
+        admin = db_safety.make_engine(base.set(database="postgres"), isolation_level="AUTOCOMMIT")
         with admin.connect() as connection:
             connection.execute(text(f'CREATE DATABASE "{name}"'))
-        url = base.set(database=name).render_as_string(hide_password=False)
+        url = db_safety.hidden(
+            base.set(database=name).render_as_string(hide_password=False)
+        )
         monkeypatch.setattr(settings, "database_url", url)
-        yield url
-        with admin.connect() as connection:
-            connection.execute(text(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)'))
-        admin.dispose()
+        try:
+            yield url
+        finally:
+            # In a finally, so a test that errors cannot leave the database behind, and
+            # without FORCE -- see db_safety.drop_temp_database for why FORCE needs
+            # privileges over the superuser that this role deliberately does not have.
+            db_safety.drop_temp_database(admin, name)
     else:
         url = f"sqlite:///{tmp_path / 'snapshot_rename.db'}"
         monkeypatch.setattr(settings, "database_url", url)
@@ -78,7 +87,7 @@ def _alembic_config() -> Config:
 
 
 def _columns(url: str) -> dict:
-    engine = create_engine(url)
+    engine = db_safety.make_engine(url)
     try:
         return {c["name"]: c for c in inspect(engine).get_columns(_TABLE)}
     finally:
@@ -87,7 +96,7 @@ def _columns(url: str) -> dict:
 
 def _seed(url: str) -> None:
     """Rows exactly as they exist before this revision, under the OLD column name."""
-    engine = create_engine(url)
+    engine = db_safety.make_engine(url)
     now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat(sep=" ")
     insert_snapshot = (
         "INSERT INTO readiness_snapshots"
@@ -100,9 +109,9 @@ def _seed(url: str) -> None:
             connection.execute(
                 text(
                     "INSERT INTO users (id, email, password_hash, is_active, created_at, token_version)"
-                    " VALUES (1, 'pre@example.com', 'x', 1, :now, 0)"
+                    " VALUES (1, 'pre@example.com', 'x', :active, :now, 0)"
                 ),
-                {"now": now},
+                {"now": now, "active": True},
             )
             connection.execute(text("INSERT INTO student_profiles (id, user_id) VALUES (1, 1)"))
             for row_id, role_key, day, percent in _SEEDED:
@@ -122,7 +131,7 @@ def _seed(url: str) -> None:
 
 
 def _read_rows(url: str, column: str):
-    engine = create_engine(url)
+    engine = db_safety.make_engine(url)
     query = (
         f"SELECT id, profile_id, role_family_key, snapshot_date, {column}"
         f" FROM {_TABLE} ORDER BY id"
@@ -184,7 +193,7 @@ def test_the_unique_constraint_and_indexes_survive(seeded_at_previous_revision):
     same-day concurrency guarantee gone and the race test green for the wrong reason."""
     command.upgrade(_alembic_config(), _THIS_REVISION)
 
-    engine = create_engine(seeded_at_previous_revision)
+    engine = db_safety.make_engine(seeded_at_previous_revision)
     try:
         inspector = inspect(engine)
         unique_names = {u["name"] for u in inspector.get_unique_constraints(_TABLE)}

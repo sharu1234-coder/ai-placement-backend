@@ -24,7 +24,6 @@ two databases agree.
 """
 
 import datetime
-import os
 
 import pytest
 from cryptography.fernet import Fernet
@@ -42,15 +41,19 @@ from app.models.external_profile_snapshot import ExternalProfileSnapshot
 from app.models.profile import StudentProfile
 from app.models.provider_connection import ProviderConnection
 from app.models.user import User
+from tests import db_safety
 
-_TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
+# Supplied by tests/db_safety.py, never read from the environment here: that module
+# refuses a target it cannot prove is disposable, and it does so at import time -- before
+# any fixture in this file can drop a table.
+_TEST_DATABASE_URL = db_safety.resolve_test_database_url()
 
 
 @pytest.fixture()
 def db():
     if _TEST_DATABASE_URL:
         engine = create_engine(_TEST_DATABASE_URL, poolclass=NullPool)
-        Base.metadata.drop_all(bind=engine)
+        db_safety.drop_all_safely(engine)
     else:
         engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
 

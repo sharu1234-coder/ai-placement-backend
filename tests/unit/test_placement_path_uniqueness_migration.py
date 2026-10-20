@@ -33,14 +33,18 @@ import uuid
 
 import pytest
 from alembic.config import Config
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import inspect, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError
 
 from alembic import command
 from app.core.config import settings
+from tests import db_safety
 
-_TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
+# Supplied by tests/db_safety.py, never read from the environment here: that module
+# refuses a target it cannot prove is disposable, and it does so at import time -- before
+# any fixture in this file can drop a table.
+_TEST_DATABASE_URL = db_safety.resolve_test_database_url()
 
 _PREVIOUS_REVISION = "b1c47e0a52d9"
 _THIS_REVISION = "c9e2f5a71b04"
@@ -67,15 +71,20 @@ def migration_target(tmp_path, monkeypatch):
     if _TEST_DATABASE_URL:
         base = make_url(_TEST_DATABASE_URL)
         name = f"placement_path_uniqueness_{uuid.uuid4().hex[:8]}"
-        admin = create_engine(base.set(database="postgres"), isolation_level="AUTOCOMMIT")
+        admin = db_safety.make_engine(base.set(database="postgres"), isolation_level="AUTOCOMMIT")
         with admin.connect() as connection:
             connection.execute(text(f'CREATE DATABASE "{name}"'))
-        url = base.set(database=name).render_as_string(hide_password=False)
+        url = db_safety.hidden(
+            base.set(database=name).render_as_string(hide_password=False)
+        )
         monkeypatch.setattr(settings, "database_url", url)
-        yield url
-        with admin.connect() as connection:
-            connection.execute(text(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)'))
-        admin.dispose()
+        try:
+            yield url
+        finally:
+            # In a finally, so a test that errors cannot leave the database behind, and
+            # without FORCE -- see db_safety.drop_temp_database for why FORCE needs
+            # privileges over the superuser that this role deliberately does not have.
+            db_safety.drop_temp_database(admin, name)
     else:
         url = f"sqlite:///{tmp_path / 'placement_path_uniqueness.db'}"
         monkeypatch.setattr(settings, "database_url", url)
@@ -94,7 +103,7 @@ def _alembic_config() -> Config:
 
 def _at_previous_revision(url: str):
     command.upgrade(_alembic_config(), _PREVIOUS_REVISION)
-    return create_engine(url)
+    return db_safety.make_engine(url)
 
 
 def _upgrade():
@@ -102,7 +111,7 @@ def _upgrade():
 
 
 def _rows(url: str, sql: str, **params):
-    engine = create_engine(url)
+    engine = db_safety.make_engine(url)
     try:
         with engine.connect() as connection:
             return connection.execute(text(sql), params).all()
@@ -131,6 +140,26 @@ def _seed_path(connection, path_id: int, profile_id: int, status: str) -> None:
             " VALUES (:id, :pid, :status, :now)"
         ),
         {"id": path_id, "pid": profile_id, "status": status, "now": _NOW},
+    )
+
+
+def _seed_blueprint(connection, blueprint_id: int, profile_id: int) -> None:
+    """The parent row a topic's practice_blueprint_id points at.
+
+    SQLite does not enforce foreign keys unless asked to, so seeding the child alone passed
+    there for as long as this test has existed and raised ForeignKeyViolation the first time
+    it met PostgreSQL. The parent belongs to the fixture's truth rather than being a
+    workaround: a topic completed via an assessment really does reference a blueprint.
+
+    The columns are the ones the table has had since d36dd7ceee4e created it -- id, role_id,
+    jd_id, profile_id, source, sections -- so this is valid at the revision under test.
+    """
+    connection.execute(
+        text(
+            "INSERT INTO assessment_blueprints (id, profile_id, source, sections)"
+            " VALUES (:id, :pid, 'default_taxonomy', :sections)"
+        ),
+        {"id": blueprint_id, "pid": profile_id, "sections": "[]"},
     )
 
 
@@ -165,7 +194,7 @@ def _topics(url: str):
 
 
 def _assert_index_refuses_a_second_active_path(url: str, profile_id: int = 1) -> None:
-    engine = create_engine(url)
+    engine = db_safety.make_engine(url)
     try:
         with pytest.raises(IntegrityError):
             with engine.begin() as connection:
@@ -187,7 +216,7 @@ def test_the_index_exists_and_refuses_a_second_active_path(migration_target):
     _upgrade()
 
     indexes = {
-        index["name"] for index in inspect(create_engine(migration_target)).get_indexes("placement_paths")
+        index["name"] for index in inspect(db_safety.make_engine(migration_target)).get_indexes("placement_paths")
     }
     assert _INDEX in indexes, indexes
     _assert_index_refuses_a_second_active_path(migration_target)
@@ -207,7 +236,7 @@ def test_superseded_history_is_still_unlimited(migration_target):
     engine.dispose()
     _upgrade()
 
-    engine = create_engine(migration_target)
+    engine = db_safety.make_engine(migration_target)
     with engine.begin() as connection:
         for path_id in range(2, 8):
             _seed_path(connection, path_id, 1, "superseded")
@@ -233,6 +262,8 @@ def test_duplicate_active_paths_are_superseded_and_no_progress_is_lost(migration
         _seed_path(connection, 2, 1, "active")
         _seed_path(connection, 5, 1, "active")
         # Progress the student made on each copy, including on the ones about to be retired.
+        # Topic 10 was completed via an assessment, so its blueprint parent has to exist.
+        _seed_blueprint(connection, 77, 1)
         _seed_topic(connection, 10, 1, "sql_basics", "completed", "assessment", 77)
         _seed_topic(connection, 11, 2, "sql_joins", "in_progress")
         _seed_topic(connection, 12, 5, "sql_basics", "completed", "manual")
@@ -328,7 +359,7 @@ def test_the_migration_is_reversible_and_the_resolution_stands(migration_target)
     command.downgrade(_alembic_config(), _PREVIOUS_REVISION)
 
     indexes = {
-        index["name"] for index in inspect(create_engine(migration_target)).get_indexes("placement_paths")
+        index["name"] for index in inspect(db_safety.make_engine(migration_target)).get_indexes("placement_paths")
     }
     assert _INDEX not in indexes, indexes
     assert [(row.id, row.status) for row in _paths(migration_target)] == [
@@ -336,7 +367,7 @@ def test_the_migration_is_reversible_and_the_resolution_stands(migration_target)
         (2, "active"),
     ]
     # And a second active row is accepted again, which is what "the index is gone" means.
-    engine = create_engine(migration_target)
+    engine = db_safety.make_engine(migration_target)
     with engine.begin() as connection:
         _seed_path(connection, 3, 1, "active")
     engine.dispose()

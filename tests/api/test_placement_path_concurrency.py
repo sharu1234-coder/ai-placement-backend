@@ -35,7 +35,6 @@ has to be assertable as a status code with its body in the failure message rathe
 as a traceback from inside a worker thread.
 """
 
-import os
 import threading
 import time
 import uuid
@@ -60,8 +59,12 @@ from app.models.profile import StudentProfile
 from app.models.resume import Resume
 from app.models.resume_analysis import ResumeAnalysis
 from app.models.user import User
+from tests import db_safety
 
-_TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
+# Supplied by tests/db_safety.py, never read from the environment here: that module
+# refuses a target it cannot prove is disposable, and it does so at import time -- before
+# any fixture in this file can drop a table.
+_TEST_DATABASE_URL = db_safety.resolve_test_database_url()
 
 PASSWORD = "supersecret123"
 
@@ -116,7 +119,7 @@ def engine(tmp_path):
         eng = create_engine(
             _TEST_DATABASE_URL, poolclass=NullPool, connect_args={"options": "-c lock_timeout=15000"}
         )
-        Base.metadata.drop_all(bind=eng)
+        db_safety.drop_all_safely(eng)
     else:
         # check_same_thread=False because the route runs in Starlette's threadpool, so a session
         # is used by a different thread than created it -- the same reason app/database/session.py
@@ -138,7 +141,7 @@ def engine(tmp_path):
         yield eng
     finally:
         if _TEST_DATABASE_URL:
-            Base.metadata.drop_all(bind=eng)
+            db_safety.drop_all_safely(eng)
         eng.dispose()
 
 

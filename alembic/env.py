@@ -6,6 +6,7 @@ from sqlalchemy import pool
 from alembic import context
 
 from app.core.config import settings
+from app.database.alembic_url import set_sqlalchemy_url
 from app.database.base import Base
 
 # Imported for their side effect of registering tables with Base.metadata.
@@ -21,6 +22,8 @@ from app.models.career_path_skill_item import CareerPathSkillItem  # noqa: F401
 from app.models.career_strategy_target import CareerStrategyTarget  # noqa: F401
 from app.models.certification import Certification  # noqa: F401
 from app.models.conversation import Conversation  # noqa: F401
+from app.models.deletion_job import DeletionJob  # noqa: F401
+from app.models.deletion_request import DeletionRequest  # noqa: F401
 from app.models.conversation import ConversationTurn  # noqa: F401
 from app.models.education import Education  # noqa: F401
 from app.models.evidence_state_snapshot import EvidenceStateSnapshot  # noqa: F401
@@ -79,7 +82,10 @@ from app.models.weakness_record import WeaknessRecord  # noqa: F401
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
 config = context.config
-config.set_main_option("sqlalchemy.url", settings.database_url)
+# Not set_main_option directly: ConfigParser interpolates %, so a percent-encoded credential
+# raises before any migration runs -- and its error message quotes the URL. See
+# app/database/alembic_url.py.
+set_sqlalchemy_url(config, settings.database_url)
 
 # Interpret the config file for Python logging.
 # This line sets up loggers basically.

@@ -2,9 +2,14 @@ name: Backend CI
 
 on:
   push:
-    branches: [master]
+    # `master` plus the active development branch. Until 2026-10-19 this listed `master`
+    # only, while all real work happened on the long-running feature branch below -- so
+    # GitHub ran this workflow zero times for any of it, and `gh run list` showed nothing
+    # but Dependabot. A branch nobody tests is a branch whose green local run means nothing.
+    branches: [master, professional-presence-intelligence]
+  # No branch filter: a pull request into ANY branch gets checked, not only ones
+  # targeting `master`. Review on a feature branch was previously unguarded too.
   pull_request:
-    branches: [master]
 
 # Cancel a stale run for the same branch/PR when a new push arrives -- keeps this within the
 # free private-repo Actions minutes budget instead of stacking up redundant runs.
@@ -144,4 +149,16 @@ jobs:
       - name: Run API and claim-concurrency tests against PostgreSQL
         env:
           TEST_DATABASE_URL: postgresql+psycopg2://postgres:postgres@localhost:5432/aiplacement_test
+          # tests/db_safety.py refuses a destructive target that has not been declared
+          # disposable, because the suite drops every table in it before the first test. This
+          # database is created by the `services: postgres` container above and dies with the
+          # job, so declaring it here is a statement of fact.
+          TEST_DATABASE_DESTRUCTIVE: "1"
+          # That container has exactly one role, and it is the superuser. The guard refuses an
+          # instance-wide role by default -- a name suffix protects nothing if the role can
+          # reach every other database on the instance -- and this is the one situation the
+          # exemption exists for: the instance holds nothing but this test database and is
+          # destroyed when the job ends. A long-lived instance needs a dedicated test role
+          # instead, which is why the exemption is explicit rather than inferred from CI.
+          TEST_DATABASE_ALLOW_ADMIN_ROLE: "1"
         run: pytest -q tests/api tests/unit/test_business_claim.py

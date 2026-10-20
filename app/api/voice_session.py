@@ -162,6 +162,17 @@ class _Connection:
     #: The one Session that serves this whole socket, reused for transcript persistence
     #: so a turn is recorded on the same connection that produced it.
     db: Any = None
+    #: The interview question this socket exists to answer, or None outside interview mode.
+    #:
+    #: Not stale by construction: `build_interview_responder` is built once per socket for one
+    #: question, so one socket is one question. It is set only for VoiceMode.INTERVIEW, so a
+    #: Career Coach conversation cannot pick up interview-only metadata from a client that
+    #: passed the query parameter anyway.
+    #:
+    #: `append_turn` has always accepted `interview_question_id`; both call sites simply never
+    #: passed it, so mock-interview transcripts were stored unlinked to the question they
+    #: answered.
+    interview_question_id: Optional[int] = None
     #: The durable transcript this socket appends to. None only if it could not be
     #: opened, in which case the conversation still works and simply is not recorded --
     #: losing the record is bad, losing the student turn would be worse.
@@ -257,6 +268,7 @@ def _persist_turn(connection: "_Connection", turn: Any, result: Any) -> None:
                 role="user",
                 text=result.transcript,
                 turn_id=turn.turn_id,
+                interview_question_id=connection.interview_question_id,
             )
         if result.answer is not None and result.answer.text:
             conversation_history.append_turn(
@@ -265,6 +277,9 @@ def _persist_turn(connection: "_Connection", turn: Any, result: Any) -> None:
                 role="assistant",
                 text=result.answer.text,
                 turn_id=turn.turn_id,
+                # Both halves of the exchange belong to the same question, so a transcript can
+                # be read back per question rather than only per conversation.
+                interview_question_id=connection.interview_question_id,
             )
         connection.db.commit()
     except Exception as exc:  # noqa: BLE001
@@ -388,18 +403,55 @@ async def voice_session(
     else:
         responder = None  # built below, once the session id exists to scope its memory
 
-    try:
-        record = registry.open(user_id=user.id, sample_rate_hz=sample_rate, channel_count=channels)
-    except TooManySessions:
-        await websocket.accept()
-        await websocket.close(code=_CLOSE_POLICY, reason="too many concurrent voice sessions")
-        return
+    # ------------------------------------------------------------------ resume, before anything
+    # The grant is resolved *here*, before a session, a responder or a transcript exists.
+    # That ordering is the whole fix: everything downstream is keyed on the session id
+    # (`build_coach_responder(session_key="voice-" + id)` and `ensure_conversation(session_key=
+    # "voice-" + id)`), so the only way to reattach retained state is to know the id before
+    # building anything. A resume presented after `accept` -- as a protocol message -- arrives
+    # when the new conversation has already been opened, which is why it could only ever
+    # relabel a fresh session.
+    #
+    # Ownership is established before continuity: `redeem_resume_token` checks that the grant
+    # belongs to this authenticated user, and a grant for anyone else is indistinguishable
+    # from an unknown one.
+    offered = websocket.headers.get(protocol.RESUME_HEADER)
+    record = None
+    resumed = False
+    if offered:
+        grant = registry.redeem_resume_token(offered, user_id=user.id)
+        if grant is not None:
+            record = registry.resume(
+                grant=grant, sample_rate_hz=sample_rate, channel_count=channels
+            )
+            resumed = record is not None
+            if record is None:
+                # A live socket still holds that id. Refused rather than joined: two
+                # connections writing one transcript is the ambiguous state this must not
+                # enter. The client gets a fresh session and is told `resumed: false`.
+                logger.info("voice resume refused: session %s is still live", grant.session_id)
+        else:
+            # Unknown, expired, already consumed, or someone else's. Not fatal, and not
+            # distinguished: the client gets a working new session, honestly labelled.
+            logger.info("voice session offered an unusable resume grant")
+
+    if record is None:
+        try:
+            record = registry.open(
+                user_id=user.id, sample_rate_hz=sample_rate, channel_count=channels
+            )
+        except TooManySessions:
+            await websocket.accept()
+            await websocket.close(code=_CLOSE_POLICY, reason="too many concurrent voice sessions")
+            return
 
     await websocket.accept()
     resume_token = registry.issue_resume_token(record)
     # Issued now, not on close: a connection that dies does not get a chance to hand one over,
     # and a resume token the client never received is a resume that can never happen.
-    await websocket.send_text(protocol.session_accepted(record.session_id, resume_token))
+    await websocket.send_text(
+        protocol.session_accepted(record.session_id, resume_token, resumed=resumed)
+    )
 
     if responder is None:
         responder = responders.build_coach_responder(
@@ -427,6 +479,11 @@ async def voice_session(
         runtime=build_turn_runtime(),
         responder=responder,
         db=db,
+        # Gated on the mode, not merely on the parameter being present: a career-coach socket
+        # that was handed an interview_question_id must not record one.
+        interview_question_id=(
+            interview_question_id if selected is VoiceMode.INTERVIEW else None
+        ),
         conversation_id=_open_conversation(
             db,
             user=user,
@@ -441,14 +498,15 @@ async def voice_session(
         record.session_id, user.id, selected.value, sample_rate, channels, locale,
     )
 
-    # interrupted unless the pump returns of its own accord. A dropped connection is not
-    # a completed interview, and the student own record must not claim it was.
+    # `interrupted` until the receive loop names a reason that means otherwise. The reason
+    # decides, not the fact that it returned: almost every abnormal ending is also a normal
+    # return. Only an explicit `end_session` from the client maps to `completed`.
     ended_status = "interrupted"
     try:
-        await _pump(connection)
-        ended_status = "completed"
+        ended_status = status_for_pump_reason(await _pump(connection))
     except WebSocketDisconnect:
-        pass
+        # Raised rather than delivered as a message; same meaning as PUMP_PEER_GONE.
+        ended_status = status_for_pump_reason(PUMP_PEER_GONE)
     finally:
         _close_conversation(connection, ended_status)
         # Runs for every exit -- clean close, disconnect, limit breach, cancellation. A session
@@ -463,8 +521,64 @@ async def voice_session(
         logger.info("voice session closed session_id=%s", record.session_id)
 
 
-async def _pump(connection: _Connection) -> None:
+#: Why the receive loop stopped.
+#:
+#: This exists because `_pump` returning normally used to *be* the completion signal, and it
+#: is not one. Its own docstring says it returns when "the peer goes away or breaks a rule",
+#: and every one of its exits -- idle timeout, peer disconnect, oversized text frame,
+#: oversized audio frame, invalid audio frame, session audio limit, registry eviction,
+#: protocol violation -- returns normally. So `ended_status = "completed"` was reachable
+#: *only* through an abnormal ending, the exact inverse of what its own comment claimed, and
+#: a student who timed out or lost signal got a record saying they finished the interview.
+#:
+#: `CLIENT_END` is the one reason that means the student deliberately finished.
+PUMP_CLIENT_END = "client_end"
+PUMP_PEER_GONE = "peer_gone"
+PUMP_IDLE_TIMEOUT = "idle_timeout"
+PUMP_TEXT_FRAME_TOO_BIG = "text_frame_too_big"
+PUMP_AUDIO_FRAME_TOO_BIG = "audio_frame_too_big"
+PUMP_AUDIO_FRAME_INVALID = "audio_frame_invalid"
+PUMP_AUDIO_LIMIT = "audio_limit"
+PUMP_SESSION_EVICTED = "session_evicted"
+PUMP_PROTOCOL_VIOLATION = "protocol_violation"
+
+#: Reason -> persisted conversation status. Only `active`, `completed` and `interrupted` are
+#: approved (`CONVERSATION_STATUSES`), so every non-completion maps onto `interrupted` rather
+#: than inventing a status that would need a migration and a new client vocabulary.
+#:
+#: Exhaustive on purpose, rather than `"completed" if reason is CLIENT_END else "interrupted"`:
+#: a reason added without a decided status should fail loudly instead of defaulting into
+#: whichever answer happens to be wrong.
+_PUMP_REASON_STATUS: Final[dict[str, str]] = {
+    PUMP_CLIENT_END: "completed",
+    PUMP_PEER_GONE: "interrupted",
+    PUMP_IDLE_TIMEOUT: "interrupted",
+    PUMP_TEXT_FRAME_TOO_BIG: "interrupted",
+    PUMP_AUDIO_FRAME_TOO_BIG: "interrupted",
+    PUMP_AUDIO_FRAME_INVALID: "interrupted",
+    PUMP_AUDIO_LIMIT: "interrupted",
+    PUMP_SESSION_EVICTED: "interrupted",
+    PUMP_PROTOCOL_VIOLATION: "interrupted",
+}
+
+
+def status_for_pump_reason(reason: str) -> str:
+    """The conversation status a receive-loop reason persists as.
+
+    An unknown reason raises. Defaulting it either way is what this mapping exists to stop.
+    """
+    try:
+        return _PUMP_REASON_STATUS[reason]
+    except KeyError:
+        raise ValueError("no conversation status is defined for pump reason " + repr(reason))
+
+
+async def _pump(connection: _Connection) -> str:
     """Receive until the peer goes away or breaks a rule.
+
+    Returns the `PUMP_*` reason it stopped for. The caller maps that reason to a status; this
+    function deliberately does not, so "why it stopped" and "what gets recorded" stay
+    separable and separately testable.
 
     Inbound audio is accumulated into the current turn and nothing else; there is no outbound
     queue, so backpressure on this side stays trivially bounded. Outbound audio is streamed by
@@ -477,22 +591,26 @@ async def _pump(connection: _Connection) -> None:
         except asyncio.TimeoutError:
             await connection.send_text(protocol.session_expired())
             await websocket.close(code=_CLOSE_NORMAL, reason="idle")
-            return
+            return PUMP_IDLE_TIMEOUT
 
         if message.get("type") == "websocket.disconnect":
-            return
+            # A disconnect delivered as a *message* rather than raised as WebSocketDisconnect.
+            # This is the path that most often made a dropped phone look like a finished
+            # interview, because it returns with no exception at all.
+            return PUMP_PEER_GONE
 
         record = registry.get(connection.session_id)
         if record is None:  # closed underneath us; nothing left to update
-            return
+            return PUMP_SESSION_EVICTED
 
         text = message.get("text")
         if text is not None:
             if len(text.encode("utf-8")) > MAX_TEXT_FRAME_BYTES:
                 await websocket.close(code=_CLOSE_TOO_BIG, reason="control message too large")
-                return
-            if not await _handle_text(connection, text, record=record):
-                return
+                return PUMP_TEXT_FRAME_TOO_BIG
+            ended = await _handle_text(connection, text, record=record)
+            if ended is not None:
+                return ended
             registry.touch(connection.session_id)
             continue
 
@@ -502,18 +620,18 @@ async def _pump(connection: _Connection) -> None:
 
         if len(payload) > MAX_BINARY_FRAME_BYTES:
             await websocket.close(code=_CLOSE_TOO_BIG, reason="audio frame too large")
-            return
+            return PUMP_AUDIO_FRAME_TOO_BIG
         try:
             protocol.validate_audio_frame(payload, channel_count=connection.channels)
         except protocol.ProtocolError as exc:
             await websocket.close(code=_CLOSE_POLICY, reason=str(exc))
-            return
+            return PUMP_AUDIO_FRAME_INVALID
 
         record.audio_bytes += len(payload)
         record.audio_frames += 1
         if record.audio_bytes > MAX_SESSION_AUDIO_BYTES:
             await websocket.close(code=_CLOSE_TOO_BIG, reason="session audio limit reached")
-            return
+            return PUMP_AUDIO_LIMIT
 
         # Frames that arrive while a turn is running belong to the *next* turn, not the one being
         # recognised -- its bytes were detached when it was committed, so nothing can be appended
@@ -522,8 +640,14 @@ async def _pump(connection: _Connection) -> None:
         registry.touch(connection.session_id)
 
 
-async def _handle_text(connection: _Connection, raw: str, *, record) -> bool:
-    """Dispatch one control message. Returns False when the connection should end."""
+async def _handle_text(connection: _Connection, raw: str, *, record) -> Optional[str]:
+    """Dispatch one control message.
+
+    Returns None to keep receiving, or a `PUMP_*` reason when the connection should end.
+    A reason rather than a bool because "stop" and "stop because the student finished"
+    are different facts, and collapsing them into False is what let an abandoned session
+    be recorded as a completed one.
+    """
     try:
         message = protocol.decode_client_message(raw)
     except protocol.ProtocolError as exc:
@@ -531,17 +655,24 @@ async def _handle_text(connection: _Connection, raw: str, *, record) -> bool:
         # unparseable after a reconnect, and a retry loop on a client bug is a battery drain.
         logger.warning("voice session %s sent an invalid message: %s", connection.session_id, exc)
         await connection.websocket.close(code=_CLOSE_POLICY, reason="protocol violation")
-        return False
+        return PUMP_PROTOCOL_VIOLATION
+
+    if message.type == "end_session":
+        # The only clean completion. Closed with 1000 so the client sees a normal close and
+        # does not start its reconnect/resume machinery for a session the student ended.
+        logger.info("voice session %s ended by the student", connection.session_id)
+        await connection.websocket.close(code=_CLOSE_NORMAL, reason="client ended session")
+        return PUMP_CLIENT_END
 
     if message.type == "heartbeat":
         # No reply, deliberately. The client fails a session on any message type it cannot
         # parse, and it has no "heartbeat_ack". Liveness here is one-directional.
-        return True
+        return None
 
     if message.type == "commit_turn":
         record.turns_committed += 1
         await _commit(connection)
-        return True
+        return None
 
     if message.type == "interrupt":
         record.interrupts += 1
@@ -551,34 +682,37 @@ async def _handle_text(connection: _Connection, raw: str, *, record) -> bool:
             # round trip rather than after a recogniser finishes. Late audio chunks are still
             # safe: each carries its generation id, which is what lets the client drop them.
             await connection.send_text(protocol.generation_cancelled(abandoned.generation_id))
-        return True
+        return None
 
     if message.type == "cancel_operation":
         # Counted, never resolved. This path executes no confirmable ACTION tool, so there is no
         # tracked operation to report on -- and an `operation_outcome` invented here would be
         # precisely the false success the specification forbids. Unknown stays unknown.
         record.cancels_requested += 1
-        return True
+        return None
 
     if message.type == "resume":
-        grant = registry.redeem_resume_token(message.get("token"), user_id=connection.user_id)
-        if grant is None:
-            # Not fatal: the client is already on a healthy new session, and killing it over a
-            # stale token would turn a recovered connection back into an outage. An invalid
-            # token for *another* user is indistinguishable from an unknown one by design.
-            logger.info("voice session %s offered an unusable resume token", connection.session_id)
-            return True
-        record.resumed_from = grant.session_id
+        # Kept for clients built before the grant moved to the connect-time header, and
+        # deliberately **not** rebinding anything. By the time a message arrives this socket
+        # already has its session id, its responder memory and its transcript; rebinding here
+        # would mean abandoning a conversation that has already been opened, which is the
+        # defect this path used to embody -- it set `resumed_from` and rotated the token, so
+        # the client was told it had resumed while talking into a new conversation.
+        #
+        # The grant is *not* consumed, so an updated client can still present it properly on
+        # its next connect, and it expires on its own TTL.
         rotated = registry.issue_resume_token(record)
-        # Deliberately no turn state is carried over. A turn that was in flight on the old
-        # connection is not restarted here: it may already have written an interview answer, and
-        # silently re-running an operation whose outcome is uncertain is the one thing a reconnect
-        # must never do.
-        await connection.send_text(protocol.session_accepted(connection.session_id, rotated))
-        logger.info("voice session %s resumed from %s", connection.session_id, grant.session_id)
-        return True
+        await connection.send_text(
+            protocol.session_accepted(connection.session_id, rotated, resumed=False)
+        )
+        logger.info(
+            "voice session %s offered a resume token as a message; a resume must be presented "
+            "at connect time, so this session continues unresumed",
+            connection.session_id,
+        )
+        return None
 
-    return True  # pragma: no cover - decode_client_message rejects every other type
+    return None  # pragma: no cover - decode_client_message rejects every other type
 
 
 async def _commit(connection: _Connection) -> None:

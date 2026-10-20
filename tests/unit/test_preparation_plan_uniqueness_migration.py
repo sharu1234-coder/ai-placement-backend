@@ -32,14 +32,18 @@ import uuid
 
 import pytest
 from alembic.config import Config
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import inspect, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError
 
 from alembic import command
 from app.core.config import settings
+from tests import db_safety
 
-_TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
+# Supplied by tests/db_safety.py, never read from the environment here: that module
+# refuses a target it cannot prove is disposable, and it does so at import time -- before
+# any fixture in this file can drop a table.
+_TEST_DATABASE_URL = db_safety.resolve_test_database_url()
 
 _PREVIOUS_REVISION = "7f3c21d9ab48"
 _THIS_REVISION = "b1c47e0a52d9"
@@ -68,15 +72,20 @@ def migration_target(tmp_path, monkeypatch):
     if _TEST_DATABASE_URL:
         base = make_url(_TEST_DATABASE_URL)
         name = f"prep_plan_uniqueness_{uuid.uuid4().hex[:8]}"
-        admin = create_engine(base.set(database="postgres"), isolation_level="AUTOCOMMIT")
+        admin = db_safety.make_engine(base.set(database="postgres"), isolation_level="AUTOCOMMIT")
         with admin.connect() as connection:
             connection.execute(text(f'CREATE DATABASE "{name}"'))
-        url = base.set(database=name).render_as_string(hide_password=False)
+        url = db_safety.hidden(
+            base.set(database=name).render_as_string(hide_password=False)
+        )
         monkeypatch.setattr(settings, "database_url", url)
-        yield url
-        with admin.connect() as connection:
-            connection.execute(text(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)'))
-        admin.dispose()
+        try:
+            yield url
+        finally:
+            # In a finally, so a test that errors cannot leave the database behind, and
+            # without FORCE -- see db_safety.drop_temp_database for why FORCE needs
+            # privileges over the superuser that this role deliberately does not have.
+            db_safety.drop_temp_database(admin, name)
     else:
         url = f"sqlite:///{tmp_path / 'prep_plan_uniqueness.db'}"
         monkeypatch.setattr(settings, "database_url", url)
@@ -95,7 +104,7 @@ def _alembic_config() -> Config:
 
 def _at_previous_revision(url: str):
     command.upgrade(_alembic_config(), _PREVIOUS_REVISION)
-    return create_engine(url)
+    return db_safety.make_engine(url)
 
 
 def _upgrade():
@@ -103,7 +112,7 @@ def _upgrade():
 
 
 def _rows(url: str, sql: str, **params):
-    engine = create_engine(url)
+    engine = db_safety.make_engine(url)
     try:
         with engine.connect() as connection:
             return connection.execute(text(sql), params).all()
@@ -164,7 +173,7 @@ def _plans(url: str):
 
 
 def _assert_constraint_refuses_duplicates(url: str, profile_id: int = 1, jd_id: int = 1) -> None:
-    engine = create_engine(url)
+    engine = db_safety.make_engine(url)
     try:
         with pytest.raises(IntegrityError):
             with engine.begin() as connection:
@@ -175,7 +184,7 @@ def _assert_constraint_refuses_duplicates(url: str, profile_id: int = 1, jd_id: 
 
 def _assert_columns_indexes_and_foreign_keys_survived(url: str) -> None:
     """The batch rebuild drops and recreates the table; this is what proves it came back whole."""
-    engine = create_engine(url)
+    engine = db_safety.make_engine(url)
     try:
         inspector = inspect(engine)
         columns = {c["name"] for c in inspector.get_columns("job_preparation_plans")}
@@ -213,12 +222,12 @@ def test_the_constraint_exists_and_refuses_a_second_plan_for_the_same_jd(migrati
     _upgrade()
 
     constraints = {
-        c["name"] for c in inspect(create_engine(migration_target)).get_unique_constraints(
+        c["name"] for c in inspect(db_safety.make_engine(migration_target)).get_unique_constraints(
             "job_preparation_plans"
         )
     }
     assert _CONSTRAINT in constraints, constraints
-    engine = create_engine(migration_target)
+    engine = db_safety.make_engine(migration_target)
     with engine.begin() as connection:
         _seed_plan(connection, 1, 1, 1, "Acme")
     engine.dispose()
@@ -242,7 +251,7 @@ def test_a_different_jd_or_a_different_student_is_never_refused(migration_target
 
     _upgrade()
 
-    engine = create_engine(migration_target)
+    engine = db_safety.make_engine(migration_target)
     with engine.begin() as connection:
         _seed_plan(connection, 1, 1, 1, "One")
         _seed_plan(connection, 2, 2, 1, "Two")
@@ -351,14 +360,14 @@ def test_the_migration_is_reversible_and_the_removals_stand(migration_target):
     command.downgrade(_alembic_config(), _PREVIOUS_REVISION)
 
     constraints = {
-        c["name"] for c in inspect(create_engine(migration_target)).get_unique_constraints(
+        c["name"] for c in inspect(db_safety.make_engine(migration_target)).get_unique_constraints(
             "job_preparation_plans"
         )
     }
     assert _CONSTRAINT not in constraints, constraints
     assert [(row.id, row.company_name) for row in _plans(migration_target)] == [(2, "Kept")]
     # And a duplicate is accepted again, which is what "the constraint is gone" means.
-    engine = create_engine(migration_target)
+    engine = db_safety.make_engine(migration_target)
     with engine.begin() as connection:
         _seed_plan(connection, 3, 1, 1, "Allowed once more")
     engine.dispose()

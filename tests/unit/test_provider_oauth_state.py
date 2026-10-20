@@ -16,7 +16,6 @@ nowhere to be stored even if someone later wants to store it.
 
 import datetime
 import hashlib
-import os
 
 import pytest
 from sqlalchemy import create_engine, event
@@ -29,8 +28,12 @@ from app.database.base import Base
 from app.models.profile import StudentProfile
 from app.models.provider_oauth_state import ProviderOAuthState
 from app.models.user import User
+from tests import db_safety
 
-_TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
+# Supplied by tests/db_safety.py, never read from the environment here: that module
+# refuses a target it cannot prove is disposable, and it does so at import time -- before
+# any fixture in this file can drop a table.
+_TEST_DATABASE_URL = db_safety.resolve_test_database_url()
 
 # Timezone-aware, and every comparison below is made in SQL rather than in Python.
 #
@@ -47,7 +50,7 @@ _NOW = datetime.datetime(2026, 9, 13, 12, 0, tzinfo=datetime.timezone.utc)
 def db():
     if _TEST_DATABASE_URL:
         engine = create_engine(_TEST_DATABASE_URL, poolclass=NullPool)
-        Base.metadata.drop_all(bind=engine)
+        db_safety.drop_all_safely(engine)
     else:
         engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
 

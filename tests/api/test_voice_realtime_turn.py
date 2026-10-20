@@ -24,7 +24,7 @@ import pytest
 
 from app.ai.provider import get_ai_provider
 from app.api import voice_session as endpoint
-from app.core.config import settings
+from app.core.config import Settings, settings
 from app.database.base import Base
 from app.main import app
 from app.speech.contracts import (
@@ -958,13 +958,25 @@ class TestSpeechOutcomes:
 
 
 class TestTheApprovedDefault:
-    def test_no_provider_is_configured_so_a_turn_reports_it_honestly(self, client, headers):
-        """No fakes, no monkeypatching: the real `build_turn_runtime` against real settings.
+    def test_no_provider_is_configured_so_a_turn_reports_it_honestly(self, client, headers, monkeypatch):
+        """No fakes: the real `build_turn_runtime`, the real selection path, the real socket.
 
         `STT_PROVIDER` and `TTS_PROVIDER` default to `none` and no provider is approved, so the
         honest outcome of committing audio on a stock server is `stt_unavailable` -- not a
         transcript, and not a crash.
+
+        The two settings are pinned to their declared defaults rather than read from the live
+        singleton, because "a stock server" is the *premise* of this test and not something it
+        proves. Reading the singleton made the premise depend on the machine: pydantic fills it
+        from the process environment and from `.env`, so a developer with
+        `STT_PROVIDER=faster-whisper` configured -- which is a correct development setup -- saw
+        this fail on the precondition, having tested nothing. Pinned, the test asks what it
+        meant to ask: given nothing configured, does a committed turn say so? Everything after
+        this is still the real thing; `app/speech/selection.py` reads these settings per call,
+        so the selection path exercised below is the production one.
         """
+        monkeypatch.setattr(settings, "stt_provider", Settings.model_fields["stt_provider"].default)
+        monkeypatch.setattr(settings, "tts_provider", Settings.model_fields["tts_provider"].default)
         assert settings.stt_provider == "none"
         assert settings.tts_provider == "none"
 

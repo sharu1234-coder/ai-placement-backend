@@ -78,7 +78,24 @@ class TestServerMessages:
 
     def test_session_accepted_carries_the_identifiers(self):
         body = json.loads(protocol.session_accepted("s-1", "r-1"))
-        assert body == {"type": "session_accepted", "session_id": "s-1", "resume_token": "r-1"}
+        assert body == {
+            "type": "session_accepted",
+            "session_id": "s-1",
+            "resume_token": "r-1",
+            "resumed": False,
+        }
+
+    def test_session_accepted_reports_a_resume_the_server_actually_honoured(self):
+        # The flag is the server's own answer, not the client's inference, so both states
+        # are pinned here: a client that trusts `resumed` must never read true for a
+        # session the server did not continue.
+        body = json.loads(protocol.session_accepted("s-1", "r-1", resumed=True))
+        assert body == {
+            "type": "session_accepted",
+            "session_id": "s-1",
+            "resume_token": "r-1",
+            "resumed": True,
+        }
 
     def test_a_null_resume_token_is_omitted_rather_than_sent_as_null(self):
         # The client reads it as an optional string; an explicit null is a third state nobody

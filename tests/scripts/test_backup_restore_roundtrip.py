@@ -30,6 +30,8 @@ from pathlib import Path
 
 import pytest
 
+from tests import db_safety
+
 ROOT = Path(__file__).resolve().parents[2]
 BACKUP = ROOT / "scripts" / "backup_db.py"
 RESTORE = ROOT / "scripts" / "restore_db.py"
@@ -297,14 +299,19 @@ def test_a_corrupt_backup_does_not_produce_a_database_that_looks_restored(tmp_pa
         conn.close()
 
 
+# Validated at import by tests/db_safety.py rather than read from the environment: this
+# test hands the URL to pg_restore, which overwrites the database it is given.
+_TEST_DATABASE_URL = db_safety.resolve_test_database_url()
+
+
 @pytest.mark.skipif(
-    not os.environ.get("TEST_DATABASE_URL"),
+    not _TEST_DATABASE_URL,
     reason="PostgreSQL backup/restore needs a TEST_DATABASE_URL that already exists; "
            "credentials are never probed for",
 )
 def test_postgres_backup_and_restore_round_trip(tmp_path):
     backup_db, restore_db = _import_scripts()
-    url = os.environ["TEST_DATABASE_URL"]
+    url = _TEST_DATABASE_URL
     if not shutil.which("pg_dump") or not shutil.which("pg_restore"):
         pytest.skip("pg_dump/pg_restore not on PATH")
     out_dir = tmp_path / "pg"

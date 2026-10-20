@@ -28,13 +28,17 @@ import uuid
 
 import pytest
 from alembic.config import Config
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import inspect, text
 from sqlalchemy.engine import make_url
 
 from alembic import command
 from app.core.config import settings
+from tests import db_safety
 
-_TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
+# Supplied by tests/db_safety.py, never read from the environment here: that module
+# refuses a target it cannot prove is disposable, and it does so at import time -- before
+# any fixture in this file can drop a table.
+_TEST_DATABASE_URL = db_safety.resolve_test_database_url()
 
 _TABLE = "job_listings"
 _PREVIOUS_REVISION = "b4e17c9d05af"
@@ -53,15 +57,20 @@ def migration_target(tmp_path, monkeypatch):
     if _TEST_DATABASE_URL:
         base = make_url(_TEST_DATABASE_URL)
         name = f"manual_listing_migration_test_{uuid.uuid4().hex[:8]}"
-        admin = create_engine(base.set(database="postgres"), isolation_level="AUTOCOMMIT")
+        admin = db_safety.make_engine(base.set(database="postgres"), isolation_level="AUTOCOMMIT")
         with admin.connect() as connection:
             connection.execute(text(f'CREATE DATABASE "{name}"'))
-        url = base.set(database=name).render_as_string(hide_password=False)
+        url = db_safety.hidden(
+            base.set(database=name).render_as_string(hide_password=False)
+        )
         monkeypatch.setattr(settings, "database_url", url)
-        yield url
-        with admin.connect() as connection:
-            connection.execute(text(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)'))
-        admin.dispose()
+        try:
+            yield url
+        finally:
+            # In a finally, so a test that errors cannot leave the database behind, and
+            # without FORCE -- see db_safety.drop_temp_database for why FORCE needs
+            # privileges over the superuser that this role deliberately does not have.
+            db_safety.drop_temp_database(admin, name)
     else:
         url = f"sqlite:///{tmp_path / 'manual_listing.db'}"
         monkeypatch.setattr(settings, "database_url", url)
@@ -76,7 +85,7 @@ def _alembic_config() -> Config:
 
 
 def _columns(url: str) -> dict:
-    engine = create_engine(url)
+    engine = db_safety.make_engine(url)
     try:
         return {c["name"]: c for c in inspect(engine).get_columns(_TABLE)}
     finally:
@@ -86,16 +95,16 @@ def _columns(url: str) -> dict:
 def _seed(url: str) -> None:
     """Rows exactly as they exist before this revision: two provider adverts, one of them
     saved by a student and scored for them, so the foreign keys are real and not decorative."""
-    engine = create_engine(url)
+    engine = db_safety.make_engine(url)
     now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat(sep=" ")
     try:
         with engine.begin() as connection:
             connection.execute(
                 text(
                     "INSERT INTO users (id, email, password_hash, is_active, created_at,"
-                    " token_version) VALUES (1, 'pre@example.com', 'x', 1, :now, 0)"
+                    " token_version) VALUES (1, 'pre@example.com', 'x', :active, :now, 0)"
                 ),
-                {"now": now},
+                {"now": now, "active": True},
             )
             connection.execute(text("INSERT INTO student_profiles (id, user_id) VALUES (1, 1)"))
             for row_id, provider, provider_job_id, url_value, title, company in _SEEDED:
@@ -103,7 +112,7 @@ def _seed(url: str) -> None:
                     text(
                         "INSERT INTO job_listings (id, provider, provider_job_id, url, title,"
                         " company, salary_is_predicted, fetched_at)"
-                        " VALUES (:id, :provider, :pjid, :url, :title, :company, 0, :now)"
+                        " VALUES (:id, :provider, :pjid, :url, :title, :company, FALSE, :now)"
                     ),
                     {
                         "id": row_id,
@@ -137,7 +146,7 @@ def _seed(url: str) -> None:
 
 
 def _listings(url: str):
-    engine = create_engine(url)
+    engine = db_safety.make_engine(url)
     try:
         with engine.connect() as connection:
             return connection.execute(
@@ -188,7 +197,7 @@ def test_existing_rows_are_owned_by_nobody(seeded_at_previous_revision):
     everyone else."""
     command.upgrade(_alembic_config(), _THIS_REVISION)
 
-    engine = create_engine(seeded_at_previous_revision)
+    engine = db_safety.make_engine(seeded_at_previous_revision)
     try:
         with engine.connect() as connection:
             owners = connection.execute(
@@ -206,7 +215,7 @@ def test_rows_that_reference_a_listing_still_reference_it(seeded_at_previous_rev
     a row with nothing behind it."""
     command.upgrade(_alembic_config(), _THIS_REVISION)
 
-    engine = create_engine(seeded_at_previous_revision)
+    engine = db_safety.make_engine(seeded_at_previous_revision)
     try:
         with engine.connect() as connection:
             saved = connection.execute(
@@ -237,7 +246,7 @@ def test_the_unique_constraint_on_provider_identity_survives(seeded_at_previous_
     features silently broken."""
     command.upgrade(_alembic_config(), _THIS_REVISION)
 
-    engine = create_engine(seeded_at_previous_revision)
+    engine = db_safety.make_engine(seeded_at_previous_revision)
     try:
         unique = {u["name"] for u in inspect(engine).get_unique_constraints(_TABLE)}
     finally:
@@ -251,7 +260,7 @@ def test_a_manual_listing_with_no_url_can_be_stored_afterwards(seeded_at_previou
     exactly why the migration exists rather than being a convenience."""
     command.upgrade(_alembic_config(), _THIS_REVISION)
 
-    engine = create_engine(seeded_at_previous_revision)
+    engine = db_safety.make_engine(seeded_at_previous_revision)
     now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat(sep=" ")
     try:
         with engine.begin() as connection:
@@ -260,7 +269,7 @@ def test_a_manual_listing_with_no_url_can_be_stored_afterwards(seeded_at_previou
                     "INSERT INTO job_listings (id, provider, provider_job_id, url, title,"
                     " company, created_by_profile_id, salary_is_predicted, fetched_at)"
                     " VALUES (3, 'manual', '1:abc', NULL, 'Campus placement -- SDE',"
-                    " 'Contoso', 1, 0, :now)"
+                    " 'Contoso', 1, FALSE, :now)"
                 ),
                 {"now": now},
             )

@@ -31,7 +31,13 @@ from typing import Any, Final
 
 #: Everything the client may send. Anything else is a protocol violation.
 CLIENT_MESSAGE_TYPES: Final[frozenset[str]] = frozenset(
-    {"commit_turn", "interrupt", "resume", "cancel_operation", "heartbeat"}
+    # "end_session" is how a student says "I am finished". It exists because nothing else
+    # in this set can say it, and without it a clean ending was indistinguishable from a
+    # dropped socket -- see `_PUMP_REASON_STATUS` in app/api/voice_session.py.
+    #
+    # Additive and backward compatible: a client that never sends it simply never produces a
+    # `completed` conversation, which is the safe direction to be wrong in.
+    {"commit_turn", "interrupt", "resume", "cancel_operation", "heartbeat", "end_session"}
 )
 
 #: Everything the client can parse. Sending a type absent from this set is a server bug: the
@@ -170,8 +176,26 @@ def _server_message(message_type: str, **fields: Any) -> str:
     return json.dumps(body, separators=(",", ":"))
 
 
-def session_accepted(session_id: str, resume_token: str | None = None) -> str:
-    return _server_message("session_accepted", session_id=session_id, resume_token=resume_token)
+#: The header a client presents a resume grant in. A header rather than a query parameter
+#: because a URL reaches server logs, proxy logs and crash reports -- the same reason
+#: WebSocketRealtimeTransport keeps the access token out of the query string -- and because it
+#: has to be readable *before* the socket is accepted, which a protocol message cannot be.
+RESUME_HEADER: Final = "x-voice-resume"
+
+
+def session_accepted(
+    session_id: str, resume_token: str | None = None, *, resumed: bool = False
+) -> str:
+    """Accept a session, saying honestly whether it continued an earlier one.
+
+    `resumed` is additive and defaults to false, so a client that does not read it behaves as
+    before. It exists because the alternative -- letting the client infer continuity from the
+    presence of a token it just sent -- is what allowed a reconnect to report success while
+    starting a new conversation.
+    """
+    return _server_message(
+        "session_accepted", session_id=session_id, resume_token=resume_token, resumed=resumed
+    )
 
 
 def session_expired() -> str:

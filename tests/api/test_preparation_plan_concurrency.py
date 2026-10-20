@@ -30,7 +30,6 @@ to be assertable as a status code with its body in the failure message rather th
 traceback from inside a worker thread.
 """
 
-import os
 import threading
 import time
 import uuid
@@ -49,9 +48,13 @@ from app.api.deps import get_db
 from app.core.config import settings
 from app.database.base import Base
 from app.main import app
+from tests import db_safety
 from tests.api.test_jobs import SAMPLE_PARSED_JD, SAMPLE_PREP_CONTENT
 
-_TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
+# Supplied by tests/db_safety.py, never read from the environment here: that module
+# refuses a target it cannot prove is disposable, and it does so at import time -- before
+# any fixture in this file can drop a table.
+_TEST_DATABASE_URL = db_safety.resolve_test_database_url()
 
 PASSWORD = "supersecret123"
 JD_TEXT = "We need SQL, Excel and Power BI for dashboards."
@@ -107,7 +110,7 @@ def engine(tmp_path):
         engine = create_engine(
             _TEST_DATABASE_URL, poolclass=NullPool, connect_args={"options": "-c lock_timeout=15000"}
         )
-        Base.metadata.drop_all(bind=engine)
+        db_safety.drop_all_safely(engine)
     else:
         # check_same_thread=False because the route runs in Starlette's threadpool, so a session
         # is used by a different thread than created it -- the same reason app/database/session.py
@@ -129,7 +132,7 @@ def engine(tmp_path):
         yield engine
     finally:
         if _TEST_DATABASE_URL:
-            Base.metadata.drop_all(bind=engine)
+            db_safety.drop_all_safely(engine)
         engine.dispose()
 
 

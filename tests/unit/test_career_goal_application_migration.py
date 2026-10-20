@@ -24,14 +24,18 @@ import uuid
 
 import pytest
 from alembic.config import Config
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import inspect, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError
 
 from alembic import command
 from app.core.config import settings
+from tests import db_safety
 
-_TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
+# Supplied by tests/db_safety.py, never read from the environment here: that module
+# refuses a target it cannot prove is disposable, and it does so at import time -- before
+# any fixture in this file can drop a table.
+_TEST_DATABASE_URL = db_safety.resolve_test_database_url()
 
 _TABLE = "career_goals"
 _PREVIOUS_REVISION = "7c41a0d9e2b5"
@@ -43,15 +47,20 @@ def migration_target(tmp_path, monkeypatch):
     if _TEST_DATABASE_URL:
         base = make_url(_TEST_DATABASE_URL)
         name = f"goal_link_migration_test_{uuid.uuid4().hex[:8]}"
-        admin = create_engine(base.set(database="postgres"), isolation_level="AUTOCOMMIT")
+        admin = db_safety.make_engine(base.set(database="postgres"), isolation_level="AUTOCOMMIT")
         with admin.connect() as connection:
             connection.execute(text(f'CREATE DATABASE "{name}"'))
-        url = base.set(database=name).render_as_string(hide_password=False)
+        url = db_safety.hidden(
+            base.set(database=name).render_as_string(hide_password=False)
+        )
         monkeypatch.setattr(settings, "database_url", url)
-        yield url
-        with admin.connect() as connection:
-            connection.execute(text(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)'))
-        admin.dispose()
+        try:
+            yield url
+        finally:
+            # In a finally, so a test that errors cannot leave the database behind, and
+            # without FORCE -- see db_safety.drop_temp_database for why FORCE needs
+            # privileges over the superuser that this role deliberately does not have.
+            db_safety.drop_temp_database(admin, name)
     else:
         url = f"sqlite:///{tmp_path / 'goal_link_migration.db'}"
         monkeypatch.setattr(settings, "database_url", url)
@@ -66,7 +75,7 @@ def _alembic_config() -> Config:
 
 
 def _columns(url: str) -> dict:
-    engine = create_engine(url)
+    engine = db_safety.make_engine(url)
     try:
         return {c["name"]: c for c in inspect(engine).get_columns(_TABLE)}
     finally:
@@ -74,7 +83,7 @@ def _columns(url: str) -> dict:
 
 
 def _current_revision(url: str):
-    engine = create_engine(url)
+    engine = db_safety.make_engine(url)
     try:
         with engine.connect() as connection:
             row = connection.execute(text("SELECT version_num FROM alembic_version")).fetchone()
@@ -85,14 +94,14 @@ def _current_revision(url: str):
 
 def _seed_unlinked_rows(url: str) -> None:
     """A profile with a goal and a saved job, exactly as they exist before this revision."""
-    engine = create_engine(url)
+    engine = db_safety.make_engine(url)
     now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat(sep=" ")
     try:
         with engine.begin() as connection:
             connection.execute(
                 text("INSERT INTO users (id, email, password_hash, is_active, created_at, token_version)"
-                     " VALUES (1, 'pre@example.com', 'x', 1, :now, 0)"),
-                {"now": now},
+                     " VALUES (1, 'pre@example.com', 'x', :active, :now, 0)"),
+                {"now": now, "active": True},
             )
             connection.execute(
                 text("INSERT INTO student_profiles (id, user_id) VALUES (1, 1)")
@@ -101,7 +110,7 @@ def _seed_unlinked_rows(url: str) -> None:
                 text(
                     "INSERT INTO job_listings (id, provider, provider_job_id, url, title,"
                     " salary_is_predicted, fetched_at)"
-                    " VALUES (1, 'test', 'p1', 'https://example.invalid/j', 'Data Engineer', 0, :now)"
+                    " VALUES (1, 'test', 'p1', 'https://example.invalid/j', 'Data Engineer', FALSE, :now)"
                 ),
                 {"now": now},
             )
@@ -139,7 +148,7 @@ def test_the_column_arrives_nullable_and_existing_rows_survive(migration_target)
     assert columns["saved_job_id"]["nullable"] is True, (
         "a goal must be able to exist without an application -- most do"
     )
-    engine = create_engine(migration_target)
+    engine = db_safety.make_engine(migration_target)
     try:
         with engine.connect() as connection:
             goal = connection.execute(
@@ -162,7 +171,7 @@ def test_the_unique_constraint_really_exists(migration_target):
     _seed_unlinked_rows(migration_target)
     command.upgrade(config, _THIS_REVISION)
 
-    engine = create_engine(migration_target)
+    engine = db_safety.make_engine(migration_target)
     now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat(sep=" ")
     try:
         with engine.begin() as connection:
@@ -199,7 +208,7 @@ def test_many_goals_may_be_unlinked_at_once(migration_target):
     _seed_unlinked_rows(migration_target)
     command.upgrade(config, _THIS_REVISION)
 
-    engine = create_engine(migration_target)
+    engine = db_safety.make_engine(migration_target)
     now = datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None).isoformat(sep=" ")
     try:
         with engine.begin() as connection:
@@ -225,7 +234,7 @@ def test_deleting_the_application_nulls_the_link_instead_of_raising(migration_ta
     _seed_unlinked_rows(migration_target)
     command.upgrade(config, _THIS_REVISION)
 
-    engine = create_engine(migration_target)
+    engine = db_safety.make_engine(migration_target)
     try:
         with engine.begin() as connection:
             connection.execute(text("UPDATE career_goals SET saved_job_id = 1 WHERE id = 1"))
@@ -264,7 +273,7 @@ def test_downgrading_keeps_every_goal_and_every_application(migration_target):
     _seed_unlinked_rows(migration_target)
     command.upgrade(config, _THIS_REVISION)
 
-    engine = create_engine(migration_target)
+    engine = db_safety.make_engine(migration_target)
     try:
         with engine.begin() as connection:
             connection.execute(text("UPDATE career_goals SET saved_job_id = 1 WHERE id = 1"))
@@ -273,7 +282,7 @@ def test_downgrading_keeps_every_goal_and_every_application(migration_target):
 
     command.downgrade(config, _PREVIOUS_REVISION)
 
-    engine = create_engine(migration_target)
+    engine = db_safety.make_engine(migration_target)
     try:
         with engine.connect() as connection:
             assert connection.execute(text("SELECT COUNT(*) FROM career_goals")).scalar() == 1

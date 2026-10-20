@@ -18,6 +18,7 @@ from starlette.websockets import WebSocketDisconnect
 
 from app.api import voice_session as endpoint
 from app.database.base import Base
+from app.voice import realtime_protocol as protocol
 from app.voice.session_registry import registry
 from tests.fixtures import replay_harness as h
 
@@ -295,47 +296,71 @@ class TestLifecycle:
 
 class TestResume:
     def test_a_valid_token_resumes_and_rotates(self, client, headers):
+        """Presented at connect time, a grant returns the *original* session id.
+
+        This is the assertion the old version could not make: it sent the grant as a message
+        and asserted the session id was the *new* one, which is exactly the defect -- the
+        client was told it had resumed while talking into a different conversation.
+        """
         with client.websocket_connect(URL, headers=headers) as ws:
             first = _accept(ws)
 
-        with client.websocket_connect(URL, headers=headers) as ws:
-            second = _accept(ws)
-            ws.send_text(json.dumps({"type": "resume", "token": first["resume_token"]}))
-            resumed = json.loads(ws.receive_text())
+        resuming = dict(headers)
+        resuming[protocol.RESUME_HEADER] = first["resume_token"]
+        with client.websocket_connect(URL, headers=resuming) as ws:
+            resumed = _accept(ws)
 
-        assert resumed["type"] == "session_accepted"
-        assert resumed["session_id"] == second["session_id"]
+        assert resumed["resumed"] is True
+        assert resumed["session_id"] == first["session_id"], (
+            "a resume must continue the original session, not relabel a new one"
+        )
         # Rotated: a grant is single use, so a captured token buys one attempt at most.
         assert resumed["resume_token"] != first["resume_token"]
 
     def test_a_token_is_single_use(self, client, headers):
+        """A replayed grant cannot resume a second time."""
         with client.websocket_connect(URL, headers=headers) as ws:
             first = _accept(ws)
 
-        with client.websocket_connect(URL, headers=headers) as ws:
-            opened = _accept(ws)
-            ws.send_text(json.dumps({"type": "resume", "token": first["resume_token"]}))
-            assert json.loads(ws.receive_text())["type"] == "session_accepted"
-            # Replayed. Ignored, and the session survives.
-            ws.send_text(json.dumps({"type": "resume", "token": first["resume_token"]}))
-            ws.send_text(json.dumps({"type": "resume", "token": opened["resume_token"]}))
-            assert json.loads(ws.receive_text())["type"] == "session_accepted"
+        resuming = dict(headers)
+        resuming[protocol.RESUME_HEADER] = first["resume_token"]
+        with client.websocket_connect(URL, headers=resuming) as ws:
+            once = _accept(ws)
+            assert once["resumed"] is True
+
+        # Replayed: the grant is gone, so this is a new session, honestly labelled.
+        with client.websocket_connect(URL, headers=resuming) as ws:
+            twice = _accept(ws)
+            assert twice["resumed"] is False
+            assert twice["session_id"] != first["session_id"]
 
     def test_another_users_token_is_useless(self, client, headers):
-        """The owner check is the security boundary, not the token's secrecy."""
+        """The owner check is the security boundary, not the token's secrecy.
+
+        Asserted at connect time, which is where a grant is now redeemed. The attacker gets a
+        working session of their own -- refusing the connection would make the endpoint an
+        oracle for whether someone else's session exists -- but it is a *different* session,
+        and it is honestly labelled unresumed.
+        """
         with client.websocket_connect(URL, headers=headers) as ws:
             victim = _accept(ws)
 
         attacker = h.signup(client, email="attacker-va2@example.com")
-        with client.websocket_connect(URL, headers=attacker) as ws:
+        stolen = dict(attacker)
+        stolen[protocol.RESUME_HEADER] = victim["resume_token"]
+        with client.websocket_connect(URL, headers=stolen) as ws:
             mine = _accept(ws)
-            ws.send_text(json.dumps({"type": "resume", "token": victim["resume_token"]}))
-            # Silently ignored -- indistinguishable from an unknown token, so the endpoint is
-            # not an oracle for whether someone else's session exists.
-            ws.send_text(json.dumps({"type": "resume", "token": mine["resume_token"]}))
-            resumed = json.loads(ws.receive_text())
-            assert resumed["session_id"] == mine["session_id"]
-            assert registry.get(mine["session_id"]).resumed_from == mine["session_id"]
+            assert mine["resumed"] is False, "a grant must not cross a user boundary"
+            assert mine["session_id"] != victim["session_id"]
+
+        # The victim's own session was not taken from them, and their grant was not consumed
+        # by the attempt: they can still resume it themselves.
+        own = dict(headers)
+        own[protocol.RESUME_HEADER] = victim["resume_token"]
+        with client.websocket_connect(URL, headers=own) as ws:
+            back = _accept(ws)
+            assert back["resumed"] is True
+            assert back["session_id"] == victim["session_id"]
 
     def test_an_unknown_token_does_not_kill_a_healthy_session(self, client, headers):
         with client.websocket_connect(URL, headers=headers) as ws:
@@ -345,36 +370,25 @@ class TestResume:
             assert json.loads(ws.receive_text())["type"] == "session_accepted"
 
     def test_an_expired_token_is_refused(self, client, headers, monkeypatch):
-        with client.websocket_connect(URL, headers=headers) as ws:
-            first = _accept(ws)
+        """An expired grant yields a fresh session, labelled unresumed -- never an error.
 
-        # Only tokens minted *after* this patch are expired by it: a grant's expires_at is
-        # computed at issue time (session_registry.issue_resume_token), so `first` -- minted in
-        # the connection above -- keeps its full TTL. close() deliberately leaves a grant
-        # alive, because outliving the socket is the whole point of resume. An earlier version
-        # of this test asserted both tokens were expired, which was wrong about `first`.
+        Only tokens minted *after* this patch are expired by it: a grant's expires_at is
+        computed at issue time (session_registry.issue_resume_token), so a token minted before
+        it keeps its full TTL. close() deliberately leaves a grant alive, because outliving
+        the socket is the whole point of resume.
+        """
         monkeypatch.setattr(registry, "resume_ttl_seconds", -1.0)
         with client.websocket_connect(URL, headers=headers) as ws:
             opened = _accept(ws)
+            assert opened["resumed"] is False
 
-            # Minted under the patched TTL, so already expired: ignored, no reply, and the
-            # healthy session survives it.
-            ws.send_text(json.dumps({"type": "resume", "token": opened["resume_token"]}))
+        stale = dict(headers)
+        stale[protocol.RESUME_HEADER] = opened["resume_token"]
+        with client.websocket_connect(URL, headers=stale) as ws:
+            after = _accept(ws)
+            assert after["resumed"] is False, "an expired grant must not resume"
+            assert after["session_id"] != opened["session_id"]
+            # The session is healthy, which an expired grant must not have cost it.
             ws.send_text(json.dumps({"type": "commit_turn"}))
-
-            # The synchronisation point, and the reason the assertion below is not a race. The
-            # expired resume is answered with nothing; the commit *is* answered -- with a typed
-            # `no_audio` refusal, since nothing was spoken -- and because frames are handled in
-            # order that reply proves the resume above was processed first.
             assert json.loads(ws.receive_text())["type"] == "turn_failed"
-
-            # The second resume is valid, so it replies too. A successful resume keeps the same
-            # record and counters, so it cannot mask the count being checked.
-            ws.send_text(json.dumps({"type": "resume", "token": first["resume_token"]}))
-            resumed = json.loads(ws.receive_text())
-            assert resumed["type"] == "session_accepted"
-            assert resumed["session_id"] == opened["session_id"]
-
-            record = registry.get(opened["session_id"])
-            assert record.turns_committed == 1
-            assert record.resumed_from == first["session_id"]
+            assert registry.get(after["session_id"]).turns_committed == 1

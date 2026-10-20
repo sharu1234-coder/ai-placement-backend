@@ -22,13 +22,17 @@ import uuid
 
 import pytest
 from alembic.config import Config
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import inspect, text
 from sqlalchemy.engine import make_url
 
 from alembic import command
 from app.core.config import settings
+from tests import db_safety
 
-_TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
+# Supplied by tests/db_safety.py, never read from the environment here: that module
+# refuses a target it cannot prove is disposable, and it does so at import time -- before
+# any fixture in this file can drop a table.
+_TEST_DATABASE_URL = db_safety.resolve_test_database_url()
 
 _NEW_TABLES = (
     "provider_connections",
@@ -60,19 +64,22 @@ def migration_target(tmp_path, monkeypatch):
         name = f"migration_test_{uuid.uuid4().hex[:8]}"
         # CREATE/DROP DATABASE cannot run inside a transaction block, hence AUTOCOMMIT against
         # the maintenance database rather than the one under test.
-        admin = create_engine(base.set(database="postgres"), isolation_level="AUTOCOMMIT")
+        admin = db_safety.make_engine(base.set(database="postgres"), isolation_level="AUTOCOMMIT")
         with admin.connect() as connection:
             connection.execute(text(f'CREATE DATABASE "{name}"'))
         # render_as_string(hide_password=False), not str(): SQLAlchemy's URL.__str__ masks the
         # password as "***", which would be handed to Alembic as a literal and fail to connect.
-        url = base.set(database=name).render_as_string(hide_password=False)
+        url = db_safety.hidden(
+            base.set(database=name).render_as_string(hide_password=False)
+        )
         monkeypatch.setattr(settings, "database_url", url)
-        yield url
-        with admin.connect() as connection:
-            # FORCE (PostgreSQL 13+) terminates any connection the engines below left behind,
-            # so a failed assertion cannot leave an undroppable database on the server.
-            connection.execute(text(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)'))
-        admin.dispose()
+        try:
+            yield url
+        finally:
+            # In a finally, so a test that errors cannot leave the database behind, and
+            # without FORCE -- see db_safety.drop_temp_database for why FORCE needs
+            # privileges over the superuser that this role deliberately does not have.
+            db_safety.drop_temp_database(admin, name)
     else:
         url = f"sqlite:///{tmp_path / 'migration.db'}"
         monkeypatch.setattr(settings, "database_url", url)
@@ -102,7 +109,7 @@ def _alembic_config() -> Config:
 
 
 def _table_names(url: str) -> set:
-    engine = create_engine(url)
+    engine = db_safety.make_engine(url)
     try:
         return set(inspect(engine).get_table_names())
     finally:
@@ -110,7 +117,7 @@ def _table_names(url: str) -> set:
 
 
 def _current_revision(url: str):
-    engine = create_engine(url)
+    engine = db_safety.make_engine(url)
     try:
         with engine.connect() as connection:
             row = connection.execute(text("SELECT version_num FROM alembic_version")).fetchone()
@@ -151,7 +158,7 @@ def test_the_migration_produces_the_columns_the_models_declare(migration_target)
     suite the schema comes from the models, so only this comparison can see a difference."""
     command.upgrade(_alembic_config(), _THIS_REVISION)
 
-    engine = create_engine(migration_target)
+    engine = db_safety.make_engine(migration_target)
     try:
         inspector = inspect(engine)
         connection_columns = {c["name"] for c in inspector.get_columns("provider_connections")}
@@ -193,7 +200,7 @@ def test_the_migration_produces_the_columns_the_models_declare(migration_target)
 def test_foreign_keys_point_where_the_models_say(migration_target):
     command.upgrade(_alembic_config(), _THIS_REVISION)
 
-    engine = create_engine(migration_target)
+    engine = db_safety.make_engine(migration_target)
     try:
         inspector = inspect(engine)
 
@@ -219,7 +226,7 @@ def test_postgresql_creates_both_indexes_as_genuinely_partial(migration_target):
     """
     command.upgrade(_alembic_config(), _THIS_REVISION)
 
-    engine = create_engine(migration_target)
+    engine = db_safety.make_engine(migration_target)
     try:
         with engine.connect() as connection:
             rows = connection.execute(

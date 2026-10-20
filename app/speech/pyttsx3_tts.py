@@ -25,6 +25,14 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+from app.core.voice_selection import (
+    VoiceChoice,
+    apply_rate,
+    available_voice_ids,
+    confirm_selection,
+    log_choice,
+    select_voice,
+)
 from app.speech.audio import read_wav, wav_duration_seconds
 from app.speech.contracts import (
     AudioEncoding,
@@ -39,14 +47,6 @@ from app.speech.contracts import (
     SynthesizeRequest,
     TextToSpeech,
     TtsCapabilities,
-)
-from app.core.voice_selection import (
-    VoiceChoice,
-    apply_rate,
-    available_voice_ids,
-    confirm_selection,
-    log_choice,
-    select_voice,
 )
 
 logger = logging.getLogger(__name__)

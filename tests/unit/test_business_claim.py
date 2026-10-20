@@ -28,8 +28,12 @@ from app.models.operation_claim import OperationClaim
 from app.models.profile import StudentProfile
 from app.models.user import User
 from app.services import idempotency
+from tests import db_safety
 
-_TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
+# Supplied by tests/db_safety.py, never read from the environment here: that module
+# refuses a target it cannot prove is disposable, and it does so at import time -- before
+# any fixture in this file can drop a table.
+_TEST_DATABASE_URL = db_safety.resolve_test_database_url()
 
 OPERATION = "jd.preparation_plan"
 IDENTITY = {"jd_id": 7}
@@ -66,7 +70,7 @@ def engine(tmp_path):
     if _TEST_DATABASE_URL:
         eng = create_engine(_TEST_DATABASE_URL, poolclass=NullPool,
                             connect_args={"options": "-c lock_timeout=15000"})
-        Base.metadata.drop_all(bind=eng)
+        db_safety.drop_all_safely(eng)
     else:
         # A file, not :memory:, so a second session in a second thread is genuinely a second
         # connection. timeout lets a writer wait for SQLite's lock rather than failing instantly.
@@ -76,7 +80,7 @@ def engine(tmp_path):
         yield eng
     finally:
         if _TEST_DATABASE_URL:
-            Base.metadata.drop_all(bind=eng)
+            db_safety.drop_all_safely(eng)
         eng.dispose()
 
 

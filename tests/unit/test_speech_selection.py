@@ -102,13 +102,33 @@ class TestConfiguredSelection:
         with pytest.raises(SpeechNotConfigured):
             get_text_to_speech("none")
 
-    def test_that_is_the_default(self):
+    def test_that_is_the_default(self, monkeypatch):
         # No provider has been measured well enough to be a production default, so the default
         # must be the honest one.
-        from app.core.config import settings
+        #
+        # This asserts the *declared* default, which is the claim being made, and deliberately
+        # does not read `app.core.config.settings`. That singleton is whatever this machine is
+        # configured to run: pydantic fills it from the process environment and from `.env`,
+        # and a developer with `TTS_PROVIDER=pyttsx3` in their `.env` is correctly configured,
+        # not in breach of this contract. Reading the singleton made the test pass or fail on
+        # the contents of an untracked file: measured, it passed wherever `.env` was not
+        # discoverable and failed from a repository root with a populated `.env` -- the worst
+        # of both, since it never caught a real default change and failed for a reason that
+        # was not a bug. (No claim is made about CI here: no workflow has run on this branch.)
+        from app.core.config import Settings
 
-        assert settings.stt_provider == "none"
-        assert settings.tts_provider == "none"
+        assert Settings.model_fields["stt_provider"].default == "none"
+        assert Settings.model_fields["tts_provider"].default == "none"
+
+        # And a process with nothing configured must actually get those defaults -- the field
+        # declaration above would not catch a validator or an alias that rewrote the value on
+        # the way in. `_env_file=None` ignores `.env`; the two `delenv` calls cover the
+        # process-environment overrides that would otherwise win over the default.
+        monkeypatch.delenv("STT_PROVIDER", raising=False)
+        monkeypatch.delenv("TTS_PROVIDER", raising=False)
+        controlled = Settings(_env_file=None)
+        assert controlled.stt_provider == "none"
+        assert controlled.tts_provider == "none"
 
     def test_an_unknown_name_raises_rather_than_falling_back(self):
         # A typo in configuration silently selecting a different provider is worse than a

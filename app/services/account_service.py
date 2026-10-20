@@ -63,6 +63,7 @@ from app.models.skill_gap import SkillGap
 from app.models.subscription import Subscription
 from app.models.user import User
 from app.models.weakness_record import WeaknessRecord
+from app.services import deletion_outbox
 from app.storage.provider import StorageProvider
 
 logger = logging.getLogger(__name__)
@@ -94,6 +95,29 @@ def delete_account(db: Session, user: User, storage: StorageProvider) -> None:
     here could go undetected until it hits production.
     """
     profile = db.query(StudentProfile).filter(StudentProfile.user_id == user.id).first()
+
+    # Phase 1 of the outbox (docs/proposal-account-deletion-outbox.md). Every storage key is
+    # copied into a durable job *before* any row is deleted, and the insert and the deletes
+    # below are one transaction -- so a rollback leaves both the key and the object in place,
+    # and a commit leaves the obligation recorded. Nothing here calls storage.
+    #
+    # The outbox engages only when there is something stored to erase. With no objects there
+    # is nothing for a worker to do, so the user row goes in this transaction as before and
+    # the account is finished on return. That keeps the simple case simple and is why the
+    # no-profile path below is unchanged.
+    storage_keys = deletion_outbox.collect_storage_keys(db, profile.id) if profile else []
+    request = (
+        deletion_outbox.enqueue(db, original_user_id=user.id, keys=storage_keys)
+        if storage_keys
+        else None
+    )
+    if request is not None:
+        # The uuid and the count only. Never a key: it is a user-scoped path.
+        logger.info(
+            "Account deletion request %s recorded %s object(s) for erasure",
+            request.request_uuid,
+            len(storage_keys),
+        )
 
     if profile is not None:
         pid = profile.id
@@ -328,18 +352,17 @@ def delete_account(db: Session, user: User, storage: StorageProvider) -> None:
         )
 
         # -- resumes: must follow placement_paths (nullable FK into resumes) and the resume-
-        # owned leaves above. File deletion is best-effort and never blocks the DB delete. --
-        resumes = db.query(Resume).filter(Resume.profile_id == pid).all()
-        for resume in resumes:
-            try:
-                storage.delete(resume.file_path)
-            except Exception as exc:
-                logger.warning(
-                    "Could not delete resume file %s for resume_id=%s during account deletion: %s",
-                    resume.file_path,
-                    resume.id,
-                    exc,
-                )
+        # owned leaves above.
+        #
+        # File deletion used to happen here, inside this transaction, and the whole account
+        # deletion was abandoned if storage was unreachable. That held the invariant -- never
+        # destroy the last pointer to an object that is still there -- but it made a user's
+        # ability to leave depend on a bucket being up.
+        #
+        # The keys are now in `deletion_jobs`, inserted above in this same transaction, so the
+        # pointer survives the delete below and the erasure is the worker's obligation. The
+        # invariant is unchanged; what moved is where the pointer lives. No storage call
+        # happens in this function at all, which is why `storage` is no longer used here.
         db.query(Resume).filter(Resume.profile_id == pid).delete(synchronize_session=False)
 
         # -- job_descriptions: must follow every one of requirements, job_preparation_plans,
@@ -379,5 +402,13 @@ def delete_account(db: Session, user: User, storage: StorageProvider) -> None:
     # unconditionally, not nested inside `if profile is not None`.
     db.query(PasswordResetToken).filter(PasswordResetToken.user_id == user.id).delete(synchronize_session=False)
 
-    db.delete(user)
+    if request is None:
+        # Nothing is stored, so there is no obligation to outlive this transaction.
+        db.delete(user)
+    else:
+        # The row stays until the last object is gone, but grants nothing: the token version
+        # bump kills every issued access token, refresh token and open WebSocket, and the
+        # identifying columns are overwritten. The worker deletes it when the request closes.
+        deletion_outbox.revoke_access(db, user)
+        deletion_outbox.minimise(db, user)
     db.commit()

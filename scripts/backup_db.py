@@ -22,13 +22,13 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from urllib.parse import urlparse
 
 # Imports app.core.config directly (not the full app) -- this must not trigger
 # validate_for_production() (that only runs via app/main.py's module-level call), and it
 # doesn't: app.core.config only *defines* that function, it doesn't call it on import.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from app.core.config import settings  # noqa: E402
+from app.database.pg_client import child_env, parse_target, redact_output  # noqa: E402
 
 
 def _timestamp() -> str:
@@ -58,19 +58,23 @@ def backup_postgres(db_url: str, out_dir: Path) -> Path:
             r'"C:\Program Files\PostgreSQL\17\bin\pg_dump.exe").'
         )
 
-    db_name = urlparse(db_url).path.lstrip("/") or "database"
-    out_path = out_dir / f"{db_name}_{_timestamp()}.dump"
+    # Parsed once, then passed explicitly. A SQLAlchemy URL is not a libpq connection
+    # string: see app/database/pg_client.py for what happens when one is handed over whole.
+    target = parse_target(db_url)
+    out_path = out_dir / f"{target.database}_{_timestamp()}.dump"
 
     # -Fc: custom format -- compressed, and required by pg_restore's --clean/--if-exists
     # (used by restore_db.py) to selectively drop-and-recreate objects before restoring.
     result = subprocess.run(
-        [pg_dump, "-Fc", "-f", str(out_path), db_url],
+        [pg_dump, "-Fc", "-f", str(out_path), *target.args()],
         capture_output=True,
         text=True,
+        env=child_env(target),
     )
     if result.returncode != 0:
         out_path.unlink(missing_ok=True)
-        raise SystemExit(f"pg_dump failed:\n{result.stderr}")
+        detail = redact_output(result.stderr, target.password)
+        raise SystemExit(f"pg_dump failed against {target.redacted()}:\n{detail}")
     return out_path
 
 

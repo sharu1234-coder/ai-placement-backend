@@ -1,4 +1,3 @@
-import os
 
 import pytest
 from fastapi.testclient import TestClient
@@ -12,10 +11,19 @@ from app.main import app
 from app.models.role import Role
 from app.models.role_skill_weight import RoleSkillWeight
 from app.models.user import User  # noqa: F401  (registers the table with Base.metadata)
+from tests import db_safety
 
 # Opt-in: point the API suite at a real PostgreSQL instead of in-memory SQLite.
 #
-#   TEST_DATABASE_URL=postgresql+psycopg2://postgres@127.0.0.1:55432/aiplacement_test pytest
+#   TEST_DATABASE_DESTRUCTIVE=1
+#   TEST_DATABASE_URL=postgresql+psycopg2://talviora_test:...@127.0.0.1:55432/aiplacement_test
+#   pytest
+#
+# Both variables, and a role that holds grants on that database only -- the fixture below
+# drops every table in whatever the URL names, before every test, so tests/db_safety.py
+# refuses a target that has not been declared disposable, is not PostgreSQL, is not named
+# *_test, connects as an instance-wide administrator, or turns out on inspection to be the
+# application's own database. That check runs at import, before this file's first drop.
 #
 # Unset -- which is every existing run, local and CI -- behaves exactly as before. The default
 # matters: SQLite in-memory gives each test a private database for free and runs in seconds,
@@ -26,7 +34,10 @@ from app.models.user import User  # noqa: F401  (registers the table with Base.m
 # a transaction that fails mid-way behaves differently there (a failed statement poisons the
 # whole transaction until rollback, where SQLite carries on). Savepoint-recovery code is
 # written for that, so it deserves to be exercised against the database it was written for.
-_TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
+# Supplied by tests/db_safety.py, never read from the environment here: that module
+# refuses a target it cannot prove is disposable, and it does so at import time -- before
+# any fixture in this file can drop a table.
+_TEST_DATABASE_URL = db_safety.resolve_test_database_url()
 
 
 def _make_engine():
@@ -81,7 +92,7 @@ def client():
     # seed below collides with itself. An in-memory SQLite database is discarded wholesale and
     # needs none of this.
     if _TEST_DATABASE_URL:
-        Base.metadata.drop_all(bind=engine)
+        db_safety.drop_all_safely(engine)
     Base.metadata.create_all(bind=engine)
 
     # Minimal role + skill-weight seed for tests (mirrors the real Alembic seed migrations,
@@ -142,3 +153,35 @@ def client():
     for issued in issued_sessions:
         issued.close()
     engine.dispose()
+
+
+# --------------------------------------------------------------------------- report scrubbing
+# Second layer behind db_safety.HiddenUrl. pytest's default long traceback prints the failing
+# function's arguments, and libraries compose their own messages, so a credential can reach a
+# report from a direction this suite does not control. Anything the configured destructive URL
+# would disclose is replaced here, at the last point before the text is displayed or written
+# to a junit file.
+#
+# It is a no-op on an ordinary run: with no TEST_DATABASE_URL there is no secret to scrub, and
+# the report object is left exactly as pytest built it.
+_SCRUB = db_safety.secrets_to_scrub()
+
+
+def _scrubbed(text: str) -> str:
+    for secret in _SCRUB:
+        text = text.replace(secret, "<redacted>")
+    return text
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_makereport(item, call):
+    report = yield
+    if _SCRUB and report.longrepr is not None:
+        original = str(report.longrepr)
+        cleaned = _scrubbed(original)
+        if cleaned != original:
+            # Replacing the structured longrepr with text costs the coloured source markers
+            # and keeps every line of the traceback. That trade is deliberate: a readable
+            # report that leaks a password is worse than a plain one that does not.
+            report.longrepr = cleaned
+    return report

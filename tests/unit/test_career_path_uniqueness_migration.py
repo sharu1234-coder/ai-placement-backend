@@ -32,14 +32,18 @@ import uuid
 
 import pytest
 from alembic.config import Config
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import inspect, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import IntegrityError
 
 from alembic import command
 from app.core.config import settings
+from tests import db_safety
 
-_TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
+# Supplied by tests/db_safety.py, never read from the environment here: that module
+# refuses a target it cannot prove is disposable, and it does so at import time -- before
+# any fixture in this file can drop a table.
+_TEST_DATABASE_URL = db_safety.resolve_test_database_url()
 
 _PREVIOUS_REVISION = "c3a7f1d85e29"
 _THIS_REVISION = "5b8e2f7c1a94"
@@ -67,15 +71,20 @@ def migration_target(tmp_path, monkeypatch):
     if _TEST_DATABASE_URL:
         base = make_url(_TEST_DATABASE_URL)
         name = f"career_path_uniqueness_{uuid.uuid4().hex[:8]}"
-        admin = create_engine(base.set(database="postgres"), isolation_level="AUTOCOMMIT")
+        admin = db_safety.make_engine(base.set(database="postgres"), isolation_level="AUTOCOMMIT")
         with admin.connect() as connection:
             connection.execute(text(f'CREATE DATABASE "{name}"'))
-        url = base.set(database=name).render_as_string(hide_password=False)
+        url = db_safety.hidden(
+            base.set(database=name).render_as_string(hide_password=False)
+        )
         monkeypatch.setattr(settings, "database_url", url)
-        yield url
-        with admin.connect() as connection:
-            connection.execute(text(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)'))
-        admin.dispose()
+        try:
+            yield url
+        finally:
+            # In a finally, so a test that errors cannot leave the database behind, and
+            # without FORCE -- see db_safety.drop_temp_database for why FORCE needs
+            # privileges over the superuser that this role deliberately does not have.
+            db_safety.drop_temp_database(admin, name)
     else:
         url = f"sqlite:///{tmp_path / 'career_path_uniqueness.db'}"
         monkeypatch.setattr(settings, "database_url", url)
@@ -94,7 +103,7 @@ def _alembic_config() -> Config:
 
 def _at_previous_revision(url: str):
     command.upgrade(_alembic_config(), _PREVIOUS_REVISION)
-    return create_engine(url)
+    return db_safety.make_engine(url)
 
 
 def _upgrade():
@@ -102,7 +111,7 @@ def _upgrade():
 
 
 def _rows(url: str, sql: str, **params):
-    engine = create_engine(url)
+    engine = db_safety.make_engine(url)
     try:
         with engine.connect() as connection:
             return connection.execute(text(sql), params).all()
@@ -268,7 +277,7 @@ def _assert_indexes_and_foreign_keys_survived(url: str) -> None:
     constraint differences as drift, so a lost index would pass every other test here and show up
     only as a slow query in production.
     """
-    inspector = inspect(create_engine(url))
+    inspector = inspect(db_safety.make_engine(url))
     indexed = {tuple(index["column_names"]) for index in inspector.get_indexes("career_paths")}
     assert ("profile_id",) in indexed, f"the profile_id index was lost in the rebuild: {indexed}"
     assert ("role_family_key",) in indexed, f"the role_family_key index was lost in the rebuild: {indexed}"
@@ -281,7 +290,7 @@ def _assert_indexes_and_foreign_keys_survived(url: str) -> None:
 
 
 def _assert_constraint_refuses_duplicates(url: str, profile_id: int = 1, family: str = _FAMILY) -> None:
-    engine = create_engine(url)
+    engine = db_safety.make_engine(url)
     try:
         with pytest.raises(IntegrityError):
             with engine.begin() as connection:
@@ -306,11 +315,16 @@ def test_the_constraint_exists_and_refuses_a_second_row_for_the_same_role(migrat
             _seed_path(connection, path_id=1, is_primary=True, skills=(("sql", "completed", "manual", None),))
     finally:
         engine.dispose()
-    assert _CONSTRAINT not in {c["name"] for c in inspect(create_engine(migration_target)).get_unique_constraints("career_paths")}
+    assert _CONSTRAINT not in {
+        c["name"]
+        for c in inspect(db_safety.make_engine(migration_target)).get_unique_constraints(
+            "career_paths"
+        )
+    }
 
     _upgrade()
 
-    constraints = inspect(create_engine(migration_target)).get_unique_constraints("career_paths")
+    constraints = inspect(db_safety.make_engine(migration_target)).get_unique_constraints("career_paths")
     matching = [c for c in constraints if c["name"] == _CONSTRAINT]
     assert matching, f"constraint missing; found {[c['name'] for c in constraints]}"
     assert matching[0]["column_names"] == ["profile_id", "role_family_key"], (
@@ -339,7 +353,7 @@ def test_a_different_profile_or_role_is_never_refused(migration_target):
 
     _upgrade()
 
-    engine = create_engine(migration_target)
+    engine = db_safety.make_engine(migration_target)
     try:
         with engine.begin() as connection:
             for profile_id, family in ((2, _FAMILY), (1, "data_scientist")):
@@ -590,7 +604,7 @@ def test_the_migration_is_reversible_and_the_merge_stands(migration_target):
     command.downgrade(_alembic_config(), _PREVIOUS_REVISION)
 
     assert _CONSTRAINT not in {
-        c["name"] for c in inspect(create_engine(migration_target)).get_unique_constraints("career_paths")
+        c["name"] for c in inspect(db_safety.make_engine(migration_target)).get_unique_constraints("career_paths")
     }
     assert _skills(migration_target, 1) == {
         "sql": ("completed", "manual", None),

@@ -97,9 +97,11 @@ class TestTheGatewayWritesATranscript:
 
         db = read()
         conversation = db.execute(select(Conversation)).scalars().one()
-        # Either is honest for a socket the client closed; what must not happen is staying
-        # `active` for ever, which would show the student a conversation still in progress.
-        assert conversation.status in ("completed", "interrupted")
+        # Tightened 2026-10-19. This used to accept ("completed", "interrupted"), which passed
+        # whichever one the code produced -- and the code produced `completed` for a socket
+        # that was merely closed. Closing a socket is not finishing a conversation; only an
+        # explicit `end_session` is. Accepting both answers is how the defect stayed green.
+        assert conversation.status == "interrupted"
         assert conversation.ended_at is not None
         db.close()
 
@@ -153,3 +155,105 @@ class TestNothingIsInvented:
         # The conversation itself still exists: a session happened, it simply has no turns.
         assert len(db.execute(select(Conversation)).scalars().all()) == 1
         db.close()
+
+
+class TestOnlyADeliberateEndIsCompleted:
+    """`completed` must mean the student finished, not merely that the loop returned.
+
+    Before this, `ended_status = "completed"` was set whenever `_pump` returned without
+    raising -- and `_pump` returns normally on idle timeout, peer disconnect, oversized
+    frames, invalid audio, the session audio cap and protocol violations. Because the only
+    path that raised was `WebSocketDisconnect`, `completed` was in practice reachable *only*
+    through an abnormal ending: the precise inverse of the comment above it.
+    """
+
+    def test_an_explicit_end_session_completes_the_conversation(self, client, headers, read):
+        with client.websocket_connect(URL, headers=headers) as ws:
+            _accept(ws)
+            ws.send_text(json.dumps({"type": "end_session"}))
+
+        db = read()
+        conversation = db.execute(select(Conversation)).scalars().one()
+        assert conversation.status == "completed"
+        assert conversation.ended_at is not None
+        db.close()
+
+    def test_a_protocol_violation_is_not_a_completion(self, client, headers, read):
+        with client.websocket_connect(URL, headers=headers) as ws:
+            _accept(ws)
+            ws.send_text("{not json")
+
+        db = read()
+        conversation = db.execute(select(Conversation)).scalars().one()
+        assert conversation.status == "interrupted"
+        db.close()
+
+    def test_an_oversized_control_message_is_not_a_completion(self, client, headers, read):
+        with client.websocket_connect(URL, headers=headers) as ws:
+            _accept(ws)
+            ws.send_text(json.dumps({"type": "heartbeat", "pad": "x" * 9000}))
+
+        db = read()
+        conversation = db.execute(select(Conversation)).scalars().one()
+        assert conversation.status == "interrupted"
+        db.close()
+
+    def test_an_invalid_audio_frame_is_not_a_completion(self, client, headers, read):
+        with client.websocket_connect(URL, headers=headers) as ws:
+            _accept(ws)
+            # An odd byte count cannot be whole 16-bit samples.
+            ws.send_bytes(b"\x00\x01\x02")
+
+        db = read()
+        conversation = db.execute(select(Conversation)).scalars().one()
+        assert conversation.status == "interrupted"
+        db.close()
+
+    def test_an_idle_timeout_is_not_a_completion(self, client, headers, read, monkeypatch):
+        """The clearest case of the old bug: the student stopped talking and walked away,
+        and their record said they finished the interview."""
+        from app.api import voice_session as vs
+
+        monkeypatch.setattr(vs, "IDLE_TIMEOUT_SECONDS", 0.05)
+        with client.websocket_connect(URL, headers=headers) as ws:
+            _accept(ws)
+            # The server sends session_expired then closes; read until it goes away.
+            try:
+                for _ in range(4):
+                    ws.receive_text()
+            except Exception:
+                pass
+
+        db = read()
+        conversation = db.execute(select(Conversation)).scalars().one()
+        assert conversation.status == "interrupted"
+        db.close()
+
+
+class TestPumpReasonMapping:
+    """The mapping itself, independent of a socket."""
+
+    def test_every_reason_has_a_decided_status(self):
+        from app.api import voice_session as vs
+
+        reasons = [v for k, v in vars(vs).items() if k.startswith("PUMP_")]
+        assert len(reasons) >= 9
+        for reason in reasons:
+            assert vs.status_for_pump_reason(reason) in ("completed", "interrupted")
+
+    def test_only_a_client_end_maps_to_completed(self):
+        """Guards the inversion from coming back by a different route: if some future reason
+        is mapped to `completed`, this fails rather than quietly shipping false records."""
+        from app.api import voice_session as vs
+
+        completed = [
+            v for k, v in vars(vs).items()
+            if k.startswith("PUMP_") and vs.status_for_pump_reason(v) == "completed"
+        ]
+        assert completed == [vs.PUMP_CLIENT_END]
+
+    def test_an_undecided_reason_raises_rather_than_guessing(self):
+        from app.api import voice_session as vs
+
+        with pytest.raises(ValueError, match="no conversation status"):
+            vs.status_for_pump_reason("something_new")

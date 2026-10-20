@@ -495,21 +495,124 @@ class TestInFlightDuplicates:
             bodies=[{**body, "confirmation_token": token} for token in tokens],
         )
 
+        # The race was actually staged. Asserted first, because every assertion below is
+        # worthless if the two requests ran one after the other -- and the old version of this
+        # test never checked it. `gated_threads` holds one entry per *thread* the gate held,
+        # which is the harness's own answer to "did these genuinely overlap".
+        assert len(h.gated_threads) == 2, (
+            "both requests must have been held at the claims read; with fewer, this is two "
+            "sequential requests and proves nothing about concurrency"
+        )
+
         states = sorted(
             (r.json().get("state") if r.status_code == 200 else f"http-{r.status_code}")
             for r in responses
         )
-        assert states == ["in_progress", "succeeded"], [r.status_code for r in responses]
-        for response in responses:
-            if response.status_code == 200 and response.json()["state"] == "in_progress":
-                assert response.json()["verified"] is False
+        # Both orderings are legal and this test no longer demands one of them.
+        #
+        # It used to assert exactly ["in_progress", "succeeded"], i.e. that the loser observed
+        # the in-flight window. The gate releases both threads at the claims read and does not
+        # order what follows, so the loser's re-read races the winner's finalize write; when the
+        # winner finalises first the loser reads the real, completed result and reports
+        # "succeeded". Measured at 3 failures in 10 isolated runs for that reason alone.
+        #
+        # Reporting a finished operation as finished is the guard working, not failing. What
+        # must never happen is the opposite -- a success handed back for work that has not
+        # finished -- and that is what is asserted below, for every response, in both orderings.
+        assert states in (["in_progress", "succeeded"], ["succeeded", "succeeded"]), [
+            (r.status_code, r.json().get("state")) for r in responses
+        ]
+
         db.expire_all()
         rows = (
             db.query(SavedJob)
             .filter(SavedJob.profile_id == profile.id, SavedJob.listing_id == listing.id)
             .all()
         )
+        # One mutation, whichever way the two threads interleaved.
         assert len(rows) == 1
+
+        for response in responses:
+            assert response.status_code == 200, response.text
+            body = response.json()
+            if body["state"] == "in_progress":
+                # Nothing is claimed for work still running.
+                assert body["verified"] is False
+                assert body.get("result") in (None, {}), (
+                    "an in-progress reply must not carry a result for unfinished work"
+                )
+            else:
+                # The stronger half, and the invariant the refusal exists to protect: a reply
+                # that says "succeeded" must be backed by the durable row. Previously only one
+                # response was ever checked this way, because the other was required to be
+                # in_progress.
+                assert body["state"] == "succeeded"
+                assert rows, "a success was reported with no durable mutation behind it"
+
+    def test_an_operation_still_in_flight_is_never_reported_as_a_result(self, client, db):
+        """The in-flight branch, deterministically and without threads.
+
+        The racing test above exercises this branch only when it wins the race, which is why a
+        30%-failing test was its only coverage. Here the in-flight state is arranged directly:
+        a real claim is taken through `idempotency.claim` -- the same function the tool
+        registry uses -- so the stored request fingerprint is the genuine one, and the row is
+        left in `claimed`, exactly as it looks while the work is running.
+
+        The fingerprint is built from the registry's own input model rather than from the raw
+        request body, because that is what the real path hashes
+        (`fingerprint(spec.name, parsed.model_dump(mode="json"))`). Hand-rolling the params
+        would make this test pass or fail on fingerprint parity instead of on the behaviour
+        under test.
+        """
+        from app.api.actions import _REGISTRY
+        from app.services import idempotency
+
+        headers = h.signup(client, email="va10-inflight-det@example.com")
+        profile = profile_for(db, "va10-inflight-det@example.com")
+        listing = make_listing(db)
+        body = {"capability": "jobs.save", "arguments": {"listing_id": listing.id}}
+        key = "k-va10-inflight-deterministic"
+
+        spec = _REGISTRY.get("jobs.save")
+        parsed = spec.input_model.model_validate({"listing_id": listing.id})
+        taken = idempotency.claim(
+            db,
+            profile.id,
+            # "tool." prefixed, as app/tools/registry.py does -- the operation name is part of
+            # the fingerprint, so "jobs.save" here produces a different hash and the endpoint
+            # correctly refuses the key as naming a different request (409).
+            operation="tool.jobs.save",
+            idempotency_key=key,
+            params=parsed.model_dump(mode="json"),
+        )
+        assert taken.status == "claimed", taken.status
+
+        token = client.post("/actions/preview", json=body, headers=headers).json()[
+            "confirmation_token"
+        ]
+        replay = client.post(
+            "/actions/execute",
+            json={**body, "confirmation_token": token},
+            headers={**headers, "Idempotency-Key": key},
+        )
+
+        assert replay.status_code == 200, replay.text
+        reported = replay.json()
+        assert reported["state"] == "in_progress", (
+            "a duplicate arriving while the first is still in flight must be told the work is "
+            "in progress, not handed a result"
+        )
+        assert reported["verified"] is False
+
+        db.expire_all()
+        rows = (
+            db.query(SavedJob)
+            .filter(SavedJob.profile_id == profile.id, SavedJob.listing_id == listing.id)
+            .all()
+        )
+        assert rows == [], (
+            "the in-flight refusal must not run the mutation; the claim holder owns it"
+        )
 
 
 class TestConfirmationResourceRebinding:

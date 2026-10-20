@@ -187,6 +187,49 @@ class SessionRegistry:
             del self._grants[token]
             return grant
 
+    def resume(
+        self, *, grant: "_ResumeGrant", sample_rate_hz: int, channel_count: int
+    ) -> VoiceSessionRecord | None:
+        """Re-register the granted session under its **original** id, or refuse.
+
+        This is what makes a resume a resume rather than a relabelled new session. The id is
+        the identity everything downstream is keyed on -- the coach responder's memory scope
+        and the durable transcript's `session_key` are both `"voice-" + session_id` -- so
+        handing the original id back is what reattaches the retained state. Nothing is copied.
+
+        Refused, by returning None, when a **live** record already holds that id. That would
+        mean two sockets claiming one session, and the caller's answer is to proceed as a
+        fresh session reporting `resumed: false` -- an honest new conversation rather than two
+        connections writing into one transcript with ambiguous ownership.
+
+        The grant has already been consumed by `redeem_resume_token`, which checked the owner
+        under this same lock, so a refusal here costs the client its grant. That is the
+        conservative direction: a client that cannot resume is told so and carries on, whereas
+        a grant left redeemable after an ambiguous attempt is a replay waiting to happen.
+
+        Not counted against `max_sessions_per_user`: the session already existed, and the
+        socket that held it is gone. Counting it would make a reconnect fail exactly when a
+        user is at their limit, which is when a dropped connection is most likely.
+        """
+        now = self.clock()
+        with self._lock:
+            existing = self._sessions.get(grant.session_id)
+            if existing is not None and not existing.closed:
+                return None
+            record = VoiceSessionRecord(
+                session_id=grant.session_id,
+                user_id=grant.user_id,
+                sample_rate_hz=sample_rate_hz,
+                channel_count=channel_count,
+                opened_at=now,
+                last_seen_at=now,
+                # Equal to session_id by construction: a resume continues a session rather
+                # than descending from a different one.
+                resumed_from=grant.session_id,
+            )
+            self._sessions[record.session_id] = record
+            return record
+
     def _purge_expired_locked(self) -> None:
         now = self.clock()
         for token in [t for t, g in self._grants.items() if g.expires_at <= now]:

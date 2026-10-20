@@ -27,7 +27,7 @@ from alembic.autogenerate import compare_metadata
 from alembic.config import Config
 from alembic.migration import MigrationContext
 from alembic.script import ScriptDirectory
-from sqlalchemy import Column, Integer, MetaData, Table, create_engine, inspect, text
+from sqlalchemy import Column, Integer, MetaData, Table, inspect, text
 from sqlalchemy.engine.url import make_url
 
 from alembic import command
@@ -39,8 +39,12 @@ from app.database.base import Base
 # against whichever handful of models happened to be imported, and pass while missing most of
 # the schema.
 import app.main  # noqa: F401  isort:skip
+from tests import db_safety
 
-_TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
+# Supplied by tests/db_safety.py, never read from the environment here: that module
+# refuses a target it cannot prove is disposable, and it does so at import time -- before
+# any fixture in this file can drop a table.
+_TEST_DATABASE_URL = db_safety.resolve_test_database_url()
 
 
 def _alembic_config() -> Config:
@@ -69,15 +73,20 @@ def migration_target(tmp_path, monkeypatch):
     if _TEST_DATABASE_URL:
         base = make_url(_TEST_DATABASE_URL)
         name = f"parity_test_{uuid.uuid4().hex[:8]}"
-        admin = create_engine(base.set(database="postgres"), isolation_level="AUTOCOMMIT")
+        admin = db_safety.make_engine(base.set(database="postgres"), isolation_level="AUTOCOMMIT")
         with admin.connect() as connection:
             connection.execute(text(f'CREATE DATABASE "{name}"'))
-        url = base.set(database=name).render_as_string(hide_password=False)
+        url = db_safety.hidden(
+            base.set(database=name).render_as_string(hide_password=False)
+        )
         monkeypatch.setattr(settings, "database_url", url)
-        yield url
-        with admin.connect() as connection:
-            connection.execute(text(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)'))
-        admin.dispose()
+        try:
+            yield url
+        finally:
+            # In a finally, so a test that errors cannot leave the database behind, and
+            # without FORCE -- see db_safety.drop_temp_database for why FORCE needs
+            # privileges over the superuser that this role deliberately does not have.
+            db_safety.drop_temp_database(admin, name)
     else:
         url = f"sqlite:///{tmp_path / 'parity.db'}"
         monkeypatch.setattr(settings, "database_url", url)
@@ -85,7 +94,7 @@ def migration_target(tmp_path, monkeypatch):
 
 
 def _diffs_against_models(url: str) -> list:
-    engine = create_engine(url)
+    engine = db_safety.make_engine(url)
     try:
         with engine.connect() as connection:
             context = MigrationContext.configure(connection)
@@ -95,7 +104,7 @@ def _diffs_against_models(url: str) -> list:
 
 
 def _table_names(url: str) -> set:
-    engine = create_engine(url)
+    engine = db_safety.make_engine(url)
     try:
         return set(inspect(engine).get_table_names())
     finally:
@@ -139,7 +148,7 @@ def test_the_parity_check_actually_detects_drift(migration_target):
         table.to_metadata(drifted)
     Table("a_table_no_migration_ever_created", drifted, Column("id", Integer, primary_key=True))
 
-    engine = create_engine(migration_target)
+    engine = db_safety.make_engine(migration_target)
     try:
         with engine.connect() as connection:
             context = MigrationContext.configure(connection)

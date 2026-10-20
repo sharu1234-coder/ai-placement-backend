@@ -21,13 +21,17 @@ import uuid
 
 import pytest
 from alembic.config import Config
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import inspect, text
 from sqlalchemy.engine import make_url
 
 from alembic import command
 from app.core.config import settings
+from tests import db_safety
 
-_TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
+# Supplied by tests/db_safety.py, never read from the environment here: that module
+# refuses a target it cannot prove is disposable, and it does so at import time -- before
+# any fixture in this file can drop a table.
+_TEST_DATABASE_URL = db_safety.resolve_test_database_url()
 
 _TABLE = "interview_evaluations"
 _SCORE_COLUMNS = (
@@ -51,15 +55,20 @@ def migration_target(tmp_path, monkeypatch):
     if _TEST_DATABASE_URL:
         base = make_url(_TEST_DATABASE_URL)
         name = f"eval_migration_test_{uuid.uuid4().hex[:8]}"
-        admin = create_engine(base.set(database="postgres"), isolation_level="AUTOCOMMIT")
+        admin = db_safety.make_engine(base.set(database="postgres"), isolation_level="AUTOCOMMIT")
         with admin.connect() as connection:
             connection.execute(text(f'CREATE DATABASE "{name}"'))
-        url = base.set(database=name).render_as_string(hide_password=False)
+        url = db_safety.hidden(
+            base.set(database=name).render_as_string(hide_password=False)
+        )
         monkeypatch.setattr(settings, "database_url", url)
-        yield url
-        with admin.connect() as connection:
-            connection.execute(text(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)'))
-        admin.dispose()
+        try:
+            yield url
+        finally:
+            # In a finally, so a test that errors cannot leave the database behind, and
+            # without FORCE -- see db_safety.drop_temp_database for why FORCE needs
+            # privileges over the superuser that this role deliberately does not have.
+            db_safety.drop_temp_database(admin, name)
     else:
         url = f"sqlite:///{tmp_path / 'eval_migration.db'}"
         monkeypatch.setattr(settings, "database_url", url)
@@ -75,7 +84,7 @@ def _alembic_config() -> Config:
 
 
 def _columns(url: str) -> dict:
-    engine = create_engine(url)
+    engine = db_safety.make_engine(url)
     try:
         return {c["name"]: c for c in inspect(engine).get_columns(_TABLE)}
     finally:
@@ -83,7 +92,7 @@ def _columns(url: str) -> dict:
 
 
 def _current_revision(url: str):
-    engine = create_engine(url)
+    engine = db_safety.make_engine(url)
     try:
         with engine.connect() as connection:
             row = connection.execute(text("SELECT version_num FROM alembic_version")).fetchone()
@@ -98,7 +107,7 @@ def _now() -> str:
 
 def _insert_graded_evaluation(url: str) -> int:
     """A graded evaluation written the way every pre-migration row was: every score set."""
-    engine = create_engine(url)
+    engine = db_safety.make_engine(url)
     try:
         with engine.begin() as connection:
             connection.execute(
@@ -138,7 +147,7 @@ def _insert_graded_evaluation(url: str) -> int:
 
 def _insert_ungraded_evaluation(url: str) -> int:
     """What the post-migration code writes when the AI review fails: no scores at all."""
-    engine = create_engine(url)
+    engine = db_safety.make_engine(url)
     try:
         with engine.begin() as connection:
             profile_id = connection.execute(text("SELECT MAX(id) FROM student_profiles")).scalar()
@@ -184,7 +193,7 @@ def test_the_migration_round_trips_with_existing_grades_intact(migration_target)
     assert after["interview_id"]["nullable"] is False
     assert _current_revision(migration_target) == _THIS_REVISION
 
-    engine = create_engine(migration_target)
+    engine = db_safety.make_engine(migration_target)
     try:
         with engine.connect() as connection:
             row = connection.execute(
@@ -214,7 +223,7 @@ def test_a_null_score_is_accepted_only_after_the_upgrade(migration_target):
     command.upgrade(config, _THIS_REVISION)
 
     ungraded_id = _insert_ungraded_evaluation(migration_target)
-    engine = create_engine(migration_target)
+    engine = db_safety.make_engine(migration_target)
     try:
         with engine.connect() as connection:
             row = connection.execute(
@@ -242,7 +251,7 @@ def test_the_downgrade_removes_only_the_ungraded_rows(migration_target):
         assert columns[name]["nullable"] is False, f"{name} must be NOT NULL again"
     assert _current_revision(migration_target) == _PREVIOUS_REVISION
 
-    engine = create_engine(migration_target)
+    engine = db_safety.make_engine(migration_target)
     try:
         with engine.connect() as connection:
             surviving = [

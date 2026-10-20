@@ -27,17 +27,12 @@ def test_validate_for_production_raises_with_the_default_secret(monkeypatch) -> 
 
 
 def test_validate_for_production_passes_with_a_real_secret(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "environment", "production")
-    monkeypatch.setattr(settings, "jwt_secret_key", "a-real-random-64-char-secret-not-the-dev-default")
-    monkeypatch.setattr(settings, "email_provider", "smtp")
-    monkeypatch.setattr(settings, "debug", False)
-    monkeypatch.setattr(settings, "allowed_hosts", "api.aiplacementos.com")
+    _production_base(monkeypatch)
     _production_ready_ai(monkeypatch)
-    monkeypatch.setattr(settings, "storage_provider", "s3")
-    monkeypatch.setattr(settings, "database_url", "postgresql+psycopg2://u:p@db.example.com:5432/app")
-    # This dev checkout's .env ships a real rzp_test_ key (needed for the Razorpay-flow
-    # tests elsewhere) -- explicitly override it here so this "everything else is production-
-    # ready" test isn't coupled to that unrelated local dev value.
+    # Restated rather than inherited from the baseline: a live key is part of what this test
+    # asserts is acceptable, not incidental setup. (It used to be overridden here because
+    # this checkout's .env ships a real rzp_test_ key; _production_base now pins it, along
+    # with every other setting the validator reads.)
     monkeypatch.setattr(settings, "razorpay_key_id", "rzp_live_abc123")
     # Required alongside a configured key since the webhook-secret check was added: without
     # it the webhook endpoint fails closed and paid users would never be activated.
@@ -115,14 +110,8 @@ def test_validate_for_production_raises_with_a_test_mode_razorpay_key(monkeypatc
     had no equivalent check for a rzp_test_ key surviving into production -- a real
     deployment could go live with real user traffic hitting Razorpay's test mode, silently
     collecting no real money while appearing to work end-to-end."""
-    monkeypatch.setattr(settings, "environment", "production")
-    monkeypatch.setattr(settings, "jwt_secret_key", "a-real-random-64-char-secret-not-the-dev-default")
-    monkeypatch.setattr(settings, "email_provider", "smtp")
-    monkeypatch.setattr(settings, "debug", False)
-    monkeypatch.setattr(settings, "allowed_hosts", "api.aiplacementos.com")
+    _production_base(monkeypatch)
     _production_ready_ai(monkeypatch)
-    monkeypatch.setattr(settings, "storage_provider", "s3")
-    monkeypatch.setattr(settings, "database_url", "postgresql+psycopg2://u:p@db.example.com:5432/app")
     monkeypatch.setattr(settings, "razorpay_key_id", "rzp_test_abc123")
 
     with pytest.raises(RuntimeError, match="RAZORPAY_KEY_ID"):
@@ -130,14 +119,8 @@ def test_validate_for_production_raises_with_a_test_mode_razorpay_key(monkeypatc
 
 
 def test_validate_for_production_passes_with_a_live_razorpay_key(monkeypatch) -> None:
-    monkeypatch.setattr(settings, "environment", "production")
-    monkeypatch.setattr(settings, "jwt_secret_key", "a-real-random-64-char-secret-not-the-dev-default")
-    monkeypatch.setattr(settings, "email_provider", "smtp")
-    monkeypatch.setattr(settings, "debug", False)
-    monkeypatch.setattr(settings, "allowed_hosts", "api.aiplacementos.com")
+    _production_base(monkeypatch)
     _production_ready_ai(monkeypatch)
-    monkeypatch.setattr(settings, "storage_provider", "s3")
-    monkeypatch.setattr(settings, "database_url", "postgresql+psycopg2://u:p@db.example.com:5432/app")
     monkeypatch.setattr(settings, "razorpay_key_id", "rzp_live_abc123")
     # Required alongside a configured key since the webhook-secret check was added: without
     # it the webhook endpoint fails closed and paid users would never be activated.
@@ -151,14 +134,8 @@ def test_validate_for_production_does_not_require_razorpay_to_be_configured(monk
     real use elsewhere (subscription_service) -- this startup check must not additionally
     demand a key just to start the app, matching the same "fail loudly on first use, not at
     startup" treatment already given to ANTHROPIC_API_KEY/STORAGE_S3_*/SMTP_*."""
-    monkeypatch.setattr(settings, "environment", "production")
-    monkeypatch.setattr(settings, "jwt_secret_key", "a-real-random-64-char-secret-not-the-dev-default")
-    monkeypatch.setattr(settings, "email_provider", "smtp")
-    monkeypatch.setattr(settings, "debug", False)
-    monkeypatch.setattr(settings, "allowed_hosts", "api.aiplacementos.com")
+    _production_base(monkeypatch)
     _production_ready_ai(monkeypatch)
-    monkeypatch.setattr(settings, "storage_provider", "s3")
-    monkeypatch.setattr(settings, "database_url", "postgresql+psycopg2://u:p@db.example.com:5432/app")
     monkeypatch.setattr(settings, "razorpay_key_id", None)
 
     validate_for_production()  # must not raise
@@ -194,6 +171,30 @@ def _production_base(monkeypatch) -> None:
     # Required alongside a configured key since the webhook-secret check was added: without
     # it the webhook endpoint fails closed and paid users would never be activated.
     monkeypatch.setattr(settings, "razorpay_webhook_secret", "a-real-webhook-secret")
+    # Everything else validate_for_production() reads, pinned to its *declared* default.
+    #
+    # This is the half that was missing, and it is why twenty tests in this module failed from
+    # a repository root while passing in a clean checkout. The helper pinned the settings
+    # production requires to be non-default and left the rest to whatever the machine was
+    # configured with -- and pydantic fills those from the process environment and from
+    # `.env`. A developer with STT_PROVIDER=faster-whisper in `.env` is correctly configured,
+    # but every test here that expected a production-ready baseline then got
+    # "development-only speech adapters" instead, from a setting it had never mentioned.
+    #
+    # Declared defaults rather than literals: the point of these tests is what the validator
+    # does, not what this machine runs, and a default that changes in config.py should change
+    # the baseline with it. The three fields production may legitimately leave unset
+    # (TOKEN_ENCRYPTION_KEY, the GitHub OAuth trio) have their own guard classes below, each
+    # of which sets the value it is about after calling this.
+    for field in ("stt_provider", "tts_provider", "token_encryption_key",
+                  "github_client_id", "github_client_secret", "github_oauth_redirect_uri"):
+        monkeypatch.setattr(settings, field, Settings.model_fields[field].default)
+
+
+#: Read by test_the_baseline_covers_every_setting_the_validator_reads, at the end of this
+#: module. AI_PROVIDER and OLLAMA_BASE_URL are deliberately not in _production_base: several
+#: tests here are *about* them, and _production_ready_ai is the opt-in for the rest.
+_BASELINE_EXEMPT = frozenset({"ai_provider", "ollama_base_url"})
 
 
 @pytest.mark.parametrize(
@@ -265,14 +266,8 @@ def test_validate_for_production_requires_a_webhook_secret_when_razorpay_is_conf
     charged for real and never receive premium. Nothing else in the system complains: startup
     succeeds, checkout works, and client-side verify works in every manual test.
     """
-    monkeypatch.setattr(settings, "environment", "production")
-    monkeypatch.setattr(settings, "jwt_secret_key", "a-real-random-64-char-secret-not-the-dev-default")
-    monkeypatch.setattr(settings, "email_provider", "smtp")
-    monkeypatch.setattr(settings, "debug", False)
-    monkeypatch.setattr(settings, "allowed_hosts", "api.aiplacementos.com")
+    _production_base(monkeypatch)
     _production_ready_ai(monkeypatch)
-    monkeypatch.setattr(settings, "storage_provider", "s3")
-    monkeypatch.setattr(settings, "database_url", "postgresql+psycopg2://u:p@db.example.com:5432/app")
     monkeypatch.setattr(settings, "razorpay_key_id", "rzp_live_abc123")
     monkeypatch.setattr(settings, "razorpay_webhook_secret", None)
 
@@ -285,14 +280,8 @@ def test_validate_for_production_does_not_require_a_webhook_secret_when_razorpay
 ) -> None:
     """Payments being switched off entirely is a valid deployment -- subscription_service
     already fails loudly on first use. Only a *configured* gateway needs the webhook."""
-    monkeypatch.setattr(settings, "environment", "production")
-    monkeypatch.setattr(settings, "jwt_secret_key", "a-real-random-64-char-secret-not-the-dev-default")
-    monkeypatch.setattr(settings, "email_provider", "smtp")
-    monkeypatch.setattr(settings, "debug", False)
-    monkeypatch.setattr(settings, "allowed_hosts", "api.aiplacementos.com")
+    _production_base(monkeypatch)
     _production_ready_ai(monkeypatch)
-    monkeypatch.setattr(settings, "storage_provider", "s3")
-    monkeypatch.setattr(settings, "database_url", "postgresql+psycopg2://u:p@db.example.com:5432/app")
     monkeypatch.setattr(settings, "razorpay_key_id", None)
     monkeypatch.setattr(settings, "razorpay_webhook_secret", None)
 
@@ -491,7 +480,11 @@ class TestTokenEncryptionKeyGuard:
         secret_looking = "aaaabbbbccccddddeeeeffffgggghhhh-but-not-valid-base64-fernet"
         monkeypatch.setattr(settings, "token_encryption_key", secret_looking)
 
-        with pytest.raises(RuntimeError) as caught:
+        # match=: before the baseline pinned every validated setting, this test passed on a
+        # developer machine because `.env` tripped the development-speech guard first -- a
+        # different RuntimeError, which also happened not to echo the key. It has to be the
+        # key's own error for the assertion below to mean anything.
+        with pytest.raises(RuntimeError, match="TOKEN_ENCRYPTION_KEY") as caught:
             validate_for_production()
         assert secret_looking not in str(caught.value)
 
@@ -647,3 +640,79 @@ class TestDevelopmentOnlySpeechAdapters:
         message = str(caught.value)
         assert "faster-whisper" in message and "pyttsx3" in message
         assert settings.jwt_secret_key not in message
+
+
+class TestTheBaselineCannotSilentlyStopCoveringTheValidator:
+    """The thing that actually went wrong, turned into a test.
+
+    Twenty tests in this module passed in a clean checkout and failed from a repository root
+    with a populated `.env`, and the mechanism was not a bad assertion: `validate_for_production`
+    grew a check on a setting (STT_PROVIDER/TTS_PROVIDER) that `_production_base` did not pin,
+    so pydantic's `.env` loading supplied the value instead and every "production-ready
+    baseline" test inherited a development machine's configuration.
+
+    Nothing warned about it. The next setting added to the validator would do it again, and the
+    failure would once more look like a broken test rather than a missing pin -- so this asserts
+    the invariant directly: every setting the validator reads is one the baseline controls.
+    """
+
+    def _names_pinned_by(self, helper) -> set:
+        class Recorder:
+            def __init__(self) -> None:
+                self.names: set = set()
+
+            def setattr(self, _target, name, _value) -> None:
+                self.names.add(name)
+
+        recorder = Recorder()
+        helper(recorder)
+        return recorder.names
+
+    def _names_read_by_the_validator(self) -> set:
+        import inspect
+        import re
+
+        source = inspect.getsource(validate_for_production)
+        return set(re.findall(r"settings\.([a-z_][a-z_0-9]*)", source))
+
+    def test_the_baseline_covers_every_setting_the_validator_reads(self) -> None:
+        controlled = self._names_pinned_by(_production_base)
+        controlled |= self._names_pinned_by(_production_ready_ai)
+        controlled |= _BASELINE_EXEMPT
+
+        read = self._names_read_by_the_validator()
+        # Non-vacuity. The invariant below is a subset check, so a regex that matched nothing
+        # -- after a refactor that read the settings through a local alias, say -- would
+        # satisfy it while checking nothing at all. That is the same shape of silent pass this
+        # whole class exists to prevent.
+        assert len(read) >= 10, f"the scan found only {sorted(read)}; it is no longer reading the validator"
+
+        uncovered = read - controlled
+        assert uncovered == set(), (
+            "validate_for_production() reads these settings and no test helper pins them, so "
+            f"their values come from the process environment or .env: {sorted(uncovered)}. Add "
+            "them to _production_base (declared default unless production requires otherwise), "
+            "or to _BASELINE_EXEMPT if a test is specifically about them."
+        )
+
+    def test_the_recorder_matches_monkeypatchs_interface(self) -> None:
+        # The test above is only meaningful if Recorder sees what monkeypatch would, so this
+        # pins the one assumption it makes: the helpers set attributes positionally through
+        # `setattr(target, name, value)`.
+        import inspect
+
+        signature = inspect.signature(pytest.MonkeyPatch.setattr)
+        assert list(signature.parameters)[:4] == ["self", "target", "name", "value"]
+
+    def test_the_exempt_set_is_not_a_place_to_hide_things(self) -> None:
+        # _BASELINE_EXEMPT exists for settings this module tests directly. If it ever grows to
+        # cover a setting no test varies, the invariant above is satisfied without the
+        # isolation it was written for.
+        import inspect
+        import re
+        import sys
+
+        module_source = inspect.getsource(sys.modules[__name__])
+        for name in _BASELINE_EXEMPT:
+            # Each exempt setting is set explicitly by at least one test in this module.
+            assert len(re.findall(rf'settings, "{name}"', module_source)) >= 1, name

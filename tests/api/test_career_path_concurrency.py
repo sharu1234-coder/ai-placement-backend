@@ -17,7 +17,6 @@ assertable as a status code with its body in the failure message, rather than ar
 traceback from inside a worker thread.
 """
 
-import os
 import threading
 import uuid
 
@@ -33,9 +32,13 @@ from app.database.base import Base
 from app.main import app
 from app.models.role import Role
 from app.models.role_skill_weight import RoleSkillWeight
+from tests import db_safety
 from tests.fixtures.career_path_helpers import RacingProvider
 
-_TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
+# Supplied by tests/db_safety.py, never read from the environment here: that module
+# refuses a target it cannot prove is disposable, and it does so at import time -- before
+# any fixture in this file can drop a table.
+_TEST_DATABASE_URL = db_safety.resolve_test_database_url()
 
 PASSWORD = "supersecret123"
 CUSTOM_ROLE = "Quantum Data Wrangler"
@@ -48,7 +51,7 @@ def engine(tmp_path):
         engine = create_engine(
             _TEST_DATABASE_URL, poolclass=NullPool, connect_args={"options": "-c lock_timeout=15000"}
         )
-        Base.metadata.drop_all(bind=engine)
+        db_safety.drop_all_safely(engine)
     else:
         # check_same_thread=False because the route runs in Starlette's threadpool, so a session
         # is used by a different thread than created it -- the same reason app/database/session.py
@@ -77,7 +80,7 @@ def engine(tmp_path):
         yield engine
     finally:
         if _TEST_DATABASE_URL:
-            Base.metadata.drop_all(bind=engine)
+            db_safety.drop_all_safely(engine)
         engine.dispose()
 
 

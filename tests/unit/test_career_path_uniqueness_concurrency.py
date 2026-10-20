@@ -41,7 +41,6 @@ constraint does the same job with genuine parallelism, and the recovery path add
 survive a failed statement poisoning the transaction, which SQLite cannot show.
 """
 
-import os
 import threading
 import uuid
 
@@ -60,9 +59,13 @@ from app.models.career_path_skill_item import CareerPathSkillItem
 from app.models.profile import StudentProfile
 from app.models.user import User
 from app.services.career_path import service as svc
+from tests import db_safety
 from tests.fixtures.career_path_helpers import RacingProvider
 
-_TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
+# Supplied by tests/db_safety.py, never read from the environment here: that module
+# refuses a target it cannot prove is disposable, and it does so at import time -- before
+# any fixture in this file can drop a table.
+_TEST_DATABASE_URL = db_safety.resolve_test_database_url()
 
 CURATED_ROLE = "Data Analyst"
 CURATED_FAMILY = "data_analyst"
@@ -79,7 +82,7 @@ def engine(tmp_path):
         engine = create_engine(
             _TEST_DATABASE_URL, poolclass=NullPool, connect_args={"options": "-c lock_timeout=15000"}
         )
-        Base.metadata.drop_all(bind=engine)
+        db_safety.drop_all_safely(engine)
     else:
         # timeout raises SQLite's own lock wait above the 5s default: several threads contending
         # for the write lock on a slow machine would otherwise surface as "database is locked",
@@ -99,7 +102,7 @@ def engine(tmp_path):
         yield engine
     finally:
         if _TEST_DATABASE_URL:
-            Base.metadata.drop_all(bind=engine)
+            db_safety.drop_all_safely(engine)
         engine.dispose()
 
 

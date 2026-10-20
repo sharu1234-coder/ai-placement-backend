@@ -30,9 +30,6 @@ import math
 import numpy as np
 import pytest
 
-from app.speech.audio import write_wav
-from app.speech.contracts import SpeechUnavailable, SynthesizeRequest
-from app.speech.pyttsx3_tts import Pyttsx3TextToSpeech
 from app.core.voice_selection import (
     VoiceOutcome,
     available_voice_ids,
@@ -40,6 +37,9 @@ from app.core.voice_selection import (
     log_choice,
     select_voice,
 )
+from app.speech.audio import write_wav
+from app.speech.contracts import SpeechUnavailable, SynthesizeRequest
+from app.speech.pyttsx3_tts import Pyttsx3TextToSpeech
 
 DAVID = r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Speech\Voices\Tokens\TTS_MS_EN-US_DAVID_11.0"
 ZIRA = r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Speech\Voices\Tokens\TTS_MS_EN-US_ZIRA_11.0"

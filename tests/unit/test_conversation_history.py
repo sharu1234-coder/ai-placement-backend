@@ -24,8 +24,12 @@ from app.models.conversation import Conversation, ConversationTurn
 from app.models.profile import StudentProfile
 from app.models.user import User
 from app.services import conversation_history as history
+from tests import db_safety
 
-_TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
+# Supplied by tests/db_safety.py, never read from the environment here: that module
+# refuses a target it cannot prove is disposable, and it does so at import time -- before
+# any fixture in this file can drop a table.
+_TEST_DATABASE_URL = db_safety.resolve_test_database_url()
 
 
 @pytest.fixture()
@@ -45,10 +49,10 @@ def _engine(url):
 @pytest.fixture()
 def engine(db_file):
     eng = _engine(db_file)
-    Base.metadata.drop_all(bind=eng)
+    db_safety.drop_all_safely(eng)
     Base.metadata.create_all(bind=eng)
     yield eng
-    Base.metadata.drop_all(bind=eng)
+    db_safety.drop_all_safely(eng)
     eng.dispose()
 
 

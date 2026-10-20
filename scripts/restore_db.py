@@ -22,6 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from app.core.config import settings  # noqa: E402
+from app.database.pg_client import child_env, parse_target, redact_output  # noqa: E402
 
 
 def restore_sqlite(db_url: str, backup_path: Path) -> None:
@@ -47,18 +48,24 @@ def restore_postgres(db_url: str, backup_path: Path) -> None:
     # --no-owner: don't try to reassign ownership to roles that may not exist on the
     # restore target (e.g. a different managed-Postgres provider than where the dump was
     # taken).
+    # Explicit host, port, user and database -- never the URL, which libpq would take for a
+    # literal database name and then connect to its own defaults. For a --clean restore that
+    # fallback would drop and recreate objects in whatever database answers on port 5432.
+    target = parse_target(db_url)
     result = subprocess.run(
-        [pg_restore, "--clean", "--if-exists", "--no-owner", "-d", db_url, str(backup_path)],
+        [pg_restore, "--clean", "--if-exists", "--no-owner", *target.args(), str(backup_path)],
         capture_output=True,
         text=True,
+        env=child_env(target),
     )
+    result_stderr = redact_output(result.stderr, target.password)
     if result.returncode != 0:
-        raise SystemExit(f"pg_restore failed:\n{result.stderr}")
-    if result.stderr:
+        raise SystemExit(f"pg_restore failed against {target.redacted()}:\n{result_stderr}")
+    if result_stderr:
         # pg_restore routinely prints non-fatal warnings (e.g. "role does not exist" for
         # --no-owner) to stderr even on success (returncode 0) -- surfaced for visibility,
         # not treated as failure.
-        print(f"pg_restore warnings:\n{result.stderr}", file=sys.stderr)
+        print(f"pg_restore warnings:\n{result_stderr}", file=sys.stderr)
 
 
 def main() -> None:

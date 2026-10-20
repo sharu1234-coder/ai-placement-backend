@@ -15,13 +15,17 @@ import uuid
 
 import pytest
 from alembic.config import Config
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import inspect, text
 from sqlalchemy.engine import make_url
 
 from alembic import command
 from app.core.config import settings
+from tests import db_safety
 
-_TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
+# Supplied by tests/db_safety.py, never read from the environment here: that module
+# refuses a target it cannot prove is disposable, and it does so at import time -- before
+# any fixture in this file can drop a table.
+_TEST_DATABASE_URL = db_safety.resolve_test_database_url()
 
 _TABLE = "career_goals"
 _PREVIOUS_REVISION = "0d6496be2213"
@@ -35,15 +39,20 @@ def migration_target(tmp_path, monkeypatch):
     if _TEST_DATABASE_URL:
         base = make_url(_TEST_DATABASE_URL)
         name = f"career_goal_migration_test_{uuid.uuid4().hex[:8]}"
-        admin = create_engine(base.set(database="postgres"), isolation_level="AUTOCOMMIT")
+        admin = db_safety.make_engine(base.set(database="postgres"), isolation_level="AUTOCOMMIT")
         with admin.connect() as connection:
             connection.execute(text(f'CREATE DATABASE "{name}"'))
-        url = base.set(database=name).render_as_string(hide_password=False)
+        url = db_safety.hidden(
+            base.set(database=name).render_as_string(hide_password=False)
+        )
         monkeypatch.setattr(settings, "database_url", url)
-        yield url
-        with admin.connect() as connection:
-            connection.execute(text(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)'))
-        admin.dispose()
+        try:
+            yield url
+        finally:
+            # In a finally, so a test that errors cannot leave the database behind, and
+            # without FORCE -- see db_safety.drop_temp_database for why FORCE needs
+            # privileges over the superuser that this role deliberately does not have.
+            db_safety.drop_temp_database(admin, name)
     else:
         url = f"sqlite:///{tmp_path / 'career_goal_migration.db'}"
         monkeypatch.setattr(settings, "database_url", url)
@@ -59,7 +68,7 @@ def _alembic_config() -> Config:
 
 
 def _columns(url: str) -> dict:
-    engine = create_engine(url)
+    engine = db_safety.make_engine(url)
     try:
         return {c["name"]: c for c in inspect(engine).get_columns(_TABLE)}
     finally:
@@ -67,7 +76,7 @@ def _columns(url: str) -> dict:
 
 
 def _current_revision(url: str):
-    engine = create_engine(url)
+    engine = db_safety.make_engine(url)
     try:
         with engine.connect() as connection:
             row = connection.execute(text("SELECT version_num FROM alembic_version")).fetchone()
@@ -125,7 +134,7 @@ def test_the_migration_round_trips(migration_target):
     config = _alembic_config()
     command.upgrade(config, _THIS_REVISION)
 
-    engine = create_engine(migration_target)
+    engine = db_safety.make_engine(migration_target)
     try:
         with engine.begin() as connection:
             connection.execute(
@@ -160,7 +169,7 @@ def test_the_migration_round_trips(migration_target):
 
     command.downgrade(config, _PREVIOUS_REVISION)
     assert _current_revision(migration_target) == _PREVIOUS_REVISION
-    engine = create_engine(migration_target)
+    engine = db_safety.make_engine(migration_target)
     try:
         assert _TABLE not in inspect(engine).get_table_names()
     finally:

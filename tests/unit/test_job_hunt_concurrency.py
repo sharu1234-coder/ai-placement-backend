@@ -24,7 +24,6 @@ writes -- the test would pass no matter what the code did.
 """
 
 import datetime
-import os
 import uuid
 
 import pytest
@@ -41,6 +40,7 @@ from app.models.saved_job import SavedJob
 from app.models.user import User
 from app.services.job_hunt import alerts, service
 from app.services.job_hunt.providers.base import ProviderJob, ProviderSearchResult
+from tests import db_safety
 from tests.fixtures.premium_helpers import grant_premium
 
 # These tests also run against PostgreSQL when TEST_DATABASE_URL is set; unset, the behaviour
@@ -55,7 +55,10 @@ from tests.fixtures.premium_helpers import grant_premium
 # poisons the whole transaction until it is rolled back, and every later statement raises
 # InFailedSqlTransaction. So a recovery path that merely looks correct on SQLite can still be
 # wrong in production, and running these here rules that out rather than assuming it.
-_TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
+# Supplied by tests/db_safety.py, never read from the environment here: that module
+# refuses a target it cannot prove is disposable, and it does so at import time -- before
+# any fixture in this file can drop a table.
+_TEST_DATABASE_URL = db_safety.resolve_test_database_url()
 
 
 @pytest.fixture()
@@ -68,7 +71,7 @@ def db(tmp_path):
         engine = create_engine(_TEST_DATABASE_URL, poolclass=NullPool,
                                connect_args={"options": "-c lock_timeout=15000"})
         # A real database persists between tests; the in-memory and tmp_path ones do not.
-        Base.metadata.drop_all(bind=engine)
+        db_safety.drop_all_safely(engine)
     else:
         engine = create_engine(f"sqlite:///{tmp_path / 'jobhunt.db'}")
     Base.metadata.create_all(bind=engine)
@@ -78,7 +81,7 @@ def db(tmp_path):
     finally:
         session.close()
         if _TEST_DATABASE_URL:
-            Base.metadata.drop_all(bind=engine)
+            db_safety.drop_all_safely(engine)
         engine.dispose()
 
 

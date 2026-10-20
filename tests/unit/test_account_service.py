@@ -16,6 +16,8 @@ from app.models.career_path_skill_item import CareerPathSkillItem
 from app.models.career_strategy_target import CareerStrategyTarget
 from app.models.certification import Certification
 from app.models.conversation import Conversation, ConversationTurn
+from app.models.deletion_job import DeletionJob
+from app.models.deletion_request import DeletionRequest
 from app.models.education import Education
 from app.models.evidence_state_snapshot import EvidenceStateSnapshot
 from app.models.experience import Experience
@@ -59,7 +61,8 @@ from app.models.subscription import Subscription
 from app.models.user import User
 from app.models.weakness_record import WeaknessRecord
 from app.services.account_service import delete_account
-from app.storage.provider import StorageProvider
+from app.storage.provider import StorageError, StorageProvider
+from app.workers import deletion_worker
 
 
 class RecordingStorage(StorageProvider):
@@ -373,7 +376,10 @@ def test_delete_account_removes_every_owned_row(db_session):
 
     delete_account(db_session, user, storage)
 
-    assert db_session.get(User, user.id) is None
+    # Phase 1 of the outbox keeps the user row until the objects are erased, and revokes
+    # access instead of deleting it. Everything else still goes in this transaction.
+    assert db_session.get(User, user.id) is not None
+    assert db_session.get(User, user.id).is_active is False
     assert db_session.get(StudentProfile, profile.id) is None
     assert db_session.query(Education).count() == 0
     assert db_session.query(Certification).count() == 0
@@ -420,7 +426,13 @@ def test_delete_account_removes_every_owned_row(db_session):
     # Nor is the role catalog, even though a deleted career_strategy_targets row pointed at it.
     assert db_session.get(Role, role.id) is not None
 
-    assert storage.deleted_keys == [resume_file_path]
+    # The key moved from the resume row into a durable job, in this same transaction, and
+    # no storage call was made: erasure is the worker obligation now.
+    assert storage.deleted_keys == []
+    assert [job.storage_key for job in db_session.query(DeletionJob).all()] == [
+        resume_file_path
+    ]
+    assert db_session.query(DeletionRequest).one().status == "pending"
 
 
 def test_delete_account_with_no_profile_still_deletes_user(db_session):
@@ -718,3 +730,194 @@ def test_the_parity_guard_actually_detects_an_uncovered_model():
             missing.append(mapper.class_.__name__)
 
     assert "CareerStrategyTarget" in missing
+
+
+# ---------------------------------------------------------------------------------------
+# Finding 1: an erasure that did not happen must not be reported as one.
+#
+# Before this, `StorageProvider.delete` was allowed to return normally whatever happened --
+# the S3 adapter caught every BotoCoreError/ClientError, logged a warning and returned -- and
+# `delete_account` wrapped the call in `except Exception` as well, with the comment "File
+# deletion is best-effort and never blocks the DB delete". It then committed. So a storage
+# outage erased the rows holding the only copy of `file_path` while the object stayed in the
+# bucket: an orphan nobody could find, belonging to a user told their data was gone.
+# ---------------------------------------------------------------------------------------
+
+
+class FailingStorage(RecordingStorage):
+    """Storage whose delete genuinely fails, the way a permissions error or outage does."""
+
+    def __init__(self, failing_keys=None):
+        super().__init__()
+        self.failing_keys = failing_keys
+        self.attempts = []
+
+    def delete(self, key):
+        self.attempts.append(key)
+        if self.failing_keys is None or key in self.failing_keys:
+            raise StorageError("simulated storage outage")
+        self.deleted_keys.append(key)
+
+
+def test_a_storage_outage_cannot_orphan_the_file_or_block_the_account(db_session):
+    """The same invariant as before, held by a different mechanism.
+
+    This used to assert that a storage failure aborted the whole deletion. That held the
+    invariant but made a user's ability to leave depend on a bucket being up. Phase 1 now
+    makes no storage call at all, so an outage cannot abort anything, and the pointer survives
+    in a `deletion_jobs` row instead of in `resumes`. What must never happen is unchanged: the
+    last pointer to a stored object is never destroyed.
+    """
+    user, profile, resume, question, role = _seed_full_account(db_session, "orphan@example.com")
+    resume_id = resume.id
+    user_id = user.id
+    key = resume.file_path
+
+    storage = FailingStorage()
+    delete_account(db_session, user, storage)  # a bucket that fails every call
+
+    assert storage.attempts == [], "Phase 1 must not touch storage"
+    assert db_session.get(Resume, resume_id) is None
+    assert [job.storage_key for job in db_session.query(DeletionJob).all()] == [key], (
+        "the key must survive the delete somewhere durable, or the object is unreachable"
+    )
+    revoked = db_session.get(User, user_id)
+    assert revoked is not None and revoked.is_active is False, (
+        "access is revoked even though the bucket is unreachable"
+    )
+
+
+def test_a_retry_after_a_storage_failure_completes(db_session):
+    """Deletion is idempotent, so partial progress is real progress.
+
+    The retry is the worker's now rather than the user's: the obligation is already durable,
+    so nobody has to ask a second time.
+    """
+    user, profile, resume, question, role = _seed_full_account(db_session, "retry@example.com")
+    user_id = user.id
+
+    delete_account(db_session, user, FailingStorage())
+
+    failing = FailingStorage()
+    deletion_worker.run_once(db_session, failing)
+    assert failing.attempts, "the worker must have tried"
+    assert db_session.query(DeletionJob).one().status == "pending"
+    assert db_session.get(User, user_id) is not None
+
+    # Storage recovers. The same job finishes, and the last user row goes with it.
+    job = db_session.query(DeletionJob).one()
+    job.next_attempt_at = deletion_worker._now() - datetime.timedelta(seconds=1)
+    job.locked_until = None
+    db_session.commit()
+
+    storage = RecordingStorage()
+    deletion_worker.run_once(db_session, storage)
+
+    assert db_session.get(User, user_id) is None
+    assert len(storage.deleted_keys) == 1
+    assert db_session.query(DeletionRequest).one().status == "done"
+
+
+def test_every_object_is_attempted_before_giving_up(db_session):
+    """One bad key must not strand the others: a retry should have less to do, not the same."""
+    user, profile, resume, question, role = _seed_full_account(db_session, "many@example.com")
+    extra = Resume(
+        profile_id=profile.id,
+        file_path="resumes/second-file.pdf",
+        raw_text="raw",
+        parse_status="completed",
+    )
+    db_session.add(extra)
+    db_session.commit()
+    first_key = resume.file_path
+
+    storage = FailingStorage(failing_keys={"resumes/second-file.pdf"})
+    delete_account(db_session, user, storage)
+
+    # One job per object, so one bad key cannot strand the other.
+    keys = {job.storage_key for job in db_session.query(DeletionJob).all()}
+    assert keys == {first_key, "resumes/second-file.pdf"}
+
+    deletion_worker.run_once(db_session, storage)
+    assert len(storage.attempts) == 2, "both objects must be attempted, not just the first"
+    assert first_key in storage.deleted_keys
+    statuses = {job.storage_key: job.status for job in db_session.query(DeletionJob).all()}
+    assert statuses[first_key] == "done"
+    assert statuses["resumes/second-file.pdf"] == "pending", (
+        "the failing object stays queued; the obligation is not abandoned"
+    )
+    assert db_session.query(DeletionRequest).one().status == "pending"
+
+
+class TestStorageAdaptersReportFailure:
+    """The adapters themselves, which is where the silence originated."""
+
+    def test_local_storage_treats_an_absent_file_as_success(self, tmp_path, monkeypatch):
+        from app.core.config import settings
+        from app.storage.local_provider import LocalStorageProvider
+
+        monkeypatch.setattr(settings, "upload_dir", str(tmp_path), raising=False)
+        # Idempotency: a retry must not fail on what it already deleted.
+        LocalStorageProvider().delete("nothing/here.pdf")
+
+    def test_local_storage_raises_when_deletion_genuinely_fails(self, tmp_path, monkeypatch):
+        from pathlib import Path
+
+        from app.core.config import settings
+        from app.storage.local_provider import LocalStorageProvider
+
+        monkeypatch.setattr(settings, "upload_dir", str(tmp_path), raising=False)
+
+        def boom(self, missing_ok=False):
+            raise OSError("read-only file system")
+
+        monkeypatch.setattr(Path, "unlink", boom)
+        with pytest.raises(StorageError, match="Failed to delete"):
+            LocalStorageProvider().delete("some/file.pdf")
+
+    def test_s3_treats_a_missing_key_as_success(self):
+        from botocore.exceptions import ClientError
+
+        from app.storage.s3_provider import S3StorageProvider
+
+        provider = S3StorageProvider.__new__(S3StorageProvider)
+        provider.bucket = "b"
+
+        class Client:
+            def delete_object(self, **_):
+                raise ClientError({"Error": {"Code": "NoSuchKey"}}, "DeleteObject")
+
+        provider._client = Client()
+        provider.delete("gone.pdf")  # must not raise
+
+    def test_s3_raises_on_a_real_failure(self):
+        from botocore.exceptions import ClientError
+
+        from app.storage.s3_provider import S3StorageProvider
+
+        provider = S3StorageProvider.__new__(S3StorageProvider)
+        provider.bucket = "b"
+
+        class Client:
+            def delete_object(self, **_):
+                raise ClientError({"Error": {"Code": "AccessDenied"}}, "DeleteObject")
+
+        provider._client = Client()
+        with pytest.raises(StorageError, match="Failed to delete"):
+            provider.delete("still-there.pdf")
+
+    def test_s3_raises_when_the_request_never_arrived(self):
+        from botocore.exceptions import EndpointConnectionError
+
+        from app.storage.s3_provider import S3StorageProvider
+
+        provider = S3StorageProvider.__new__(S3StorageProvider)
+        provider.bucket = "b"
+
+        class Client:
+            def delete_object(self, **_):
+                raise EndpointConnectionError(endpoint_url="https://example.invalid")
+
+        provider._client = Client()
+        with pytest.raises(StorageError, match="Failed to delete"):
+            provider.delete("unknown.pdf")
