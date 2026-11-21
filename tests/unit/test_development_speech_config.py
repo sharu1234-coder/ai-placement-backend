@@ -15,6 +15,7 @@ speech works -- that is `tests/unit/test_speech_real_model.py` (real adapters) a
 `tests/api/test_voice_realtime_real_adapters.py` (real adapters through the gateway).
 """
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -108,6 +109,43 @@ class TestTheArtifactIsDevelopmentOnly:
         assert set(declared) <= {"ENVIRONMENT", "STT_PROVIDER", "TTS_PROVIDER"}, (
             f"{_ARTIFACT.name} declares settings beyond the speech selection: "
             f"{sorted(set(declared) - {'ENVIRONMENT', 'STT_PROVIDER', 'TTS_PROVIDER'})}"
+        )
+
+
+class TestTheArtifactIsInTheRepository:
+    """The tests above check the file a developer happens to have. This one checks the claim their
+    own failure message makes: that it is *in the repository*.
+
+    It was not. `.gitignore`'s blanket `.env.*` rule swallowed it, so the artifact lived on one
+    machine and nowhere else -- while five tests asserted it was "the only version-controlled
+    record" of development speech. CI run 44942286471 reported five setup errors instead, the
+    first time those tests ever executed there. The negation that fixes it is one line in an
+    ignore file and easy to lose in a later edit, so this asserts the outcome (git tracks this
+    exact path) rather than the mechanism (that the line is present).
+    """
+
+    def test_git_tracks_this_exact_filename(self) -> None:
+        try:
+            listed = subprocess.run(
+                ["git", "-C", str(_ARTIFACT.parent), "ls-files", "--", _ARTIFACT.name],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:  # pragma: no cover - environment
+            raise AssertionError(
+                f"could not ask git whether {_ARTIFACT.name} is tracked: {exc}. This check needs "
+                "a git checkout, which is what CI and every developer machine run from."
+            ) from exc
+
+        assert listed.returncode == 0, (
+            f"git could not list files in {_ARTIFACT.parent}: {listed.stderr.strip()}"
+        )
+        assert listed.stdout.split() == [_ARTIFACT.name], (
+            f"{_ARTIFACT.name} is not tracked by git. It is a specification, not an environment "
+            "file, and the tests above are only meaningful if every checkout has it. Add the "
+            f"exact negation !{_ARTIFACT.name} to .gitignore -- never a wildcard such as "
+            "!.env.*, which would expose real credential files -- and commit it."
         )
 
 

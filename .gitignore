@@ -15,6 +15,13 @@ env/
 # `git add` away from being published. Only .env.example, which holds placeholders, is tracked.
 .env.*
 !.env.example
+# Exact filename, never a glob: `.env.development.speech` is a specification, not an environment
+# file. It declares only ENVIRONMENT/STT_PROVIDER/TTS_PROVIDER -- no credential, no host, no local
+# path -- and tests/unit/test_development_speech_config.py enforces that allow-list on every run,
+# so the file cannot grow a secret without failing the suite. It was previously swallowed by the
+# rule above while five tests asserted it was "the only version-controlled record" of development
+# speech, which made those tests error in CI (run 44942286471) and check nothing anywhere else.
+!.env.development.speech
 *.db
 *.sqlite3
 /uploads/
