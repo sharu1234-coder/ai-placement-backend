@@ -24,7 +24,13 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Pinned, not `ubuntu-latest`. That label rolled from Ubuntu 24.04.5 to 26.04.1 between runs
+    # 39500689829 and 44942286471 with nothing in this repository changing, and it silently
+    # altered two outcomes: the PostgreSQL client went from 16.x to 18.7, breaking a test that
+    # asserted an exact version, and a timing-sensitive voice test changed verdict. An image
+    # upgrade is a real change to the test environment, so it should arrive as a reviewable edit
+    # here rather than on GitHub's schedule.
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -87,10 +93,47 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends espeak-ng
 
+      # Recorded because two findings in run 44942286471 were environment-dependent and the log
+      # carried no way to tell which environment produced them. Cheap, and it makes a future
+      # "but it passed last week" an answerable question.
+      - name: Record environment diagnostics
+        run: |
+          echo "runner image: ${ImageOS:-unknown} ${ImageVersion:-unknown}"
+          . /etc/os-release && echo "os: $PRETTY_NAME"
+          echo "python: $(python --version 2>&1)"
+          for tool in pg_dump pg_restore psql; do
+            if command -v "$tool" > /dev/null; then
+              echo "$tool: $("$tool" --version)"
+            else
+              echo "$tool: not on PATH"
+            fi
+          done
+          echo "espeak-ng: $(espeak-ng --version 2>&1 | head -1)"
+
       # No external services needed: tests/conftest.py spins up an in-memory SQLite database
       # per test, so this doesn't need Postgres, S3, SMTP, or any API key configured.
+      #
+      # --junitxml so a failure leaves behind its message and traceback rather than one
+      # `FAILED ...` line. Each of run 44942286471's four failures had to be reconstructed from
+      # console text because the report died with the runner.
       - name: Run tests
-        run: pytest -q
+        run: pytest -q --junitxml=reports/junit-sqlite.xml
+
+      # always(), because this exists for the case where the step above failed, and a failing
+      # step stops the ones after it. continue-on-error so a problem uploading diagnostics can
+      # never turn a green suite red nor replace a real test failure with an artifact error.
+      # if-no-files-found: warn for the same reason -- a crash before pytest wrote any XML, a
+      # collection error say, must still be reported as itself. Only the JUnit XML goes up:
+      # nothing here touches .env files, requirements or any credential.
+      - name: Upload test reports
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: backend-test-results-sqlite
+          path: reports/junit-sqlite.xml
+          retention-days: 7
+          if-no-files-found: warn
 
   # Production is PostgreSQL, and SQLite cannot show us the differences that matter: a failed
   # statement poisons a Postgres transaction until it is rolled back, foreign keys are always
@@ -103,7 +146,8 @@ jobs:
   # buy nothing. This one runs the API tests, which are the ones that actually touch a
   # database -- the unit tests build their own in-memory engines and are about pure logic.
   test-postgres:
-    runs-on: ubuntu-latest
+    # Pinned for the same reason as the job above -- see the comment there.
+    runs-on: ubuntu-26.04
     # A lock wait has no timeout of its own, so a session left open by a test blocks the next
     # test's DDL forever and the job sits there burning runner minutes with no output and no
     # failing test name -- which is exactly how the first full PostgreSQL run of this suite
@@ -175,4 +219,31 @@ jobs:
           # destroyed when the job ends. A long-lived instance needs a dedicated test role
           # instead, which is why the exemption is explicit rather than inferred from CI.
           TEST_DATABASE_ALLOW_ADMIN_ROLE: "1"
-        run: pytest -q tests/api tests/unit/test_business_claim.py
+        run: pytest -q tests/api tests/unit/test_business_claim.py --junitxml=reports/junit-postgres.xml
+
+      # Both halves of the compatibility contract tests/unit/test_pg_client_args.py asserts: the
+      # client that would take a backup, and the server it would be taken from. Recorded here
+      # because this is the only job with a server to ask.
+      - name: Record PostgreSQL client and server versions
+        if: always()
+        continue-on-error: true
+        env:
+          PGPASSWORD: postgres
+        run: |
+          echo "runner image: ${ImageOS:-unknown} ${ImageVersion:-unknown}"
+          . /etc/os-release && echo "os: $PRETTY_NAME"
+          echo "client pg_dump:    $(pg_dump --version 2>&1)"
+          echo "client pg_restore: $(pg_restore --version 2>&1)"
+          echo "client psql:       $(psql --version 2>&1)"
+          echo "server: $(psql -h localhost -U postgres -d aiplacement_test -tAc 'select version()' 2>&1)"
+
+      # See the matching step in the `test` job for why always() and continue-on-error.
+      - name: Upload PostgreSQL test reports
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: backend-test-results-postgres
+          path: reports/junit-postgres.xml
+          retention-days: 7
+          if-no-files-found: warn

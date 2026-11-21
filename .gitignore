@@ -24,6 +24,10 @@ env/
 !.env.development.speech
 *.db
 *.sqlite3
+# JUnit XML from the CI test steps. Written into the workspace and uploaded as a build artifact,
+# so it is never meant to be committed -- and a stray one is exactly what a blanket `git add`
+# picks up.
+/reports/
 /uploads/
 
 .pytest_cache/
