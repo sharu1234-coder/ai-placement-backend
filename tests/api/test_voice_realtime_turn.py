@@ -17,6 +17,7 @@ realtime client package is still unmounted in `main/`. What is proven is that th
 produces honest, correctly ordered events for a committed turn.
 """
 
+import asyncio
 import json
 import threading
 
@@ -729,31 +730,56 @@ class TestCancellation:
         }
         assert following["type"] == "session_accepted", "audio was sent for a cancelled generation"
 
-    def test_an_interrupt_part_way_through_playback_truncates_the_stream(
+    def test_an_interrupt_while_the_stream_is_held_open_truncates_it(
         self, client, headers, speech, monkeypatch
     ):
-        """Barge-in *during* the audio stream, which no other cancellation test reaches.
+        """The guard inside the chunk loop, with the race taken out of it.
 
-        Every other case here interrupts before `_emit` runs, so the whole result is suppressed
-        by the liveness check in the worker. The check inside the chunk loop is a different guard
-        and it had no coverage at all -- a mutation probe deleting it left every test passing.
+        The loop is `check is_live -> send chunk -> check is_live -> send chunk`, so reaching the
+        guard means being *between* two chunks when liveness is withdrawn. The sibling test below
+        arranged that by making roughly sixteen thousand tiny chunks and relying on the receive
+        task being scheduled somewhere among them. That held on a developer machine and did not
+        hold on CI: on run 44942286471 the whole stream drained before the interrupt was handled,
+        so the guard was never reached and the test reported "no cancellation at all" -- a
+        description of its own unmet premise rather than of the server.
 
-        Reaching it needs a stream long enough to still be running when the interrupt lands, so
-        the chunk size is shrunk and the buffer is large: roughly sixteen thousand chunks, each
-        an `await` the receive loop can be scheduled between.
+        Here the stream is *held* instead. `send_bytes` is wrapped so that the third chunk waits
+        on a gate, which gives three facts no amount of buffer would: the stream is provably
+        still running, the interrupt is provably delivered while it is running, and the loop
+        provably has chunks left to send. Ten chunks are enough, because nothing is being raced.
 
-        **What is asserted is audio that arrives *after* the cancellation, and that distinction
-        is the whole test.** A first attempt counted bytes delivered up to `generation_cancelled`
-        and required fewer than the buffer -- which passes with the guard deleted, because that
-        frame comes from the interrupt handler in the receive loop rather than from the chunk
-        loop, so it arrives mid-stream either way. The guard's actual effect is that the loop
-        stops at its next check: `interrupt()` clears the live turn synchronously before the
-        cancel frame is even queued, and the outbound lock serialises the two, so with the guard
-        in place exactly zero chunks may follow it. Without it, thousands do.
+        Two details that are not incidental:
+
+        * The gate is awaited **before** delegating to the real `send_bytes`, which takes
+          `_send_lock`. Waiting while holding that lock would block the interrupt handler's own
+          `generation_cancelled` and deadlock the test rather than exercise the guard.
+        * It is a `threading.Event` reached through `asyncio.to_thread`, not an `asyncio.Event`,
+          because the driving test runs on a different thread from the ASGI loop. The loop stays
+          free while it waits, which is what lets the receive task handle the interrupt at all.
+
+        The whole outgoing sequence is kept and reported on failure. The sibling test routed
+        `speech_stopped` and `generation_done` into an unused branch, which is precisely why its
+        CI failure could not say whether the stream had finished or the guard had broken.
         """
         monkeypatch.setattr(endpoint, "SPEECH_CHUNK_BYTES", 64)
         _, tts = speech
-        tts.audio = b"\x05\x06" * (512 * 1024)  # 1 MiB -> ~16 384 chunks
+        tts.audio = b"\x05\x06" * 320  # 640 bytes -> exactly 10 chunks of 64
+        total_chunks = len(tts.audio) // 64
+
+        block_before = 3  # two chunks go out, eight remain unsent behind the gate
+        blocked = threading.Event()
+        release = threading.Event()
+        sent = []
+        real_send_bytes = endpoint._Connection.send_bytes
+
+        async def gated_send_bytes(connection, frame: bytes) -> None:
+            sent.append(frame)
+            if len(sent) == block_before:
+                blocked.set()
+                await asyncio.to_thread(release.wait)
+            await real_send_bytes(connection, frame)
+
+        monkeypatch.setattr(endpoint._Connection, "send_bytes", gated_send_bytes)
 
         with client.websocket_connect(URL, headers=headers) as ws:
             opened = _accept(ws)
@@ -763,32 +789,73 @@ class TestCancellation:
                 "generation_started", "speech_started",
             ]
 
-            assert isinstance(_read(ws, 1)[0], bytes), "expected an audio frame"
+            # Not a wait for time to pass: the gate is only set from inside the chunk loop,
+            # after chunks have gone out and with more still to send. The bound is a deadlock
+            # backstop, and it is asserted so a timeout can never read as success.
+            assert blocked.wait(timeout=30), (
+                "the audio stream never reached the gate, so the premise of this test -- a "
+                "stream still in flight -- was never established"
+            )
+
             ws.send_text(json.dumps({"type": "interrupt"}))
-            # The read terminator: frames are handled in order, so `session_accepted` proves the
-            # interrupt ahead of it was processed and the stream has had its chance to continue.
-            ws.send_text(json.dumps({"type": "resume", "token": opened["resume_token"]}))
 
-            before, after, cancelled = 1, 0, False
-            for _ in range(20_000):
+            seen: list = []
+            cancelled_at = None
+            for _ in range(total_chunks + 20):
                 frame = _read(ws, 1)[0]
-                if isinstance(frame, bytes):
-                    if cancelled:
-                        after += 1
-                    else:
-                        before += 1
-                elif frame["type"] == "generation_cancelled":
-                    cancelled = True
-                elif frame["type"] == "session_accepted":
+                seen.append(frame)
+                if isinstance(frame, dict) and frame["type"] == "generation_cancelled":
+                    cancelled_at = len(seen) - 1
                     break
-            else:
-                raise AssertionError("never reached the resume reply")
 
-        assert cancelled, "the interrupt produced no cancellation at all"
-        assert after == 0, (
-            f"{after} audio chunks were sent for a generation the student had already cancelled"
+            assert cancelled_at is not None, (
+                "the interrupt produced no generation_cancelled even though the stream was "
+                f"provably still open. Frames: {_types(seen)}"
+            )
+
+            # Only now may the loop advance, and its very next act is the guard's liveness check.
+            release.set()
+
+            ws.send_text(json.dumps({"type": "resume", "token": opened["resume_token"]}))
+            for _ in range(total_chunks + 20):
+                frame = _read(ws, 1)[0]
+                seen.append(frame)
+                if isinstance(frame, dict) and frame["type"] == "session_accepted":
+                    break
+
+        sequence = _types(seen)
+        after = sequence[cancelled_at + 1 :]
+        trailing = after.count("audio")
+
+        # Exactly one chunk may follow `generation_cancelled`, and it is not a leak: the guard
+        # runs *before* each send, so the chunk already handed to the transport when the
+        # interrupt landed cannot be recalled. What the guard promises is that no further chunk
+        # is ever *started*. Here that in-flight chunk is the one held at the gate, which is why
+        # the bound is one rather than an approximation.
+        assert trailing <= 1, (
+            f"{trailing} audio chunks followed the cancellation; only the one already in flight "
+            f"is explainable. Full sequence: {sequence}"
         )
-        assert before < len(tts.audio) // 64, "the stream had already finished; the guard was never reached"
+        assert "speech_stopped" not in after and "generation_done" not in after, (
+            "the stream ran to completion after the interrupt instead of stopping at the guard. "
+            f"Full sequence: {sequence}"
+        )
+        # The exact contract: every chunk the guard saw while the turn was live went out, and
+        # every chunk after liveness was withdrawn was suppressed. Not "fewer than all", which
+        # would also pass if the loop stopped for some unrelated reason.
+        delivered = sequence.count("audio")
+        assert delivered == block_before, (
+            f"the guard should have stopped the loop after the {block_before} chunks already "
+            f"past it, leaving {total_chunks - block_before} unsent -- but {delivered} of "
+            f"{total_chunks} were delivered. Full sequence: {sequence}"
+        )
+
+    # The racing version of the test above used to stand here. It made roughly sixteen
+    # thousand tiny chunks and relied on the receive task being scheduled somewhere among
+    # them, which held on a developer machine and failed on CI run 44942286471. The guard it
+    # covered is now proven by holding the stream open instead, so no coverage was lost --
+    # see test_an_interrupt_while_the_stream_is_held_open_truncates_it above. That CI failure
+    # described the test's own unmet premise, not a fault in the server.
 
     def test_an_interrupt_before_anything_is_committed_does_nothing(self, client, headers, speech):
         with client.websocket_connect(URL, headers=headers) as ws:
