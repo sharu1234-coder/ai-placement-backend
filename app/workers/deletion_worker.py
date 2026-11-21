@@ -277,6 +277,59 @@ def close_request_if_finished(db: Session, request_id: int) -> bool:
     return True
 
 
+def claim_finalizable_requests(db: Session, *, limit: int = 10) -> list[int]:
+    """Unresolved requests with no unresolved job left, leased to this worker.
+
+    The recovery half of the close, and the reason it has to exist: every other stage of this
+    pipeline recovers by itself, and the close did not. `claim_batch` only ever selects jobs
+    that are still pending or needs_attention, so once the final job committed `done` the
+    request had no claimable job left -- and the only caller of
+    `close_request_if_finished` was a loop over the requests whose job had transitioned in
+    *that* pass. A process death between the last job commit and the close therefore left the
+    request open permanently: still counted by `unresolved_obligations`, still logged by
+    `report_sla_breaches`, and reachable by no code path at all. Only a human could finish it.
+
+    The predicate is "no unresolved job", not "has a done job", which keeps the invariant the
+    right way round: a request is finalizable because nothing is outstanding, so `pending` and
+    `needs_attention` both hold it open, and a job that is reopened between this query and the
+    close is caught by the re-count inside `close_request_if_finished`.
+
+    A request with no jobs at all also qualifies, and that is correct rather than an oversight:
+    `deletion_outbox.enqueue` inserts the request and its jobs in one transaction, so no other
+    transaction can observe a request before its jobs exist. A visible request with no jobs has
+    no obligation to wait for. (Phase 1 does not create one today -- `account_service` only
+    opens a request when there is at least one key -- so this is a safety property, not a path.)
+
+    `FOR UPDATE SKIP LOCKED`, exactly as `claim_batch` does it and for the same reason: two
+    workers sweeping at once must not both finalize the same request, and the second must step
+    over a locked row rather than block or error. The lock is held until the caller commits, by
+    which point the winner has set the status to `done` and the row no longer matches. On SQLite
+    the clause is omitted and the single-writer model stands in, the same compromise `claim_batch`
+    documents; the concurrent case is exercised on the real engine.
+
+    Bounded by `limit` so this is never a scan of the whole queue, and the rows are only read
+    here -- the close itself happens one request per transaction in the caller, so no storage
+    call or long-running transaction is introduced.
+    """
+    outstanding = (
+        select(DeletionJob.id)
+        .where(
+            DeletionJob.deletion_request_id == DeletionRequest.id,
+            DeletionJob.status.in_((STATUS_PENDING, STATUS_NEEDS_ATTENTION)),
+        )
+        .exists()
+    )
+    statement = (
+        select(DeletionRequest.id)
+        .where(DeletionRequest.status.in_(UNRESOLVED_STATUSES), ~outstanding)
+        .order_by(DeletionRequest.id.asc())
+        .limit(limit)
+    )
+    if db.bind is not None and db.bind.dialect.name == "postgresql":
+        statement = statement.with_for_update(skip_locked=True)
+    return [row[0] for row in db.execute(statement).all()]
+
+
 def overdue_requests(
     db: Session,
     *,
@@ -336,18 +389,20 @@ def run_once(db: Session, storage: StorageProvider, *, limit: int = 10) -> RunRe
     2. one storage call per job, with **no transaction open**;
     3. one transaction per job to record the outcome, so one job's failure cannot roll back
        another job's success;
-    4. a final transaction per affected request to re-count and close.
+    4. a final transaction per affected request to re-count and close;
+    5. a bounded recovery sweep for requests no longer reachable through their jobs, one
+       transaction each.
+
+    Boundary 5 is what makes the close crash-safe. It deliberately runs even when this pass
+    claimed nothing, because a request orphaned by a crash is in exactly that state: every job
+    `done`, nothing claimable, and so previously nothing that would ever look at it again.
     """
     report = RunReport()
 
     jobs = claim_batch(db, limit=limit)
     report.claimed = len(jobs)
-    if not jobs:
-        db.commit()
-        report_sla_breaches(db)
-        return report
-
-    # Boundary 1: the lease is durable before anything is erased.
+    # Boundary 1: the lease is durable before anything is erased. Committed even for an empty
+    # claim, which also ends the read transaction before the sweep below opens its own.
     db.commit()
 
     touched_requests: set[int] = set()
@@ -367,6 +422,16 @@ def run_once(db: Session, storage: StorageProvider, *, limit: int = 10) -> RunRe
 
     # Boundary 4: re-count per request, then close.
     for request_id in sorted(touched_requests):
+        if close_request_if_finished(db, request_id):
+            report.requests_closed += 1
+        db.commit()
+
+    # Boundary 5: finish anything left behind by an earlier process. Requests closed above are
+    # already `done`, so they no longer match the claim and are not counted twice -- and
+    # `close_request_if_finished` returns False for an already-closed request in any case.
+    # One transaction per request, so a request that cannot be closed cannot roll back one that
+    # was, and nothing here calls storage.
+    for request_id in claim_finalizable_requests(db, limit=limit):
         if close_request_if_finished(db, request_id):
             report.requests_closed += 1
         db.commit()

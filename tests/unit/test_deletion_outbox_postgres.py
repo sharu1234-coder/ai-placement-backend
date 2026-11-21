@@ -557,3 +557,209 @@ class TestACrashAfterTheDeleteOnPostgres:
         finally:
             session.close()
             engine.dispose()
+
+
+class TestFinalizationRecoveryOnPostgres:
+    """H3 on the real engine: the parts SQLite cannot speak to.
+
+    The SQLite tests prove the recovery logic -- that an orphaned request is found and closed,
+    and that an unresolved job keeps it open. What they cannot prove is the half that only
+    exists on PostgreSQL: that two workers sweeping at the same time do not both finalize the
+    same request, which rests entirely on `FOR UPDATE SKIP LOCKED` over `deletion_requests`.
+    SQLite has neither row locks nor the clause, so a passing SQLite run says nothing about it.
+    """
+
+    def test_an_orphaned_request_is_recovered_on_a_later_pass(self, outbox_database):
+        """Requirement 9: the request was not touched in this pass, and still gets closed.
+
+        The crash is reproduced as the worker own boundaries 1-3 and then nothing, with the
+        second pass run from a *different session* -- a different worker, as it would be after
+        a restart.
+        """
+        engine_a, session_a = _session(outbox_database)
+        engine_b, session_b = _session(outbox_database)
+        try:
+            request = _seed_request(session_a, user_email="orphan@example.com")
+            request_id, user_id = request.id, request.original_user_id
+            storage = SelectiveStorage()
+
+            jobs = deletion_worker.claim_batch(session_a)
+            session_a.commit()
+            for job in jobs:
+                deletion_worker.execute_job(session_a, job, storage)
+                session_a.commit()
+            # The crash: the close never runs in this process.
+            assert session_a.get(DeletionRequest, request_id).status == "pending"
+            assert session_a.get(User, user_id) is not None
+
+            report = deletion_worker.run_once(session_b, storage)
+
+            assert report.claimed == 0, "there is nothing claimable -- that is the difficulty"
+            assert report.requests_closed == 1
+            assert session_b.get(DeletionRequest, request_id).status == "done"
+            assert session_b.get(User, user_id) is None
+        finally:
+            session_a.close()
+            session_b.close()
+            engine_a.dispose()
+            engine_b.dispose()
+
+    def test_two_workers_sweeping_at_once_do_not_both_finalize_it(self, outbox_database):
+        """Requirement 7, proven with two connections rather than argued from the SQL.
+
+        The first session claims the finalizable request and holds its row lock by not
+        committing. The second must step over it and come back empty -- not block, and not
+        finalize it a second time. A duplicate finalization would mean two attempts to delete
+        the same user row and two closes of the same obligation.
+        """
+        engine_a, session_a = _session(outbox_database)
+        engine_b, session_b = _session(outbox_database)
+        try:
+            request = _seed_request(session_a, user_email="contested@example.com")
+            request_id = request.id
+            jobs = deletion_worker.claim_batch(session_a)
+            session_a.commit()
+            for job in jobs:
+                deletion_worker.execute_job(session_a, job, SelectiveStorage())
+                session_a.commit()
+            session_a.rollback()
+
+            first = deletion_worker.claim_finalizable_requests(session_a)
+            assert first == [request_id]
+
+            second = deletion_worker.claim_finalizable_requests(session_b)
+            assert second == [], "the second worker claimed a request the first already held"
+
+            assert deletion_worker.close_request_if_finished(session_a, request_id) is True
+            session_a.commit()
+
+            # Once the winner has committed, the row no longer matches the predicate at all.
+            assert deletion_worker.claim_finalizable_requests(session_b) == []
+            assert deletion_worker.close_request_if_finished(session_b, request_id) is False
+            session_b.commit()
+            assert session_b.get(DeletionRequest, request_id).status == "done"
+        finally:
+            session_a.close()
+            session_b.close()
+            engine_a.dispose()
+            engine_b.dispose()
+
+    def test_two_concurrent_full_passes_close_the_request_exactly_once(self, outbox_database):
+        """The same race through the public entry point, counted rather than inspected."""
+        engine_a, session_a = _session(outbox_database)
+        engine_b, session_b = _session(outbox_database)
+        try:
+            request = _seed_request(session_a, user_email="once@example.com")
+            request_id, user_id = request.id, request.original_user_id
+            storage = SelectiveStorage()
+            jobs = deletion_worker.claim_batch(session_a)
+            session_a.commit()
+            for job in jobs:
+                deletion_worker.execute_job(session_a, job, storage)
+                session_a.commit()
+            session_a.rollback()
+
+            first = deletion_worker.run_once(session_a, storage)
+            second = deletion_worker.run_once(session_b, storage)
+
+            assert first.requests_closed + second.requests_closed == 1, (
+                "the request must be closed exactly once across both workers"
+            )
+            assert session_b.get(DeletionRequest, request_id).status == "done"
+            assert session_b.get(User, user_id) is None
+        finally:
+            session_a.close()
+            session_b.close()
+            engine_a.dispose()
+            engine_b.dispose()
+
+    def test_a_request_with_an_unresolved_job_is_never_claimed_for_finalization(self, outbox_database):
+        """The invariant, asserted against the claim itself on the real engine.
+
+        Both unresolved statuses are checked, because `needs_attention` means visible and still
+        being retried -- never given up on -- and treating it as terminal would close a request
+        while an object may still be stored.
+        """
+        engine, session = _session(outbox_database)
+        try:
+            request = _seed_request(session, keys=("a/1.pdf", "a/2.pdf"), user_email="waiting@example.com")
+            jobs = session.query(DeletionJob).order_by(DeletionJob.id).all()
+            jobs[0].status = "done"
+            jobs[0].completed_at = datetime.datetime.now(datetime.timezone.utc)
+            session.commit()
+
+            for holding_status in ("pending", "needs_attention"):
+                jobs[1].status = holding_status
+                session.commit()
+
+                assert deletion_worker.claim_finalizable_requests(session) == [], (
+                    f"a job in {holding_status} is an unresolved obligation and must hold the "
+                    "request open"
+                )
+                assert deletion_worker.close_request_if_finished(session, request.id) is False
+                session.commit()
+                assert session.get(DeletionRequest, request.id).status == "pending"
+                assert session.get(User, request.original_user_id) is not None
+
+            # And once it genuinely finishes, the request is claimable and closes.
+            jobs[1].status = "done"
+            jobs[1].completed_at = datetime.datetime.now(datetime.timezone.utc)
+            session.commit()
+            assert deletion_worker.claim_finalizable_requests(session) == [request.id]
+        finally:
+            session.close()
+            engine.dispose()
+
+    def test_a_failed_finalization_leaves_the_obligation_and_its_keys_intact(self, outbox_database):
+        """Requirement 8: a rollback mid-close must not destroy the last durable pointer.
+
+        The user row, the request and every job row -- which hold the only remaining copies of
+        the storage keys -- must all survive, so the next pass can finish the job properly.
+        """
+        engine, session = _session(outbox_database)
+        try:
+            request = _seed_request(session, keys=("a/1.pdf",), user_email="rollback@example.com")
+            request_id, user_id = request.id, request.original_user_id
+            storage = SelectiveStorage()
+            jobs = deletion_worker.claim_batch(session)
+            session.commit()
+            for job in jobs:
+                deletion_worker.execute_job(session, job, storage)
+                session.commit()
+            session.rollback()
+
+            assert deletion_worker.close_request_if_finished(session, request_id) is True
+            session.rollback()  # the crash, after the close was staged and before it committed
+
+            assert session.get(DeletionRequest, request_id).status == "pending"
+            assert session.get(User, user_id) is not None
+            job_row = session.query(DeletionJob).one()
+            assert job_row.storage_key == "a/1.pdf", "the durable key must survive a rollback"
+
+            # The next pass finishes it, which is the point of leaving everything in place.
+            report = deletion_worker.run_once(session, storage)
+            assert report.requests_closed == 1
+            assert session.get(DeletionRequest, request_id).status == "done"
+            assert session.get(User, user_id) is None
+        finally:
+            session.close()
+            engine.dispose()
+
+    def test_the_finalization_claim_is_bounded(self, outbox_database):
+        """No unbounded scan of the queue: the sweep takes at most `limit` requests a pass."""
+        engine, session = _session(outbox_database)
+        try:
+            for index in range(5):
+                request = _seed_request(session, keys=(f"b/{index}.pdf",))
+                for job in session.query(DeletionJob).filter(
+                    DeletionJob.deletion_request_id == request.id
+                ):
+                    job.status = "done"
+                    job.completed_at = datetime.datetime.now(datetime.timezone.utc)
+                session.commit()
+
+            assert len(deletion_worker.claim_finalizable_requests(session, limit=2)) == 2
+            assert len(deletion_worker.claim_finalizable_requests(session, limit=5)) == 5
+        finally:
+            session.close()
+            engine.dispose()

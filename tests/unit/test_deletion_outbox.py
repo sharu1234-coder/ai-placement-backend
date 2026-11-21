@@ -801,3 +801,207 @@ class TestFailureCodesAreRecordedForTriage:
         assert _KEY not in recorded
         assert "prod-talviora" not in recorded
         assert len(recorded) <= 100, "must fit DeletionJob.last_error_class"
+
+
+class TestFinalizationRecoversFromACrashBeforeClosure:
+    """H3: the one step in this pipeline that was not crash-safe.
+
+    Every other stage recovers by itself. A claim that dies leaves a lease to expire; a storage
+    call that dies is retried, and deleting an object that is already gone is success. The
+    exception was the *close*: `run_once` only re-counted requests whose job transitioned to
+    done **in that pass**, and `claim_batch` only ever selects jobs that are still pending or
+    needs_attention. So once the final job committed `done`, the request had no claimable job
+    left and nothing ever looked at it again -- the obligation stayed open permanently, visible
+    in the SLA log and unreachable by any code path.
+
+    The crash is reproduced by performing the worker own boundaries 1 to 3 and then stopping,
+    which is exactly what a process death between the last job commit and the close looks like.
+    Nothing internal is monkeypatched: the sequence in `_crash_after_last_job` is what
+    `run_once` itself does.
+    """
+
+    def _crash_after_last_job(self, db, storage):
+        """Boundaries 1-3 only: claim, commit, erase, commit. Never reaches the close."""
+        jobs = deletion_worker.claim_batch(db)
+        db.commit()
+        for job in jobs:
+            deletion_worker.execute_job(db, job, storage)
+            db.commit()
+        return jobs
+
+    def _open_request(self, db, keys=(_KEY,), email="leaving@example.com"):
+        """An account in Phase 1: access revoked, jobs enqueued, user row still present."""
+        user, _profile = _seed_account(db, email=email, keys=keys)
+        delete_account(db, user, FakeStorage())
+        request = (
+            db.query(DeletionRequest)
+            .order_by(DeletionRequest.id.desc())
+            .first()
+        )
+        return request.id, request.original_user_id
+
+    def test_the_crash_window_leaves_the_request_open(self, db_session):
+        """The failure itself, so the recovery tests below have something to prove."""
+        _request_id, user_id = self._open_request(db_session)
+        storage = FakeStorage()
+
+        self._crash_after_last_job(db_session, storage)
+
+        assert storage.deleted == [_KEY]
+        assert db_session.query(DeletionJob).one().status == "done"
+        assert db_session.query(DeletionRequest).one().status == "pending"
+        assert db_session.get(User, user_id) is not None
+
+    def test_a_later_pass_closes_the_orphaned_request(self, db_session):
+        """The recovery. This is the assertion that failed before H3.
+
+        The later pass has no claimable job -- that is the whole difficulty -- so a fix that
+        only looks at requests touched by the current batch cannot close this.
+        """
+        _request_id, user_id = self._open_request(db_session)
+        storage = FakeStorage()
+        self._crash_after_last_job(db_session, storage)
+
+        report = deletion_worker.run_once(db_session, storage)
+
+        assert report.requests_closed == 1
+        assert db_session.query(DeletionRequest).one().status == "done"
+        assert db_session.get(User, user_id) is None, "the final user row must be gone"
+
+    def test_recovery_does_not_repeat_the_storage_deletion(self, db_session):
+        """Requirement 3: the object was already erased, so recovery must not call storage.
+
+        Closing touches no provider at all. A recovered request that re-deleted would be doing
+        work against a bucket for an object that is already gone, and would turn a bucket
+        outage into a request that cannot close.
+        """
+        self._open_request(db_session)
+        storage = FakeStorage()
+        self._crash_after_last_job(db_session, storage)
+        assert storage.deleted == [_KEY]
+
+        deletion_worker.run_once(db_session, storage)
+
+        assert storage.deleted == [_KEY], "recovery must not re-delete an already-erased object"
+
+    def test_repeated_recovery_passes_are_idempotent(self, db_session):
+        self._open_request(db_session)
+        storage = FakeStorage()
+        self._crash_after_last_job(db_session, storage)
+
+        first = deletion_worker.run_once(db_session, storage)
+        second = deletion_worker.run_once(db_session, storage)
+        third = deletion_worker.run_once(db_session, storage)
+
+        assert first.requests_closed == 1
+        assert second.requests_closed == 0, "an already-closed request must not be closed twice"
+        assert third.requests_closed == 0
+        assert storage.deleted == [_KEY]
+        assert db_session.query(DeletionRequest).one().status == "done"
+
+    def test_a_request_with_a_pending_job_stays_open(self, db_session):
+        """Requirement 4, and the invariant: a pending job is an unresolved obligation."""
+        _request_id, user_id = self._open_request(db_session, keys=(_KEY, "resumes/42/second.pdf"))
+        storage = FakeStorage()
+        # One job is held outside the claim window, so the other finishes alone.
+        held = (
+            db_session.query(DeletionJob)
+            .filter(DeletionJob.storage_key == "resumes/42/second.pdf")
+            .one()
+        )
+        held.next_attempt_at = deletion_worker._now() + datetime.timedelta(hours=1)
+        db_session.commit()
+        self._crash_after_last_job(db_session, storage)
+
+        report = deletion_worker.run_once(db_session, storage)
+
+        assert report.requests_closed == 0
+        assert db_session.query(DeletionRequest).one().status == "pending"
+        assert db_session.get(User, user_id) is not None, "the user row is the last pointer"
+
+    def test_a_request_with_a_needs_attention_job_stays_open(self, db_session):
+        """Requirement 5. needs_attention means visible and still being retried, never given up
+        on, so it must keep the request open exactly as pending does."""
+        _request_id, user_id = self._open_request(db_session, keys=(_KEY, "resumes/42/second.pdf"))
+        jobs = db_session.query(DeletionJob).order_by(DeletionJob.id).all()
+        jobs[0].status = "done"
+        jobs[0].completed_at = deletion_worker._now()
+        jobs[1].status = "needs_attention"
+        jobs[1].next_attempt_at = deletion_worker._now() + datetime.timedelta(hours=1)
+        db_session.commit()
+
+        report = deletion_worker.run_once(db_session, FakeStorage())
+
+        assert report.requests_closed == 0
+        assert db_session.query(DeletionRequest).one().status == "pending"
+        assert db_session.get(User, user_id) is not None
+
+    def test_a_multi_job_request_closes_only_once_every_job_is_done(self, db_session):
+        """Requirement 6, walked one job at a time."""
+        _request_id, user_id = self._open_request(
+            db_session, keys=(_KEY, "resumes/42/b.pdf", "resumes/42/c.pdf")
+        )
+        storage = FakeStorage()
+
+        seen = []
+        for _ in range(3):
+            jobs = deletion_worker.claim_batch(db_session, limit=1)
+            db_session.commit()
+            for job in jobs:
+                deletion_worker.execute_job(db_session, job, storage)
+                db_session.commit()
+            seen.append(db_session.query(DeletionRequest).one().status)
+
+        assert seen[:2] == ["pending", "pending"], (
+            "the request must stay open while any job is unresolved"
+        )
+        deletion_worker.run_once(db_session, storage)
+        assert db_session.query(DeletionRequest).one().status == "done"
+        assert db_session.get(User, user_id) is None
+        assert sorted(storage.deleted) == sorted([_KEY, "resumes/42/b.pdf", "resumes/42/c.pdf"])
+
+    def test_recovery_leaves_the_job_rows_and_their_keys_intact(self, db_session):
+        """Requirement 8, in the direction that matters here: closing must not delete job rows.
+
+        The job row is the only remaining pointer to the object once the resume row is gone, so
+        a finalizer that tidied up its own jobs would destroy the record of an erasure it had
+        just claimed to finish.
+        """
+        self._open_request(db_session)
+        storage = FakeStorage()
+        self._crash_after_last_job(db_session, storage)
+
+        deletion_worker.run_once(db_session, storage)
+
+        job = db_session.query(DeletionJob).one()
+        assert job.storage_key == _KEY, "the durable key must survive finalization"
+        assert job.status == "done"
+        assert job.completed_at is not None
+
+    def test_an_unrelated_open_request_is_not_closed_by_another_recovery(self, db_session):
+        """Recovery is per request. A finalizable request must not sweep up a neighbour whose
+        own job is still outstanding."""
+        _finished_id, finished_user = self._open_request(
+            db_session, keys=("resumes/1/a.pdf",), email="done@example.com"
+        )
+        storage = FakeStorage()
+        self._crash_after_last_job(db_session, storage)
+
+        _waiting_id, waiting_user = self._open_request(
+            db_session, keys=("resumes/2/b.pdf",), email="waiting@example.com"
+        )
+        held = (
+            db_session.query(DeletionJob)
+            .filter(DeletionJob.storage_key == "resumes/2/b.pdf")
+            .one()
+        )
+        held.next_attempt_at = deletion_worker._now() + datetime.timedelta(hours=1)
+        db_session.commit()
+
+        report = deletion_worker.run_once(db_session, storage)
+
+        assert report.requests_closed == 1
+        statuses = {r.original_user_id: r.status for r in db_session.query(DeletionRequest).all()}
+        assert statuses[finished_user] == "done"
+        assert statuses[waiting_user] == "pending"
+        assert db_session.get(User, waiting_user) is not None
