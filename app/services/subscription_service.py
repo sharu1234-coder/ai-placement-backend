@@ -1,4 +1,4 @@
-"""Razorpay TEST MODE order creation + payment verification, and the resulting premium
+"""Razorpay order creation + payment verification, and the resulting premium
 entitlement. Uses Razorpay's Orders API (one-time payment) rather than its Subscriptions API
 (recurring auto-charge) -- these are fixed-duration purchases the student re-buys manually
 each time, not an auto-renewing mandate, so Orders is the correct fit, not a simplification.
@@ -318,6 +318,36 @@ def is_premium(db: Session, profile_id: int) -> bool:
     -- same "an active, unexpired, paid subscription row" definition get_status already uses,
     so a route's enforcement can never drift from what the client's own status check reports."""
     return _get_active_subscription(db, profile_id, _utcnow()) is not None
+
+
+# Razorpay encodes the mode in the key id itself: rzp_test_... for test mode,
+# rzp_live_... for live. That prefix is the only mode signal this deployment has -- Razorpay
+# exposes no "which mode am I in" endpoint -- and it is the same signal
+# config.validate_for_production already uses to refuse a test key in production.
+_TEST_KEY_PREFIX = "rzp_test_"
+_LIVE_KEY_PREFIX = "rzp_live_"
+
+
+def payment_mode() -> str:
+    """Which Razorpay mode this deployment actually charges in: "test", "live" or "unknown".
+
+    Returns the PUBLIC mode name only -- never the key id, never any part of it. The client
+    needs this because nothing on the client can derive it: the publishable key id does not
+    reach the app until /checkout, which is after the student has already been shown the
+    purchase copy, and a client-side build flag would be wrong anyway (a release build pointed
+    at a test backend, or a debug build pointed at a live one, would both report the opposite).
+
+    "unknown" is a real answer rather than a failure. An unset key (payments not configured on
+    this deployment yet) or an unrecognised prefix (a Razorpay naming change, a typo in the
+    env var) must not be reported as either mode, because "no real money is charged" is a
+    promise to the student: callers must read "unknown" as "promise nothing about the charge".
+    """
+    key_id = settings.razorpay_key_id or ""
+    if key_id.startswith(_TEST_KEY_PREFIX):
+        return "test"
+    if key_id.startswith(_LIVE_KEY_PREFIX):
+        return "live"
+    return "unknown"
 
 
 def get_status(db: Session, profile_id: int) -> dict:

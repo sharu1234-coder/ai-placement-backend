@@ -47,7 +47,10 @@ def get_status(
     db: Session = Depends(get_db),
 ) -> SubscriptionStatusRead:
     profile = get_or_create_profile(db, current_user)
-    return SubscriptionStatusRead(**subscription_service.get_status(db, profile.id))
+    return SubscriptionStatusRead(
+        **subscription_service.get_status(db, profile.id),
+        payment_mode=subscription_service.payment_mode(),
+    )
 
 
 @router.post("/checkout", response_model=CheckoutResponse, status_code=status.HTTP_201_CREATED, dependencies=_app_check_dep)
@@ -59,7 +62,8 @@ def create_checkout(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> CheckoutResponse:
-    """Creates a Razorpay TEST MODE order for the given plan. The amount charged comes ONLY
+    """Creates a Razorpay order for the given plan, in whichever mode the configured key id
+    selects (see subscription_service.payment_mode). The amount charged comes ONLY
     from the server-side PLAN_CATALOG (see subscription_service.py) keyed by `payload.plan`
     -- there is no field on this request the client could use to influence the price."""
     profile = get_or_create_profile(db, current_user)
@@ -132,7 +136,10 @@ def verify_payment(
     except subscription_service.DuplicatePaymentError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc))
 
-    return SubscriptionStatusRead(**subscription_service.get_status(db, profile.id))
+    return SubscriptionStatusRead(
+        **subscription_service.get_status(db, profile.id),
+        payment_mode=subscription_service.payment_mode(),
+    )
 
 
 @router.post("/webhook", status_code=status.HTTP_200_OK)

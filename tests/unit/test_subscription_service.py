@@ -318,3 +318,40 @@ class TestWebhook:
 
     def test_mark_failed_from_webhook_for_unknown_order_does_nothing(self, db):
         svc.mark_failed_from_webhook(db, "order_does_not_exist")  # must not raise
+
+
+class TestPaymentMode:
+    """H1: the purchase screen may say "no real money is charged" only when the server really
+    is in test mode, so the mode has to be derivable from configuration alone -- and must
+    refuse to guess when it cannot tell."""
+
+    def test_a_test_mode_key_id_reports_test(self):
+        # The autouse razorpay_keys fixture configures an rzp_test_ key id.
+        assert svc.payment_mode() == "test"
+
+    def test_a_live_mode_key_id_reports_live(self, monkeypatch):
+        monkeypatch.setattr(settings, "razorpay_key_id", "rzp_live_realkeyid")
+
+        assert svc.payment_mode() == "live"
+
+    def test_an_unset_key_id_reports_unknown_rather_than_test(self, monkeypatch):
+        """A deployment with payments not configured yet is not a test-mode deployment. Calling
+        it one would print a no-charge promise on a server that cannot charge at all."""
+        monkeypatch.setattr(settings, "razorpay_key_id", None)
+
+        assert svc.payment_mode() == "unknown"
+
+    def test_an_unrecognised_prefix_reports_unknown_rather_than_assuming_either_mode(self, monkeypatch):
+        monkeypatch.setattr(settings, "razorpay_key_id", "rzp_sandbox_somethingnew")
+
+        assert svc.payment_mode() == "unknown"
+
+    def test_the_mode_leaks_no_part_of_the_key_id(self, monkeypatch):
+        """This value is sent to the client, so it must carry the public mode name and nothing
+        else -- never a slice of the credential it was derived from."""
+        monkeypatch.setattr(settings, "razorpay_key_id", "rzp_live_distinctivesuffix")
+
+        mode = svc.payment_mode()
+
+        assert mode == "live"
+        assert "distinctivesuffix" not in mode

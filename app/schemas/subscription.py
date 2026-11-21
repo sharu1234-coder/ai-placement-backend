@@ -25,6 +25,13 @@ class SubscriptionStatusRead(BaseModel):
     status: Literal["never_subscribed", "active", "expired"]
     plan: Optional[str] = None
     expires_at: Optional[datetime.datetime] = None
+    # Which Razorpay mode this DEPLOYMENT charges in (see subscription_service.payment_mode) --
+    # a property of the server, not of this profile, but carried here because this is the
+    # response the Subscriptions screen already reads before it offers a plan, and the mode has
+    # to be known at that point rather than at /checkout time when the key id first arrives.
+    # Defaults to "unknown" so no construction site can accidentally assert "test" -- the one
+    # value that licenses telling a student no real money is charged.
+    payment_mode: Literal["test", "live", "unknown"] = "unknown"
 
 
 class CheckoutRequest(BaseModel):

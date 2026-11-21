@@ -74,7 +74,17 @@ def test_status_requires_auth(client):
 def test_status_defaults_to_free_never_subscribed(client, auth_headers):
     response = client.get("/subscriptions/status", headers=auth_headers)
     assert response.status_code == 200
-    assert response.json() == {"tier": "free", "status": "never_subscribed", "plan": None, "expires_at": None}
+    # Whole-body equality on purpose: this is the one route whose exact wire shape the
+    # Android entitlement path depends on, so a silently added or renamed field fails here.
+    # payment_mode is "test" because the autouse razorpay_keys fixture configures an
+    # rzp_test_ key id.
+    assert response.json() == {
+        "tier": "free",
+        "status": "never_subscribed",
+        "plan": None,
+        "expires_at": None,
+        "payment_mode": "test",
+    }
 
 
 def test_checkout_never_accepts_a_client_supplied_amount(client, auth_headers, monkeypatch):
@@ -270,3 +280,33 @@ def test_webhook_failed_event_does_not_downgrade_an_already_paid_subscription(cl
 
     status = client.get("/subscriptions/status", headers=auth_headers)
     assert status.json()["tier"] == "premium"
+
+
+def test_status_reports_the_servers_payment_mode(client, auth_headers):
+    """H1: the Android purchase flow prints the no-real-money disclosure only when this field
+    says "test", so it has to arrive on the response that screen already reads -- before a plan
+    is offered, not at /checkout time when the key id first reaches the client."""
+    body = client.get("/subscriptions/status", headers=auth_headers).json()
+
+    # The autouse razorpay_keys fixture configures an rzp_test_ key id.
+    assert body["payment_mode"] == "test"
+
+
+def test_status_reports_live_mode_without_shipping_the_key_id(client, auth_headers, monkeypatch):
+    monkeypatch.setattr(settings, "razorpay_key_id", "rzp_live_distinctivesuffix")
+
+    body = client.get("/subscriptions/status", headers=auth_headers).json()
+
+    assert body["payment_mode"] == "live"
+    # The mode is public; the key id it was derived from has no business on this route.
+    assert "distinctivesuffix" not in json.dumps(body)
+
+
+def test_status_reports_unknown_mode_when_payments_are_not_configured(client, auth_headers, monkeypatch):
+    """An unconfigured deployment must read as unknown, not as test -- unknown is the only
+    answer that promises the student nothing about the charge."""
+    monkeypatch.setattr(settings, "razorpay_key_id", None)
+
+    body = client.get("/subscriptions/status", headers=auth_headers).json()
+
+    assert body["payment_mode"] == "unknown"
