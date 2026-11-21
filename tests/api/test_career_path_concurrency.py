@@ -33,7 +33,10 @@ from app.main import app
 from app.models.role import Role
 from app.models.role_skill_weight import RoleSkillWeight
 from tests import db_safety
-from tests.fixtures.career_path_helpers import RacingProvider
+from tests.fixtures.career_path_helpers import (  # noqa: F401 - pre_write_barrier is an autouse fixture
+    RacingProvider,
+    pre_write_barrier,
+)
 
 # Supplied by tests/db_safety.py, never read from the environment here: that module
 # refuses a target it cannot prove is disposable, and it does so at import time -- before

@@ -11,6 +11,8 @@ finished the "does this role already have a path?" lookup and none has begun its
 
 import threading
 
+import pytest
+
 from app.ai.provider import AIProvider
 from app.ai.schemas.career_path import (
     GeneratedCareerPathExplanations,
@@ -25,7 +27,8 @@ from app.services.career_path import ai_generation
 _active_barrier = None
 
 
-def _install_pre_write_barrier() -> None:
+@pytest.fixture(autouse=True)
+def pre_write_barrier():
     """Release racing threads at the last point before select_role() writes anything.
 
     That point used to be the skill-explanation AI call, so a barrier inside the provider was
@@ -35,9 +38,24 @@ def _install_pre_write_barrier() -> None:
     races would become lucky rather than guaranteed, with every test still passing. Hooking the
     call that replaced it keeps the guarantee exactly where it was.
 
-    A no-op until a RacingProvider is given a barrier, so importing this module changes nothing
-    for any other test.
+    A no-op until a RacingProvider is given a barrier, so a test that arms none behaves exactly
+    as if this were not here.
+
+    **Why this is a fixture and not an import-time call.** It used to be the latter, and the
+    patch was therefore permanent for the whole pytest process while `_active_barrier` -- a
+    module global -- was only ever reset by the side effect of constructing a RacingProvider
+    without a barrier. The last test in tests/unit/test_career_path_uniqueness_concurrency.py
+    arms a 2-party barrier and nothing reset it, so every later call through this wrapper
+    anywhere in the suite waited the full 30s and then raised BrokenBarrierError: 16
+    career-path tests in tests/api failed purely on run order, and passed when run alone. As a
+    fixture the patch lasts one test and both the original function and the global are put back,
+    so no test can be contaminated by another.
+
+    Autouse, and imported into each racing module rather than placed in a conftest: pytest
+    registers fixtures found in a test module's namespace, so `autouse` applies to exactly the
+    two modules that import it and to nothing else in the suite.
     """
+    global _active_barrier
     original = ai_generation.template_skill_explanations
 
     def wrapper(role_name, items):
@@ -46,10 +64,17 @@ def _install_pre_write_barrier() -> None:
             _active_barrier.wait(timeout=30)
         return result
 
+    # Lets a guard test prove the hook is actually installed. Without that, a fixture that
+    # silently failed to apply would turn these races back into luck with every test still
+    # green -- the exact failure this module's own docstring warns about.
+    wrapper.is_pre_write_barrier = True
+
     ai_generation.template_skill_explanations = wrapper
-
-
-_install_pre_write_barrier()
+    try:
+        yield
+    finally:
+        ai_generation.template_skill_explanations = original
+        _active_barrier = None
 
 
 class RacingProvider(AIProvider):
