@@ -73,6 +73,20 @@ jobs:
       - name: Dependency vulnerability scan (pip-audit)
         run: pip-audit -r requirements.txt -r requirements-dev.txt
 
+      # pyttsx3 picks the platform default driver, which on Linux is eSpeak loaded through
+      # ctypes -- so the espeak-ng OS package is a hard requirement that requirements.txt
+      # cannot express. Without it tests/unit/test_tts_linux_contract.py fails with "the
+      # local text-to-speech driver could not be initialised", which is exactly what run
+      # 44942286471 reported the first time that test ever ran on Linux. That test is the
+      # only thing that can show server-side TTS works on a deployment host, so the package
+      # is installed rather than the test skipped. No audio device is involved: the contract
+      # synthesises with save_to_file and reads the WAV back. Deployment hosts using this
+      # TTS path need the same package -- see README, "Server-side TTS (eSpeak on Linux)".
+      - name: Install espeak-ng (required by the Linux TTS contract)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends espeak-ng
+
       # No external services needed: tests/conftest.py spins up an in-memory SQLite database
       # per test, so this doesn't need Postgres, S3, SMTP, or any API key configured.
       - name: Run tests
