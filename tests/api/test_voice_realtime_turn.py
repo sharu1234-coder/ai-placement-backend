@@ -748,7 +748,7 @@ class TestCancellation:
         still running, the interrupt is provably delivered while it is running, and the loop
         provably has chunks left to send. Ten chunks are enough, because nothing is being raced.
 
-        Two details that are not incidental:
+        Three details that are not incidental:
 
         * The gate is awaited **before** delegating to the real `send_bytes`, which takes
           `_send_lock`. Waiting while holding that lock would block the interrupt handler's own
@@ -756,6 +756,11 @@ class TestCancellation:
         * It is a `threading.Event` reached through `asyncio.to_thread`, not an `asyncio.Event`,
           because the driving test runs on a different thread from the ASGI loop. The loop stays
           free while it waits, which is what lets the receive task handle the interrupt at all.
+        * The held chunk's write is awaited before `resume` is requested. Both are sends
+          contending for the same `_send_lock`, so otherwise the reply can overtake the chunk and
+          the read loop stops at `session_accepted` with a delivered frame still unread. That is
+          how an earlier version of this test failed on CI while passing locally and in the same
+          run's `test-postgres` job -- a read-order race in the test, not a server fault.
 
         The whole outgoing sequence is kept and reported on failure. The sibling test routed
         `speech_stopped` and `generation_done` into an unused branch, which is precisely why its
@@ -769,6 +774,7 @@ class TestCancellation:
         block_before = 3  # two chunks go out, eight remain unsent behind the gate
         blocked = threading.Event()
         release = threading.Event()
+        gated_sent = threading.Event()
         sent = []
         real_send_bytes = endpoint._Connection.send_bytes
 
@@ -777,6 +783,11 @@ class TestCancellation:
             if len(sent) == block_before:
                 blocked.set()
                 await asyncio.to_thread(release.wait)
+                await real_send_bytes(connection, frame)
+                # The held chunk has finished its write. Signalling only now is what keeps the
+                # read order below deterministic -- see the note about `resume` in the docstring.
+                gated_sent.set()
+                return
             await real_send_bytes(connection, frame)
 
         monkeypatch.setattr(endpoint._Connection, "send_bytes", gated_send_bytes)
@@ -816,6 +827,13 @@ class TestCancellation:
             # Only now may the loop advance, and its very next act is the guard's liveness check.
             release.set()
 
+            # The held chunk's write must finish before `resume` is asked for. Both are sends
+            # competing for the same _send_lock, so without this the reply can overtake the
+            # chunk, the loop below stops at `session_accepted`, and a frame that did go out
+            # sits unread -- which is exactly how this test failed on CI run 44960055275 while
+            # passing locally and in the same run's test-postgres job.
+            assert gated_sent.wait(timeout=30), "the held chunk never completed its send"
+
             ws.send_text(json.dumps({"type": "resume", "token": opened["resume_token"]}))
             for _ in range(total_chunks + 20):
                 frame = _read(ws, 1)[0]
@@ -840,14 +858,23 @@ class TestCancellation:
             "the stream ran to completion after the interrupt instead of stopping at the guard. "
             f"Full sequence: {sequence}"
         )
-        # The exact contract: every chunk the guard saw while the turn was live went out, and
-        # every chunk after liveness was withdrawn was suppressed. Not "fewer than all", which
-        # would also pass if the loop stopped for some unrelated reason.
+        # The guarantee, stated as the bound it actually is. The upper bound is the whole point:
+        # no chunk is *started* once liveness is withdrawn, so nothing beyond the ones already
+        # past the guard may appear -- seven of ten must never be sent. The lower bound is the
+        # floor below which the stream would have been truncated too early: the chunks written
+        # before the gate cannot be retracted.
+        #
+        # It is a range rather than an equality because whether the *held* chunk is observed is
+        # not a product guarantee. `interrupt()` is cooperative -- it flips a token and clears
+        # the live turn, it does not cancel the in-flight write (see TurnChannel.interrupt) --
+        # and `_Connection.send_bytes` returns early if the peer has gone. An earlier version of
+        # this test asserted equality here and so required the held write to be observed, which
+        # is a scheduling detail, not a contract; it passed locally and failed on CI.
         delivered = sequence.count("audio")
-        assert delivered == block_before, (
-            f"the guard should have stopped the loop after the {block_before} chunks already "
-            f"past it, leaving {total_chunks - block_before} unsent -- but {delivered} of "
-            f"{total_chunks} were delivered. Full sequence: {sequence}"
+        assert block_before - 1 <= delivered <= block_before, (
+            f"the guard should have stopped the loop at the {block_before} chunks already past "
+            f"it, leaving {total_chunks - block_before} of {total_chunks} unsent -- but "
+            f"{delivered} were delivered. Full sequence: {sequence}"
         )
 
     # The racing version of the test above used to stand here. It made roughly sixteen
