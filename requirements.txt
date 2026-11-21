@@ -121,4 +121,4 @@ requests==2.34.2      # PYSEC-2026-2275
 h2==4.4.1             # PYSEC-2026-3628
 msgpack==1.2.4        # CVE-2026-114613
 click==8.5.0          # PYSEC-2026-2132
-filelock==3.32.5      # PYSEC-2026-1374/1375
+filelock==4.2.12      # CVE-2026-112907..112940 (12 advisories; fixes land in 4.0.9 and 4.2.1)
