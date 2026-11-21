@@ -52,7 +52,7 @@ psycopg2-binary==2.9.12
 # users' stored passwords keep working -- a bcrypt bump that got that wrong would lock
 # every account out of the app at once.
 bcrypt==5.0.0
-pyjwt==2.13.0  # bumped from 2.10.1 (PYSEC-2026-120/175/176/177/178/179, PYSEC-2025-183) --
+pyjwt==2.15.1  # bumped from 2.13.0 (PYSEC-2026-4140..4152 + 4183, GHSA-pxh4-856f-4h89) --
 # verified via the full suite (jwt.encode/decode exercised heavily by app/core/security.py,
 # app/api/deps.py, and every auth/password-reset test), no behavior change observed.
 PyMuPDF==1.24.14
@@ -115,10 +115,10 @@ firebase-admin==6.9.0
 # to a vulnerable release, and so `pip-audit` stays clean in CI. Re-check these whenever the
 # parent packages above are bumped -- if a parent starts requiring something older, that
 # conflict should surface loudly at install time rather than be silently downgraded.
-urllib3==2.7.0        # PYSEC-2026-141/1994/1996/1998/1999
+urllib3==2.8.0        # PYSEC-2026-4175/4176/4177 = CVE-2026-97687/97688/97689
 cryptography==50.0.1  # PYSEC-2026-35/1284/2141/3553/3554, GHSA-537c-gmf6-5ccf
 requests==2.34.2      # PYSEC-2026-2275
 h2==4.4.1             # PYSEC-2026-3628
-msgpack==1.2.2        # PYSEC-2026-3625
+msgpack==1.2.4        # CVE-2026-114613
 click==8.5.0          # PYSEC-2026-2132
 filelock==3.32.5      # PYSEC-2026-1374/1375
