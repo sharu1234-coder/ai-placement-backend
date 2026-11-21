@@ -17,11 +17,12 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from app.ai.provider import AICapabilityError
+from app.ai.provider import AICapability, AICapabilityError
 from app.api.actions import router as actions_router
 from app.api.arena import router as arena_router
 from app.api.assessments import router as assessments_router
 from app.api.auth import router as auth_router
+from app.api.capabilities import router as capabilities_router
 from app.api.career_decisions import router as career_decisions_router
 from app.api.career_goals import router as career_goals_router
 from app.api.career_path import router as career_path_router
@@ -168,6 +169,7 @@ app.include_router(recruiter_attack_router, dependencies=_app_check_dep)
 app.include_router(arena_router, dependencies=_app_check_dep)
 app.include_router(actions_router, dependencies=_app_check_dep)
 app.include_router(coach_router, dependencies=_app_check_dep)
+app.include_router(capabilities_router, dependencies=_app_check_dep)
 # NOT router-level here: subscriptions_router also owns POST /subscriptions/webhook, called
 # by Razorpay's own servers (never the Android app), which will never carry an
 # X-Firebase-AppCheck header -- see the per-route dependency on every other route in
@@ -295,10 +297,26 @@ async def ai_capability_exception_handler(request: Request, exc: AICapabilityErr
         exc.provider, exc.capability.value, exc.reason or "not declared",
         request.method, request.url.path, request_id,
     )
+    speech = exc.capability in (AICapability.TRANSCRIBE, AICapability.SYNTHESIZE)
     return JSONResponse(
         status_code=503,
         content={
-            "detail": "This feature is temporarily unavailable on the server.",
+            # Not "temporarily": this refusal is settled until the server is reconfigured, and
+            # the old wording invited the retry loop the client duly offered. The replacement
+            # still names no provider and no capability -- see the leak assertions in
+            # tests/api/test_voice_capability_gate.py -- and for speech it tells the student
+            # the one thing that actually helps, which is that typing works.
+            "detail": (
+                "Voice is not available on this server. You can type your answer instead."
+                if speech
+                else "This feature is not available on this server."
+            ),
+            # The machine-readable half. GET /capabilities/speech is how a client is meant to
+            # learn this *before* offering a voice control; this code is the backstop for a
+            # client that asked anyway, so it can avoid presenting a retry that cannot pass.
+            # A single code for both speech operations on purpose: naming which one is missing
+            # would leak the provider's shape to anyone who can trigger the failure.
+            "code": "speech_not_supported" if speech else "capability_not_supported",
             "request_id": request_id,
         },
     )
