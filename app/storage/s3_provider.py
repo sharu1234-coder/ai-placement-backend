@@ -28,6 +28,10 @@ class S3StorageProvider(StorageProvider):
         # verification time would compare today's configuration with itself.
         self.endpoint = settings.storage_s3_endpoint_url
         self.region = settings.storage_s3_region
+        # Sent as ExpectedBucketOwner on every call when configured, so the service refuses a
+        # request aimed at a bucket this account does not own instead of this process trying to
+        # detect that itself. None means no guard, which is the default and is supported.
+        self.expected_owner = settings.storage_s3_expected_bucket_owner
         self._client = boto3.client(
             "s3",
             endpoint_url=settings.storage_s3_endpoint_url,
@@ -39,9 +43,17 @@ class S3StorageProvider(StorageProvider):
     def identity(self) -> StorageIdentity:
         """Where this client points. The bucket is the part the provider name cannot carry:
         every S3-compatible vendor is `s3` here, so bucket and endpoint are what separate one
-        destination from another. No credential is included."""
+        destination from another. No credential is included.
+
+        `expected_owner` rides along as the owner guard this client would assert. It is not
+        part of the destination and does not take part in identity equality -- see
+        `StorageIdentity.expected_owner`."""
         return StorageIdentity(
-            provider=self.name, bucket=self.bucket, endpoint=self.endpoint, region=self.region
+            provider=self.name,
+            bucket=self.bucket,
+            endpoint=self.endpoint,
+            region=self.region,
+            expected_owner=self.expected_owner,
         )
 
     def save(self, key: str, data: bytes) -> str:

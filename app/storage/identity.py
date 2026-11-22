@@ -24,7 +24,7 @@ an operator's console must not be able to carry a secret. The fields here are th
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 #: Providers for which a bucket is part of the identity rather than optional. `local` stores on
@@ -49,6 +49,28 @@ class StorageIdentity:
     bucket: Optional[str] = None
     endpoint: Optional[str] = None
     region: Optional[str] = None
+    #: The account that must own the destination, or None when no owner guard is configured.
+    #:
+    #: `compare=False`, and that is the whole point of the field rather than an oversight, so
+    #: it is worth being exact about. The four fields above answer "where is this object"; this
+    #: one answers "who must own that place", which is an assertion carried alongside a
+    #: destination rather than part of it. Three consequences follow, all deliberate:
+    #:
+    #: * it is excluded from `revision`, so adding an owner guard does not re-fingerprint
+    #:   identities that were captured before it existed, and an operator's fingerprint
+    #:   groupings stay stable across the change;
+    #: * it is excluded from `==`, so a job captured before this field existed does not become
+    #:   a destination mismatch the moment the setting is introduced -- which would hold the
+    #:   entire queue for a configuration change that only added safety;
+    #: * and because `==` ignores it, the owner is compared explicitly and asymmetrically in
+    #:   `deletion_worker.identity_refusal` instead. That comparison is the weaker of the two
+    #:   guards in any case: the real enforcement is `ExpectedBucketOwner` on the wire, where
+    #:   S3 answers 403 rather than taking our word for it.
+    #:
+    #: An account id is not a credential -- it grants nothing -- but it does identify an
+    #: account, so it is kept out of logs and out of the operator report, which is why it is
+    #: absent from `describe()` as well as from `revision`.
+    expected_owner: Optional[str] = field(default=None, compare=False)
 
     @property
     def revision(self) -> str:
@@ -64,6 +86,11 @@ class StorageIdentity:
         It also serves as the marker that an identity was captured at all. A job whose stored
         revision is NULL predates identity capture, which is a different situation from a job
         whose identity does not match, and the worker treats the two separately.
+
+        The payload is the four location fields and deliberately not `expected_owner`: a
+        fingerprint that changed when an owner guard was added would re-label every job already
+        in the queue as belonging to a different configuration, which is exactly the signal an
+        operator relies on this to give truthfully.
         """
         payload = _SEP.join(
             (self.provider, self.bucket or "", self.endpoint or "", self.region or "")
@@ -109,5 +136,6 @@ class StorageIdentity:
                 bucket=settings.storage_s3_bucket,
                 endpoint=settings.storage_s3_endpoint_url,
                 region=settings.storage_s3_region,
+                expected_owner=settings.storage_s3_expected_bucket_owner,
             )
         return cls(provider=provider)

@@ -106,6 +106,10 @@ def enqueue(
                 storage_bucket=identity.bucket,
                 storage_endpoint=identity.endpoint,
                 storage_region=identity.region,
+                # The owner guard travels with the job so the worker can send it as
+                # ExpectedBucketOwner. NULL means no guard was configured at capture time,
+                # which is a supported state and not the same as unverified.
+                storage_expected_owner=identity.expected_owner,
                 storage_config_revision=identity.revision,
                 status="pending",
                 attempts=0,

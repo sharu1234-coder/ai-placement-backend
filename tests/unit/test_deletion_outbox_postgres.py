@@ -43,12 +43,12 @@ pytestmark = pytest.mark.skipif(
 # The fixture below builds its database "at head", so this has to move with the head. It was
 # f7b3c91de204, which stopped being the head when the storage-identity columns were added --
 # leaving every test here running against a deletion_jobs table the ORM no longer matches.
-_HEAD = "a3f47c21b8d5"
+_HEAD = "c5d81e0a9f36"
 # Unchanged on purpose. This is the downgrade target for the guard tests below, and it is the
 # outbox migration's own predecessor: downgrading to it must raise OutstandingObligations while
 # any request is unresolved. Moving it in step with _HEAD would retarget those tests at the
 # identity migration and stop exercising the guard they exist for. Downgrading from the new head
-# now passes through the identity migration's downgrade first, which exercises that on
+# now passes through both identity migrations' downgrades first, which exercises those on
 # PostgreSQL as well.
 _PREVIOUS = "d4a1c08f52e7"
 

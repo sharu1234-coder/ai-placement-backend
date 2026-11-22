@@ -79,11 +79,24 @@ IDENTITY_UNKNOWN = "StorageIdentityUnknown"
 IDENTITY_INCOMPLETE = "StorageIdentityIncomplete"
 IDENTITY_UNDETERMINABLE = "StorageIdentityUndeterminable"
 IDENTITY_MISMATCH = "StorageIdentityMismatch"
+#: The job recorded an owner guard and this worker is configured with a different one.
+IDENTITY_OWNER_MISMATCH = "StorageOwnerMismatch"
+#: The job recorded an owner guard and this worker has none, so it cannot assert it on the
+#: wire. Distinct from a mismatch because the fix is different: one is a wrong value, the
+#: other is a missing setting.
+IDENTITY_OWNER_UNCONFIRMED = "StorageOwnerUnconfirmed"
 
 #: The identity failures, for the operator report and for tests that assert none of them can
 #: reach storage.
 IDENTITY_FAILURES = frozenset(
-    {IDENTITY_UNKNOWN, IDENTITY_INCOMPLETE, IDENTITY_UNDETERMINABLE, IDENTITY_MISMATCH}
+    {
+        IDENTITY_UNKNOWN,
+        IDENTITY_INCOMPLETE,
+        IDENTITY_UNDETERMINABLE,
+        IDENTITY_MISMATCH,
+        IDENTITY_OWNER_MISMATCH,
+        IDENTITY_OWNER_UNCONFIRMED,
+    }
 )
 
 
@@ -101,6 +114,7 @@ def recorded_identity(job: DeletionJob) -> Optional[StorageIdentity]:
         bucket=job.storage_bucket,
         endpoint=job.storage_endpoint,
         region=job.storage_region,
+        expected_owner=job.storage_expected_owner,
     )
 
 
@@ -114,11 +128,23 @@ def identity_refusal(job: DeletionJob, storage: StorageProvider) -> Optional[str
       configuration is the silent-erasure path this exists to close;
     * identity recorded but incomplete, e.g. `s3` with no bucket;
     * the live provider cannot state where it points, so there is nothing to compare against;
-    * the two disagree.
+    * the two disagree;
+    * or the job recorded an owner guard that this worker cannot assert.
 
     None of these can be fixed by retrying, and none of them is a failure of the object -- they
     are facts about configuration, which is why they escalate immediately and why the job stays
     claimable rather than being marked done or failed.
+
+    The owner check is deliberately asymmetric, and the asymmetry is the part to review. A
+    recorded owner that this worker cannot honour is a refusal: the job was created on the
+    understanding that the destination would be proved to belong to that account, and dropping
+    that proof silently is how a bucket re-created under new ownership gets a delete it will
+    happily accept and ignore. A recorded NULL against a worker that now *has* a guard is not a
+    refusal: the guard only narrows what the worker will accept, the service enforces it on
+    every call, and holding the whole queue because an operator added a safety setting would
+    punish adding one. `StorageIdentity.expected_owner` is excluded from `==` for exactly this
+    reason -- the comparison belongs here, where the direction can be stated, rather than in a
+    dataclass equality that can only say "different".
     """
     recorded = recorded_identity(job)
     if recorded is None:
@@ -132,6 +158,13 @@ def identity_refusal(job: DeletionJob, storage: StorageProvider) -> Optional[str
         return IDENTITY_UNDETERMINABLE
     if recorded != live:
         return IDENTITY_MISMATCH
+    # Destination confirmed. The owner guard is compared separately because `==` above ignores
+    # it on purpose; see the docstring for why the two directions are not symmetric.
+    if recorded.expected_owner:
+        if not live.expected_owner:
+            return IDENTITY_OWNER_UNCONFIRMED
+        if recorded.expected_owner != live.expected_owner:
+            return IDENTITY_OWNER_MISMATCH
     return None
 
 

@@ -54,6 +54,14 @@ class DeletionJob(Base):
     storage_bucket: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     storage_endpoint: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     storage_region: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    # The account that had to own the destination when this job was created, or NULL when no
+    # owner guard was configured. Bucket, endpoint and region do not pin an account: a bucket
+    # name can be re-created under different ownership, and a multi-tenant S3-compatible
+    # endpoint can serve the same name to two tenants. The worker sends this as
+    # ExpectedBucketOwner, so the service refuses the request rather than this process having
+    # to detect the difference. An account id grants nothing, so this is not a credential --
+    # but it names an account, so it is never logged or reported.
+    storage_expected_owner: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     # A short non-secret fingerprint of the four fields above, so an operator can group jobs by
     # configuration without a bucket name or an endpoint reaching a log. Also the "identity was
     # captured" marker: NULL means this job predates identity capture.

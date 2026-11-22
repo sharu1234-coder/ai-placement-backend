@@ -135,6 +135,15 @@ class Settings(BaseSettings):
     storage_s3_endpoint_url: Optional[str] = None
     storage_s3_access_key_id: Optional[str] = None
     storage_s3_secret_access_key: Optional[str] = None
+    # The AWS account id that must own the bucket. Optional, and a safety guard rather than a
+    # credential: when it is set, every S3 call carries it as ExpectedBucketOwner and the
+    # service itself fails the request with 403 if the bucket is owned by anyone else. That
+    # matters for erasure specifically, because bucket name, endpoint and region do not pin an
+    # account -- a bucket deleted and re-created elsewhere, or a multi-tenant S3-compatible
+    # endpoint, can present the same name under different ownership, and a delete sent there
+    # would report success having erased nothing. Not a secret, but still kept out of logs and
+    # reports: it identifies an account.
+    storage_s3_expected_bucket_owner: Optional[str] = None
 
     # EMAIL_PROVIDER=console (dev default, logs the reset code instead of sending real
     # email) or "smtp" for production. SMTPEmailProvider speaks plain SMTP, so it works

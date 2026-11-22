@@ -287,6 +287,7 @@ class TestNothingUnverifiedIsEverErased:
                     storage_bucket=None,
                     storage_endpoint=None,
                     storage_region=None,
+                    storage_expected_owner=None,
                     storage_config_revision=None,
                 ),
                 Recording(identity=local),
@@ -297,6 +298,7 @@ class TestNothingUnverifiedIsEverErased:
                     storage_bucket=None,
                     storage_endpoint=None,
                     storage_region=None,
+                    storage_expected_owner=None,
                     storage_config_revision="r",
                 ),
                 Recording(identity=s3),
@@ -307,6 +309,7 @@ class TestNothingUnverifiedIsEverErased:
                     storage_bucket=None,
                     storage_endpoint=None,
                     storage_region=None,
+                    storage_expected_owner=None,
                     storage_config_revision="r",
                 ),
                 Mute(),
@@ -317,9 +320,37 @@ class TestNothingUnverifiedIsEverErased:
                     storage_bucket="b",
                     storage_endpoint=None,
                     storage_region=None,
+                    storage_expected_owner=None,
                     storage_config_revision="r",
                 ),
                 Recording(identity=StorageIdentity(provider="s3", bucket="elsewhere")),
+            ),
+            deletion_worker.IDENTITY_OWNER_MISMATCH: (
+                SimpleNamespace(
+                    storage_provider="s3",
+                    storage_bucket="b",
+                    storage_endpoint=None,
+                    storage_region=None,
+                    storage_expected_owner="111111111111",
+                    storage_config_revision="r",
+                ),
+                Recording(
+                    identity=StorageIdentity(
+                        provider="s3", bucket="b", expected_owner="222222222222"
+                    )
+                ),
+            ),
+            deletion_worker.IDENTITY_OWNER_UNCONFIRMED: (
+                SimpleNamespace(
+                    storage_provider="s3",
+                    storage_bucket="b",
+                    storage_endpoint=None,
+                    storage_region=None,
+                    storage_expected_owner="111111111111",
+                    storage_config_revision="r",
+                ),
+                # Same destination, but this worker has no owner guard to assert.
+                Recording(identity=StorageIdentity(provider="s3", bucket="b")),
             ),
         }
 
@@ -336,6 +367,7 @@ class TestNothingUnverifiedIsEverErased:
             storage_bucket="b",
             storage_endpoint="https://e",
             storage_region="r1",
+            storage_expected_owner=None,
             storage_config_revision="rev",
         )
         storage = Recording(
@@ -480,3 +512,132 @@ class TestTheOperatorReview:
         db_session.refresh(job)
 
         assert (job.status, job.attempts, job.locked_until, job.next_attempt_at) == before
+class TestTheBucketOwnerGuard:
+    """Bucket, endpoint and region do not pin an account, and the gap is not theoretical.
+
+    An S3 bucket name is globally unique only while the bucket exists: delete it and another
+    account may take the name. A multi-tenant S3-compatible endpoint can serve the same bucket
+    name to two tenants outright. In both cases all four location fields match, the delete is
+    accepted by a bucket nobody here owns, the key is absent, absence reads as idempotent
+    success -- and the job is marked done having erased nothing. `ExpectedBucketOwner` closes
+    it at the service, which answers 403 instead of taking this process's word for the
+    destination.
+    """
+
+    def test_the_owner_is_captured_with_the_destination(self, db_session, monkeypatch):
+        from app.core.config import settings
+
+        monkeypatch.setattr(settings, "storage_provider", "s3", raising=False)
+        monkeypatch.setattr(settings, "storage_s3_bucket", "talviora-prod", raising=False)
+        monkeypatch.setattr(
+            settings, "storage_s3_expected_bucket_owner", "111111111111", raising=False
+        )
+
+        identity = StorageIdentity.from_settings()
+
+        assert identity.expected_owner == "111111111111"
+
+    def test_the_owner_is_not_part_of_the_destination_fingerprint(self):
+        """Adding an owner guard must not re-label jobs already in the queue.
+
+        The fingerprint is what an operator groups held jobs by. If it moved when the setting
+        was introduced, every queued job would appear to belong to a configuration that no
+        longer exists, which is the one thing the report has to be able to say truthfully.
+        """
+        without = StorageIdentity(provider="s3", bucket="b", region="r1")
+        with_owner = StorageIdentity(
+            provider="s3", bucket="b", region="r1", expected_owner="111111111111"
+        )
+
+        assert with_owner.revision == without.revision
+        assert with_owner == without, "equality describes the destination, not the guard"
+        assert "111111111111" not in with_owner.describe()
+
+    def test_a_recorded_owner_this_worker_cannot_assert_is_refused(self):
+        """The job was created on the promise that ownership would be proved. Dropping the
+        proof silently is how a re-created bucket gets a delete it will accept and ignore."""
+        job = SimpleNamespace(
+            storage_provider="s3",
+            storage_bucket="b",
+            storage_endpoint=None,
+            storage_region=None,
+            storage_expected_owner="111111111111",
+            storage_config_revision="rev",
+        )
+        unguarded = Recording(identity=StorageIdentity(provider="s3", bucket="b"))
+
+        assert (
+            deletion_worker.identity_refusal(job, unguarded)
+            == deletion_worker.IDENTITY_OWNER_UNCONFIRMED
+        )
+
+    def test_a_different_owner_is_refused(self):
+        job = SimpleNamespace(
+            storage_provider="s3",
+            storage_bucket="b",
+            storage_endpoint=None,
+            storage_region=None,
+            storage_expected_owner="111111111111",
+            storage_config_revision="rev",
+        )
+        elsewhere = Recording(
+            identity=StorageIdentity(provider="s3", bucket="b", expected_owner="222222222222")
+        )
+
+        assert (
+            deletion_worker.identity_refusal(job, elsewhere)
+            == deletion_worker.IDENTITY_OWNER_MISMATCH
+        )
+
+    def test_adding_a_guard_does_not_freeze_jobs_that_predate_it(self):
+        """The asymmetry, asserted rather than described.
+
+        A job captured before the setting existed has no recorded owner. A worker that now has
+        one only narrows what it will accept, and the service enforces it on every call, so
+        holding the queue because an operator added a safety setting would punish adding one.
+        """
+        job = SimpleNamespace(
+            storage_provider="s3",
+            storage_bucket="b",
+            storage_endpoint=None,
+            storage_region=None,
+            storage_expected_owner=None,
+            storage_config_revision="rev",
+        )
+        guarded = Recording(
+            identity=StorageIdentity(provider="s3", bucket="b", expected_owner="111111111111")
+        )
+
+        assert deletion_worker.identity_refusal(job, guarded) is None
+
+    def test_an_owner_refusal_erases_nothing_and_does_not_complete(self, db_session):
+        job = _request_one_job(db_session)
+        job.storage_provider = "s3"
+        job.storage_bucket = "b"
+        job.storage_expected_owner = "111111111111"
+        job.storage_config_revision = "0123456789abcdef"
+        db_session.commit()
+
+        storage = Recording(
+            identity=StorageIdentity(provider="s3", bucket="b", expected_owner="222222222222")
+        )
+        deletion_worker.run_once(db_session, storage)
+        db_session.refresh(job)
+
+        assert storage.deleted == [], "nothing may be erased against an unproven owner"
+        assert job.status == "needs_attention"
+        assert job.completed_at is None
+        assert job.last_error_class == deletion_worker.IDENTITY_OWNER_MISMATCH
+
+    def test_the_operator_report_never_prints_the_account_id(self, db_session):
+        """An account id grants nothing, but it names an account, so it stays out of reports."""
+        job = _request_one_job(db_session)
+        job.storage_provider = "s3"
+        job.storage_bucket = "b"
+        job.storage_expected_owner = "999988887777"
+        job.storage_config_revision = "0123456789abcdef"
+        db_session.commit()
+
+        review = deletion_worker.review_identities(db_session)
+
+        assert "999988887777" not in repr(review)
