@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import datetime
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Sequence
 
 from sqlalchemy import select
@@ -587,3 +587,61 @@ def unresolved_obligations(db: Session) -> int:
         .filter(DeletionRequest.status.in_(UNRESOLVED_STATUSES))
         .count()
     )
+
+
+@dataclass
+class IdentityReview:
+    """What the queue looks like from a storage-identity point of view.
+
+    Counts, job ids and configuration fingerprints. No storage key, no bucket, no endpoint:
+    the same rule the rest of this module follows, so the report can be pasted into an
+    incident channel. The fingerprint is what makes that possible -- it groups jobs by the
+    configuration they were enqueued under without naming it.
+    """
+
+    unresolved_jobs: int = 0
+    #: Jobs whose identity was never captured. These predate identity capture and are held.
+    without_identity: list[int] = field(default_factory=list)
+    #: Jobs with an identity that is recorded but unusable, e.g. `s3` with no bucket.
+    incomplete_identity: list[int] = field(default_factory=list)
+    #: Unresolved jobs per configuration fingerprint, newest configuration not distinguished.
+    by_revision: dict[str, int] = field(default_factory=dict)
+    #: Job ids per `last_error_class`, for the ones currently flagged for a human.
+    held_by_reason: dict[str, list[int]] = field(default_factory=dict)
+
+    @property
+    def needs_operator(self) -> int:
+        """Jobs that cannot proceed without a configuration change."""
+        return len(self.without_identity) + len(self.incomplete_identity)
+
+
+def review_identities(db: Session) -> IdentityReview:
+    """Read-only survey of unresolved jobs and their recorded destinations.
+
+    **Deletes nothing, writes nothing and opens no storage connection.** It exists because the
+    fail-closed rule in `identity_refusal` is only humane if an operator can see what is being
+    held and why: a job created before identity capture will sit in `needs_attention` for ever
+    otherwise, and the queue would look broken rather than deliberately cautious.
+
+    Why not resolve the held jobs automatically. The only identity available to assign is the
+    one this process is configured with, and if that is wrong the object becomes unreachable
+    the moment the job is marked done -- the request closes and the last row holding the key is
+    deleted. An operator who can compare the fingerprints to their own deployment history can
+    make that call; this function cannot.
+    """
+    jobs: Sequence[DeletionJob] = (
+        db.query(DeletionJob).filter(DeletionJob.status.in_(UNRESOLVED_STATUSES)).all()
+    )
+    review = IdentityReview(unresolved_jobs=len(jobs))
+    for job in jobs:
+        identity = recorded_identity(job)
+        if identity is None:
+            review.without_identity.append(job.id)
+        else:
+            if not identity.is_complete:
+                review.incomplete_identity.append(job.id)
+            revision = job.storage_config_revision or "unrecorded"
+            review.by_revision[revision] = review.by_revision.get(revision, 0) + 1
+        if job.status == STATUS_NEEDS_ATTENTION and job.last_error_class:
+            review.held_by_reason.setdefault(job.last_error_class, []).append(job.id)
+    return review

@@ -194,3 +194,57 @@ guard on the migration refuses to remove the tables while any request is `pendin
 
 To roll back a worker *deployment*: stop the service, deploy the previous build, start it. The
 queue belongs to the database, not the process, so a worker version is not a stateful upgrade.
+
+## 12. A job held because its destination is unconfirmed
+
+The worker will not erase an object unless the destination recorded on the job matches the
+storage this worker holds. That check runs before the storage call is reachable, so a job whose
+destination cannot be confirmed produces no deletion at all. It is flagged `needs_attention`
+and stays claimable — it is still owed, and it resumes on its own once the configuration
+matches.
+
+Four reasons appear in `last_error_class`, and they are not interchangeable:
+
+| `last_error_class` | What it means | What fixes it |
+|---|---|---|
+| `StorageIdentityUnknown` | The job predates identity capture, so no destination was ever recorded | A decision by a human — see below |
+| `StorageIdentityIncomplete` | A destination was recorded but is unusable, e.g. `s3` with no bucket | Correct the configuration the job was created under |
+| `StorageIdentityUndeterminable` | This worker's storage provider cannot state where it points | A provider misconfiguration in *this* process |
+| `StorageIdentityMismatch` | The recorded destination and this worker's disagree | Point a worker at the storage the job was enqueued against |
+| `StorageError:NoSuchBucket` | The configured bucket does not exist | Correct the bucket, or point the worker at the right one |
+
+### Finding out what is held
+
+```
+python scripts/review_deletion_identity.py
+```
+
+Read-only: it deletes nothing, writes nothing, and opens no storage connection. It prints
+counts, job ids and a short fingerprint of each recorded destination. It deliberately prints no
+bucket, endpoint or storage key, so the output is safe to paste into an incident channel. More
+than one fingerprint means the queue holds jobs enqueued under different storage
+configurations, and a worker can only match one of them at a time.
+
+### Recovering a mismatch
+
+Point a worker at the storage the jobs were enqueued against and they drain by themselves. No
+row needs editing and nothing needs re-queueing; that is what keeping the job claimable is for.
+If two fingerprints both have real objects behind them, run a worker against each in turn.
+
+### Recovering a job with no recorded destination
+
+These are jobs created before identity capture existed. **Do not stamp the current
+configuration onto them**, and note that no tooling here offers to: the only value available is
+whatever this process is configured with, and if that is wrong the object becomes permanently
+unreachable the moment the job is marked done, because closing the request deletes the last row
+that held its key. An unrecoverable silent miss is strictly worse than a job that waits.
+
+The decision needs someone who can answer "which bucket was configured when this job was
+created", from deployment history, using the job's `created_at`. Once that is established,
+setting the identity columns on those specific rows is a deliberate, auditable act — do it
+narrowly, by job id, and run the review script again to confirm the result before letting a
+worker claim them.
+
+If the answer cannot be established, the honest position is that those objects cannot be
+confirmed erased. Say so rather than closing the requests; §11.2 of
+`docs/proposal-account-deletion-outbox.md` is where that is escalated.
