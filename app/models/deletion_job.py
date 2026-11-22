@@ -36,6 +36,28 @@ class DeletionJob(Base):
     # request and the erasure.
     storage_provider: Mapped[str] = mapped_column(String(20), nullable=False)
     storage_key: Mapped[str] = mapped_column(String(500), nullable=False)
+    # --- the rest of the storage identity ------------------------------------------------
+    # The provider name alone does not identify a destination. `S3StorageProvider` reads its
+    # bucket from configuration when it is constructed, so without these the worker erases
+    # from whatever bucket is configured *now* rather than the one the object was written to --
+    # and a key that is absent in the wrong bucket reads as an idempotent success, which marks
+    # the job done and destroys the last record of the key. AWS S3, Cloudflare R2, MinIO,
+    # Backblaze B2 and DigitalOcean Spaces are all `s3` here, so the provider name cannot tell
+    # them apart either. See app/storage/identity.py.
+    #
+    # Nullable, and deliberately not backfilled: a job created before these existed has no
+    # recorded destination, and inventing one from current configuration is exactly the
+    # silent-erasure path this closes. `storage_config_revision` being NULL is what marks such
+    # a job, and the worker holds it for an operator instead of acting on it.
+    #
+    # No credential is stored here. These say *where* an object is, never how to reach it.
+    storage_bucket: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    storage_endpoint: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    storage_region: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    # A short non-secret fingerprint of the four fields above, so an operator can group jobs by
+    # configuration without a bucket name or an endpoint reaching a log. Also the "identity was
+    # captured" marker: NULL means this job predates identity capture.
+    storage_config_revision: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default=STATUS_PENDING)
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     # When the job becomes claimable again. Set on creation so the first claim needs no special
