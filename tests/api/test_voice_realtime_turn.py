@@ -845,7 +845,18 @@ class TestCancellation:
         after = sequence[cancelled_at + 1 :]
         trailing = after.count("audio")
 
-        # Exactly one chunk may follow `generation_cancelled`, and it is not a leak: the guard
+        # Which chunk the gate held, proved from the capture rather than assumed from the setup.
+        # Exactly the chunks ahead of the held one arrived before the cancellation, so the held
+        # chunk -- the third -- is the only write that can have been in flight when the interrupt
+        # landed, and therefore the only one the bound further down may let through.
+        before = sequence[:cancelled_at].count("audio")
+        assert before == block_before - 1, (
+            f"expected the {block_before - 1} chunks ahead of the gate to arrive before the "
+            f"cancellation, saw {before}; the gate did not hold the chunk this test thinks it "
+            f"did, so the in-flight allowance below would be unfounded. Full sequence: {sequence}"
+        )
+
+        # At most one chunk may follow `generation_cancelled`, and it is not a leak: the guard
         # runs *before* each send, so the chunk already handed to the transport when the
         # interrupt landed cannot be recalled. What the guard promises is that no further chunk
         # is ever *started*. Here that in-flight chunk is the one held at the gate, which is why
@@ -876,6 +887,16 @@ class TestCancellation:
             f"it, leaving {total_chunks - block_before} of {total_chunks} unsent -- but "
             f"{delivered} were delivered. Full sequence: {sequence}"
         )
+
+        # The permitted shapes in full, which is the clearest statement of the contract: the two
+        # chunks ahead of the gate, the cancellation, then at most the held chunk, then the
+        # resume reply. Both variants are listed because whether the held write is observed is a
+        # scheduling outcome -- neither is preferred and neither indicates a fault. Any other
+        # shape is a protocol change and should be read here rather than inferred from a count.
+        assert sequence in (
+            ["audio", "audio", "generation_cancelled", "audio", "session_accepted"],
+            ["audio", "audio", "generation_cancelled", "session_accepted"],
+        ), f"unexpected frame sequence for a mid-stream interrupt: {sequence}"
 
     # The racing version of the test above used to stand here. It made roughly sixteen
     # thousand tiny chunks and relied on the receive task being scheduled somewhere among
