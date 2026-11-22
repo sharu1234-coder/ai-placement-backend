@@ -438,6 +438,10 @@ class TestAMissingBucketIsNotAnErasure:
 
         provider = S3StorageProvider.__new__(S3StorageProvider)
         provider.bucket = "talviora-resumes"
+        # No owner guard, stated rather than left unset: `_guard()` has no
+        # getattr default, so a provider that forgot this would send no
+        # ExpectedBucketOwner and nothing would notice.
+        provider.expected_owner = None
         provider._client = MagicMock()
         provider._client.delete_object.side_effect = ClientError(
             {"Error": {"Code": "NoSuchBucket", "Message": "nope"}}, "DeleteObject"
@@ -454,6 +458,10 @@ class TestAMissingBucketIsNotAnErasure:
 
         provider = S3StorageProvider.__new__(S3StorageProvider)
         provider.bucket = "talviora-resumes"
+        # No owner guard, stated rather than left unset: `_guard()` has no
+        # getattr default, so a provider that forgot this would send no
+        # ExpectedBucketOwner and nothing would notice.
+        provider.expected_owner = None
         provider._client = MagicMock()
         provider._client.delete_object.side_effect = ClientError(
             {"Error": {"Code": "NoSuchKey", "Message": "gone"}}, "DeleteObject"

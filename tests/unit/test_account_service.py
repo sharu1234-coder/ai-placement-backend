@@ -887,6 +887,10 @@ class TestStorageAdaptersReportFailure:
 
         provider = S3StorageProvider.__new__(S3StorageProvider)
         provider.bucket = "b"
+        # No owner guard, stated rather than left unset: `_guard()` has no
+        # getattr default, so a provider that forgot this would send no
+        # ExpectedBucketOwner and nothing would notice.
+        provider.expected_owner = None
 
         class Client:
             def delete_object(self, **_):
@@ -902,6 +906,10 @@ class TestStorageAdaptersReportFailure:
 
         provider = S3StorageProvider.__new__(S3StorageProvider)
         provider.bucket = "b"
+        # No owner guard, stated rather than left unset: `_guard()` has no
+        # getattr default, so a provider that forgot this would send no
+        # ExpectedBucketOwner and nothing would notice.
+        provider.expected_owner = None
 
         class Client:
             def delete_object(self, **_):
@@ -918,6 +926,10 @@ class TestStorageAdaptersReportFailure:
 
         provider = S3StorageProvider.__new__(S3StorageProvider)
         provider.bucket = "b"
+        # No owner guard, stated rather than left unset: `_guard()` has no
+        # getattr default, so a provider that forgot this would send no
+        # ExpectedBucketOwner and nothing would notice.
+        provider.expected_owner = None
 
         class Client:
             def delete_object(self, **_):
