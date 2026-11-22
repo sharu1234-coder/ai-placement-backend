@@ -47,10 +47,11 @@ VERSIONING_NONE = "unversioned"
 #: Absence was established by enumerating the key version history. This is the normal case and
 #: the only one that can speak for a versioned bucket.
 VERIFIED_BY_INVENTORY = "inventory"
-#: Absence was established by a 404 from HeadObject, which is sound *only* because
-#: GetBucketVersioning said this bucket has never been versioned, so no history can exist to
-#: be missed. Recorded separately so this weaker evidence can never be mistaken for the above.
-VERIFIED_BY_HEAD_UNVERSIONED = "head-after-service-confirmed-unversioned"
+#: Absence was established by the object simply not being there -- a 404 from HeadObject, or a
+#: missing file on disk. Sound *only* where no version history can exist to be missed: a
+#: filesystem, or a bucket the service itself reported as never having been versioned. Recorded
+#: separately so this weaker evidence can never be read as the enumeration above.
+VERIFIED_BY_ABSENCE_WITHOUT_HISTORY = "absence-where-no-history-can-exist"
 
 # --- failure codes, carried on StorageError.code -------------------------------------------
 # These sit alongside the backend own codes (AccessDenied, SlowDown, NoSuchBucket) in the same

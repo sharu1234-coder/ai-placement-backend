@@ -2,6 +2,12 @@ import errno
 from pathlib import Path
 
 from app.core.config import settings
+from app.storage.erasure import (
+    ERASURE_VERSIONS_REMAIN,
+    VERIFIED_BY_ABSENCE_WITHOUT_HISTORY,
+    VERSIONING_NONE,
+    ErasureOutcome,
+)
 from app.storage.provider import StorageError, StorageProvider
 
 
@@ -33,6 +39,34 @@ class LocalStorageProvider(StorageProvider):
                 # adapter gets from an error code, and equally free of the path.
                 code=errno.errorcode.get(exc.errno) if exc.errno else None,
             ) from exc
+
+    def erase(self, key: str) -> ErasureOutcome:
+        """Delete the file and confirm it is gone.
+
+        A filesystem keeps no version history, so unlinking a file is already permanent and
+        there is nothing to enumerate. That makes the file simply not being there sufficient
+        evidence here -- which it never is on a versioned bucket, and the outcome says which of
+        the two kinds of evidence was used rather than letting them look alike.
+
+        The existence check before the delete is what makes the count honest and distinguishes
+        "erased" from "was never there", which is the normal result of a retry.
+        """
+        path = Path(settings.upload_dir) / key
+        existed = path.exists()
+        self.delete(key)
+        if path.exists():
+            # unlink() returned without error and the file is still readable -- a replica, a
+            # race, or a mount that silently discards deletes. Never reported as an erasure.
+            raise StorageError(
+                f"'{key}' is still present after being deleted from local storage",
+                code=ERASURE_VERSIONS_REMAIN,
+            )
+        return ErasureOutcome(
+            versioning=VERSIONING_NONE,
+            verified_by=VERIFIED_BY_ABSENCE_WITHOUT_HISTORY,
+            versions_deleted=1 if existed else 0,
+            already_absent=not existed,
+        )
 
     def load(self, key: str) -> bytes:
         path = Path(settings.upload_dir) / key

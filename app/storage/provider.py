@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 from typing import ClassVar, Optional
 
+from app.storage.erasure import ERASURE_NOT_IMPLEMENTED, ErasureOutcome
 from app.storage.identity import StorageIdentity
 
 
@@ -76,6 +77,39 @@ class StorageProvider(ABC):
         say so, so that the decision is visible at the call site instead of buried in an
         adapter.
         """
+
+    def erase(self, key: str) -> ErasureOutcome:
+        """Remove the object **and its entire version history**, and prove that nothing is left.
+
+        Separate from `delete` because the two make genuinely different promises, and account
+        deletion needs the stronger one. `delete` promises the object is no longer the current
+        object; on a versioned bucket that is satisfied by inserting a delete marker, which
+        erases nothing. This promises that no version and no delete marker remains under the
+        key, established by enumerating what is stored rather than by asking whether the object
+        can still be fetched -- a 404 arrives as soon as a marker exists, which is precisely the
+        state in which the data is all still there.
+
+        Returns an `ErasureOutcome` only when that has been verified. Anything else raises
+        `StorageError`, so a caller cannot mistake an unfinished erasure for a finished one by
+        ignoring a return value.
+
+        Idempotent, and that is load-bearing rather than a courtesy: the worker retries after a
+        crash or a partial failure, so "nothing was there" is a success. It must also not
+        accumulate state on repetition -- a version-less delete repeated on a versioned bucket
+        adds another delete marker each time, which this must never do.
+
+        The default refuses. It is concrete rather than abstract, following `identity()` above:
+        an adapter that has not implemented version-aware erasure gets a job held for an
+        operator instead of a plain delete that would silently leave the data in place, and a
+        test double written for some unrelated path does not have to implement this to exist.
+        `tests/unit/test_storage.py` asserts that every concrete adapter in `app/storage/`
+        overrides it, so the leniency cannot reach production.
+        """
+        raise StorageError(
+            f"Storage provider {type(self).__name__} cannot erase an object version history, "
+            "so it cannot prove that an object has been erased",
+            code=ERASURE_NOT_IMPLEMENTED,
+        )
 
     @abstractmethod
     def load(self, key: str) -> bytes:
