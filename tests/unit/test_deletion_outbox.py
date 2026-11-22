@@ -42,6 +42,12 @@ class FakeStorage(StorageProvider):
     object as done, and tests/unit/test_account_service.py already pins that.
     """
 
+    # Declared because both real adapters declare it, and because the worker now verifies a
+    # job's recorded storage identity before it will erase anything. A double that cannot say
+    # where it points is refused -- which is the intended behaviour, not an obstacle -- so the
+    # double has to model the contract. `local` matches the provider these tests run under.
+    name = "local"
+
     def __init__(self, fail_times: int = 0, error: Exception | None = None) -> None:
         self.deleted: list[str] = []
         self.fail_times = fail_times

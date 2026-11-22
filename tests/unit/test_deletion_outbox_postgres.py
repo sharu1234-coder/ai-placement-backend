@@ -405,6 +405,17 @@ class SelectiveStorage:
     was previously covered only on SQLite.
     """
 
+    # The worker verifies a job's recorded storage identity before erasing, and refuses a
+    # provider that cannot state where it points. This is a plain class rather than a
+    # StorageProvider subclass, so it supplies both halves explicitly; `local` is the provider
+    # these tests run under.
+    name = "local"
+
+    def identity(self):
+        from app.storage.identity import StorageIdentity
+
+        return StorageIdentity(provider=self.name)
+
     def __init__(self, failing=()):
         self.failing = set(failing)
         self.deleted: list[str] = []

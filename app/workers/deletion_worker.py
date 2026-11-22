@@ -40,6 +40,7 @@ from app.models.deletion_job import (
 )
 from app.models.deletion_request import UNRESOLVED_STATUSES, DeletionRequest
 from app.models.user import User
+from app.storage.identity import StorageIdentity
 from app.storage.provider import StorageError, StorageProvider
 
 logger = logging.getLogger(__name__)
@@ -63,6 +64,75 @@ BACKOFF_BASE = datetime.timedelta(seconds=30)
 BACKOFF_CAP = datetime.timedelta(minutes=30)
 # Attempts after which the job is *also* flagged for a human. Not a ceiling on retries.
 ATTENTION_AFTER_ATTEMPTS = 5
+
+#: Backend error codes that describe the *configuration*, not the object. These cannot clear by
+#: being retried -- no number of attempts conjures a bucket into existence -- so they are
+#: escalated on the first occurrence instead of after ATTENTION_AFTER_ATTEMPTS, exactly as a
+#: provider mismatch is. `NoSuchBucket` used to be treated as "already gone" by the S3 adapter,
+#: which turned a misconfigured or missing bucket into a completed erasure.
+CONFIGURATION_ERROR_CODES = frozenset({"NoSuchBucket"})
+
+#: Why a job may not proceed to a destructive call. Each is an explicit non-success state, never
+#: an idempotent success, and each stays claimable so it resumes once an operator fixes the
+#: cause.
+IDENTITY_UNKNOWN = "StorageIdentityUnknown"
+IDENTITY_INCOMPLETE = "StorageIdentityIncomplete"
+IDENTITY_UNDETERMINABLE = "StorageIdentityUndeterminable"
+IDENTITY_MISMATCH = "StorageIdentityMismatch"
+
+#: The identity failures, for the operator report and for tests that assert none of them can
+#: reach storage.
+IDENTITY_FAILURES = frozenset(
+    {IDENTITY_UNKNOWN, IDENTITY_INCOMPLETE, IDENTITY_UNDETERMINABLE, IDENTITY_MISMATCH}
+)
+
+
+def recorded_identity(job: DeletionJob) -> Optional[StorageIdentity]:
+    """The destination this job was enqueued against, or None if it was never captured.
+
+    `storage_config_revision` is the marker rather than the bucket: a job whose provider is
+    `local` has no bucket either way, so without the revision there is no way to tell a job
+    created before identity capture from one created after it.
+    """
+    if not job.storage_config_revision:
+        return None
+    return StorageIdentity(
+        provider=job.storage_provider,
+        bucket=job.storage_bucket,
+        endpoint=job.storage_endpoint,
+        region=job.storage_region,
+    )
+
+
+def identity_refusal(job: DeletionJob, storage: StorageProvider) -> Optional[str]:
+    """Why this job must not be erased, or None when its destination is verified.
+
+    Fail-closed in every branch. The question is not "can I find a reason to refuse" but "has
+    the destination been positively confirmed", and anything short of that is a refusal:
+
+    * no identity recorded -- the job predates capture, and binding it to current
+      configuration is the silent-erasure path this exists to close;
+    * identity recorded but incomplete, e.g. `s3` with no bucket;
+    * the live provider cannot state where it points, so there is nothing to compare against;
+    * the two disagree.
+
+    None of these can be fixed by retrying, and none of them is a failure of the object -- they
+    are facts about configuration, which is why they escalate immediately and why the job stays
+    claimable rather than being marked done or failed.
+    """
+    recorded = recorded_identity(job)
+    if recorded is None:
+        return IDENTITY_UNKNOWN
+    if not recorded.is_complete:
+        return IDENTITY_INCOMPLETE
+
+    reader = getattr(storage, "identity", None)
+    live = reader() if callable(reader) else None
+    if live is None:
+        return IDENTITY_UNDETERMINABLE
+    if recorded != live:
+        return IDENTITY_MISMATCH
+    return None
 
 
 def _now() -> datetime.datetime:
@@ -153,6 +223,26 @@ def claim_batch(db: Session, *, limit: int = 10, now: Optional[datetime.datetime
     return claimed
 
 
+def _hold_for_operator(
+    job: DeletionJob, *, error_class: str, moment: datetime.datetime
+) -> str:
+    """Record an explicit non-success and leave the job claimable.
+
+    Deliberately not a terminal state. `needs_attention` means "still owed, and a human should
+    look"; a `failed` status would convert an unfinished erasure into an abandoned one, which
+    is what the outbox design forbids. The job keeps its backoff so a misconfigured worker does
+    not spin, and it resumes by itself once the cause is fixed -- no operator action is needed
+    beyond repairing the configuration.
+    """
+    job.attempts = (job.attempts or 0) + 1
+    job.last_error_class = error_class
+    job.next_attempt_at = moment + backoff_for(job.attempts)
+    job.locked_until = None
+    job.status = STATUS_NEEDS_ATTENTION
+    job.updated_at = moment
+    return STATUS_NEEDS_ATTENTION
+
+
 def execute_job(db: Session, job: DeletionJob, storage: StorageProvider) -> str:
     """Erase one object. Returns "deleted", "retry" or "needs_attention".
 
@@ -196,6 +286,26 @@ def execute_job(db: Session, job: DeletionJob, storage: StorageProvider) -> str:
         )
         return STATUS_NEEDS_ATTENTION
 
+    # The destination, not just the backend. The check above compares provider names, and that
+    # is not enough: every S3-compatible vendor is `s3` here, and the bucket is read from
+    # configuration when the provider is constructed. So a bucket changed after this job was
+    # enqueued sends the delete at the wrong destination, where the key is absent, where
+    # absence reads as idempotent success -- and the job is marked done having erased nothing.
+    #
+    # This runs before `storage.delete` is reachable at all, which is the property that
+    # matters: an unverified destination cannot produce a destructive call and cannot produce a
+    # `done`.
+    refusal = identity_refusal(job, storage)
+    if refusal is not None:
+        logger.error(
+            "Deletion job %s was not erased: %s. The recorded destination could not be "
+            "confirmed against this worker's storage, so nothing was deleted. The job stays "
+            "queued and resumes once the configuration matches what it was enqueued against.",
+            job.id,
+            refusal,
+        )
+        return _hold_for_operator(job, error_class=refusal, moment=moment)
+
     job.attempts = (job.attempts or 0) + 1
     try:
         storage.delete(job.storage_key)
@@ -208,6 +318,23 @@ def execute_job(db: Session, job: DeletionJob, storage: StorageProvider) -> str:
         job.last_error_class = f"{type(exc).__name__}:{code}" if code else type(exc).__name__
         job.next_attempt_at = moment + backoff_for(job.attempts)
         job.locked_until = None
+        if code in CONFIGURATION_ERROR_CODES:
+            # A missing bucket is a fault in the configuration, not in the object, and no
+            # number of attempts will create one -- so it is escalated on the first
+            # occurrence rather than after ATTENTION_AFTER_ATTEMPTS, the same treatment a
+            # provider mismatch gets. The S3 adapter used to count NoSuchBucket as "already
+            # gone", which reported a completed erasure against a bucket that does not exist.
+            # `attempts` is not incremented here: it was already incremented before the call.
+            job.status = STATUS_NEEDS_ATTENTION
+            job.updated_at = moment
+            logger.error(
+                "Deletion job %s could not reach its destination (%s); nothing was deleted. "
+                "This is a configuration fault and will not clear by retrying. The job stays "
+                "queued.",
+                job.id,
+                job.last_error_class,
+            )
+            return STATUS_NEEDS_ATTENTION
         if job.attempts >= ATTENTION_AFTER_ATTEMPTS:
             job.status = STATUS_NEEDS_ATTENTION
             job.updated_at = moment

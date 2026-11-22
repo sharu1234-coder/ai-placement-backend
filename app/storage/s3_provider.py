@@ -51,10 +51,18 @@ class S3StorageProvider(StorageProvider):
             raise StorageError(f"Failed to upload '{key}' to S3-compatible storage: {exc}") from exc
         return key
 
-    #: Error codes that mean "it is not there", which is the success case for an idempotent
-    #: delete. S3 itself returns 204 for a missing key, but S3-compatible implementations are
-    #: not consistent about that, so the codes are handled explicitly.
-    _ALREADY_GONE = frozenset({"NoSuchKey", "NoSuchBucket", "404", "NotFound"})
+    #: Error codes that mean "the object is not there", which is the success case for an
+    #: idempotent delete. S3 itself returns 204 for a missing key, but S3-compatible
+    #: implementations are not consistent about that, so the codes are handled explicitly.
+    #:
+    #: `NoSuchBucket` was here and has been removed, which is a behaviour change worth stating.
+    #: A missing bucket says nothing whatsoever about the object: it says this process is
+    #: pointed somewhere that does not exist. Counting it as an idempotent success meant a
+    #: mistyped or decommissioned bucket produced a completed erasure for every queued job,
+    #: and -- because closing a deletion request deletes the last row holding the key -- left
+    #: no record that anything had been missed. It now raises, and the worker treats it as a
+    #: configuration fault that needs a human rather than something to retry.
+    _ALREADY_GONE = frozenset({"NoSuchKey", "404", "NotFound"})
 
     def delete(self, key: str) -> None:
         try:

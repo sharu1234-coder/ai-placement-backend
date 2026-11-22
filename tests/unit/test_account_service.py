@@ -69,6 +69,11 @@ class RecordingStorage(StorageProvider):
     """Records delete() calls instead of touching real storage -- lets tests assert the
     right keys were targeted without needing a filesystem or S3 backend."""
 
+    # Both real adapters declare this, and the deletion worker now verifies a job's recorded
+    # storage identity before erasing anything: a provider that cannot say where it points is
+    # refused, by design. `local` is the provider these tests run under.
+    name = "local"
+
     def __init__(self):
         self.deleted_keys = []
 
