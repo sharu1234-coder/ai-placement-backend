@@ -25,6 +25,7 @@ from app.core.config import settings
 from app.models.deletion_job import DeletionJob
 from app.models.deletion_request import DeletionRequest
 from app.models.user import User
+from app.storage.identity import StorageIdentity
 from app.storage.provider import StorageError
 from app.workers import deletion_worker
 from tests import db_safety
@@ -39,7 +40,16 @@ pytestmark = pytest.mark.skipif(
     "credentials are never probed for",
 )
 
-_HEAD = "f7b3c91de204"
+# The fixture below builds its database "at head", so this has to move with the head. It was
+# f7b3c91de204, which stopped being the head when the storage-identity columns were added --
+# leaving every test here running against a deletion_jobs table the ORM no longer matches.
+_HEAD = "a3f47c21b8d5"
+# Unchanged on purpose. This is the downgrade target for the guard tests below, and it is the
+# outbox migration's own predecessor: downgrading to it must raise OutstandingObligations while
+# any request is unresolved. Moving it in step with _HEAD would retarget those tests at the
+# identity migration and stop exercising the guard they exist for. Downgrading from the new head
+# now passes through the identity migration's downgrade first, which exercises that on
+# PostgreSQL as well.
 _PREVIOUS = "d4a1c08f52e7"
 
 
@@ -92,15 +102,25 @@ def _seed_request(session, *, keys=("resumes/7/cv.pdf",), user_email=None):
     session.add(request)
     session.flush()
     now = datetime.datetime.now(datetime.timezone.utc)
+    # Jobs these tests hand to the worker must carry a recorded destination, because the worker
+    # refuses to erase one that does not -- a job with no identity is held for an operator, by
+    # design. Built from StorageIdentity rather than by writing a literal revision, so these
+    # rows match what `deletion_outbox.enqueue` actually produces. `local` is what
+    # SelectiveStorage reports, so the two agree.
+    identity = StorageIdentity(provider="local")
     for key in keys:
         session.add(
             DeletionJob(
                 deletion_request_id=request.id,
-                storage_provider="local",
+                storage_provider=identity.provider,
                 storage_key=key,
                 status="pending",
                 attempts=0,
                 next_attempt_at=now - datetime.timedelta(seconds=1),
+                storage_bucket=identity.bucket,
+                storage_endpoint=identity.endpoint,
+                storage_region=identity.region,
+                storage_config_revision=identity.revision,
             )
         )
     session.commit()
@@ -373,8 +393,15 @@ class TestTheDowngradeOnRealPostgres:
 class TestAFullRunOnPostgres:
     def test_a_request_completes_and_the_user_row_goes(self, outbox_database):
         class Recording:
+            # Declares its destination because the worker verifies one before erasing; a
+            # provider that cannot say where it points is refused by design.
+            name = "local"
+
             def __init__(self):
                 self.deleted = []
+
+            def identity(self):
+                return StorageIdentity(provider=self.name)
 
             def delete(self, key):
                 self.deleted.append(key)
@@ -412,8 +439,6 @@ class SelectiveStorage:
     name = "local"
 
     def identity(self):
-        from app.storage.identity import StorageIdentity
-
         return StorageIdentity(provider=self.name)
 
     def __init__(self, failing=()):
