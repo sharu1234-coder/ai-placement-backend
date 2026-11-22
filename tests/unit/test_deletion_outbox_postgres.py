@@ -29,6 +29,7 @@ from app.storage.identity import StorageIdentity
 from app.storage.provider import StorageError
 from app.workers import deletion_worker
 from tests import db_safety
+from tests.storage_doubles import ErasesWithoutHistory
 
 # Validated at import rather than read from the environment: this module runs migrations and
 # creates databases.
@@ -392,7 +393,7 @@ class TestTheDowngradeOnRealPostgres:
 
 class TestAFullRunOnPostgres:
     def test_a_request_completes_and_the_user_row_goes(self, outbox_database):
-        class Recording:
+        class Recording(ErasesWithoutHistory):
             # Declares its destination because the worker verifies one before erasing; a
             # provider that cannot say where it points is refused by design.
             name = "local"
@@ -424,7 +425,7 @@ class TestAFullRunOnPostgres:
             engine.dispose()
 
 
-class SelectiveStorage:
+class SelectiveStorage(ErasesWithoutHistory):
     """Fails the keys it is told to fail, records the rest. Opens nothing.
 
     The storage provider is still a stand-in -- no real bucket is configured -- but the

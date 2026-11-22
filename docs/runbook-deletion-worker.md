@@ -203,7 +203,7 @@ destination cannot be confirmed produces no deletion at all. It is flagged `need
 and stays claimable — it is still owed, and it resumes on its own once the configuration
 matches.
 
-Four reasons appear in `last_error_class`, and they are not interchangeable:
+Six reasons appear in `last_error_class`, and they are not interchangeable:
 
 | `last_error_class` | What it means | What fixes it |
 |---|---|---|
@@ -211,6 +211,8 @@ Four reasons appear in `last_error_class`, and they are not interchangeable:
 | `StorageIdentityIncomplete` | A destination was recorded but is unusable, e.g. `s3` with no bucket | Correct the configuration the job was created under |
 | `StorageIdentityUndeterminable` | This worker's storage provider cannot state where it points | A provider misconfiguration in *this* process |
 | `StorageIdentityMismatch` | The recorded destination and this worker's disagree | Point a worker at the storage the job was enqueued against |
+| `StorageOwnerMismatch` | The job recorded an expected bucket owner and this worker is configured with a different one | Correct `STORAGE_S3_EXPECTED_BUCKET_OWNER`, or run a worker configured for the account the job was created under |
+| `StorageOwnerUnconfirmed` | The job recorded an expected bucket owner and this worker has none, so it cannot assert ownership on the wire | Set `STORAGE_S3_EXPECTED_BUCKET_OWNER` on this worker |
 | `StorageError:NoSuchBucket` | The configured bucket does not exist | Correct the bucket, or point the worker at the right one |
 
 ### Finding out what is held
@@ -248,3 +250,86 @@ worker claim them.
 If the answer cannot be established, the honest position is that those objects cannot be
 confirmed erased. Say so rather than closing the requests; §11.2 of
 `docs/proposal-account-deletion-outbox.md` is where that is escalated.
+
+## 13. A job held because the erasure could not be proved
+
+A job reaches `done` only from a **verified** erasure: the worker deletes every object version
+and every delete marker by explicit version id, then enumerates the key version history again
+and requires it to come back empty. Anything short of that leaves the job unresolved and
+claimable.
+
+Why the check is an enumeration and not a 404. On a versioned bucket a delete without a version
+id does not erase anything — AWS: "When versioning is enabled, a simple DELETE cannot
+permanently delete an object. ... Instead, Amazon S3 inserts a delete marker". From that moment
+HEAD and GET answer 404 while every byte is still stored. So a 404 is the symptom of the
+failure, not evidence of success, and it is never used as evidence here. The single exception
+is a bucket `GetBucketVersioning` reports as never having been versioned, where no history can
+exist to be missed; the worker log line for a completed job says which kind of evidence was
+used (`absence-where-no-history-can-exist` or `inventory`).
+
+### Reasons that need a person on the first attempt
+
+| `last_error_class` | What it means | What fixes it |
+|---|---|---|
+| `StorageError:ObjectLockActive` | A version is under an Object Lock retention that has not expired | Nothing, until it expires. **Do not** grant `s3:BypassGovernanceRetention` to work around it |
+| `StorageError:LegalHoldActive` | A version is under a legal hold | The hold has to be released by whoever placed it, through the process that placed it |
+| `StorageError:VersioningStateUnknown` | The bucket reported a versioning status this code does not recognise | Establish what the bucket's versioning actually is; the worker refuses to guess what a delete would mean |
+| `StorageError:InventoryUnsupported` | The storage will not enumerate object versions, so no erasure can be proved against it | A vendor decision. Either the bucket is unversioned (and the service must say so), or this storage cannot be used for data subject to erasure |
+| `StorageError:ErasureNotImplemented` | The configured provider has no version-aware erasure | A code fix in the adapter. The worker deliberately does not fall back to a plain delete |
+| `StorageError:AccessDenied` | The request was refused. With an owner guard configured this is also what an owner mismatch looks like — the service answers 403 | Grant `s3:DeleteObjectVersion` and `s3:ListBucketVersions`, or correct `STORAGE_S3_EXPECTED_BUCKET_OWNER`. Check the worker log line for which call was refused |
+| `StorageError:AllAccessDisabled`, `StorageError:MethodNotAllowed` | The service refuses the operation outright | A bucket policy or vendor capability question |
+| `StorageError:NoSuchBucket` | The configured bucket does not exist | Correct the bucket. Never an erasure: a missing bucket says nothing about the object |
+
+**A lock is not a bug and not a backlog.** The worker holding a locked version is the retention
+policy working. What needs deciding is a conflict between two obligations — the user's erasure
+request and the lock — and that is a decision for whoever owns the retention policy, not a
+configuration change. Escalate it as a conflict; §11.2 of
+`docs/proposal-account-deletion-outbox.md` is where that goes.
+
+### Reasons that retry by themselves
+
+`StorageError:VersionsRemain` means the deletes reported success and the second enumeration
+still found something. The usual cause is a concurrent writer adding a version between the two
+passes, which the next attempt erases — so it retries on the ordinary backoff and only becomes
+`needs_attention` after `ATTENTION_AFTER_ATTEMPTS`. If it reaches that point the service is
+reporting deletions it is not performing, which is a vendor escalation.
+
+`StorageError:InventoryPaginationBroken` means a truncated version listing arrived with no
+marker to continue from, or the markers stopped advancing. The history could only be read in
+part, and a partial read must never be taken for an empty one. Retried, because a malformed
+response can be transient; persistent means a vendor escalation.
+
+Throttles, 503s and transport faults (`SlowDown`, `ServiceUnavailable`, `InternalError`,
+`EndpointConnectionError`) all retry as before.
+
+### Checking an erasure by hand
+
+Read-only, and the only question worth asking:
+
+```
+aws s3api list-object-versions --bucket <bucket> --prefix <key> --max-items 1000
+```
+
+Empty `Versions` and `DeleteMarkers` for that exact key is what "erased" means. A `404` from
+`head-object` is not — it is what a delete marker looks like. Note that `--prefix` matches
+prefixes, so check the `Key` field of each entry before concluding anything about one object.
+
+### What is not covered yet
+
+`erase` deletes the versions and delete markers of one key in one bucket. These are known gaps,
+not claims of completeness:
+
+* **Incomplete multipart uploads** retain their uploaded parts and are not listed as object
+  versions. A resume upload interrupted mid-flight can leave parts behind that this does not
+  remove. `ListMultipartUploads` / `AbortMultipartUpload`, a later stage.
+* **Replicas** in another bucket or region are separate objects with their own version
+  histories; deleting a version here does not delete them. Replication of delete markers is
+  configurable, and deleting a *version* is not replicated by default at all.
+* **Backups and snapshots** of the bucket or the database are out of reach of this worker
+  entirely.
+* **Single resume deletion** (a user deleting one resume rather than their account) still goes
+  through `delete`, so on a versioned bucket it leaves the previous content as a non-current
+  version with no deletion job recording it. Only account deletion is version-aware today.
+
+Until those are closed, "all your data is permanently deleted" is not a claim this system can
+support in full, and §11.2 of the proposal is where that is recorded.

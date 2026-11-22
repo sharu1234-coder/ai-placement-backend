@@ -36,6 +36,7 @@ from app.services.account_service import delete_account
 from app.storage.identity import StorageIdentity
 from app.storage.provider import StorageError, StorageProvider
 from app.workers import deletion_worker
+from tests.storage_doubles import ErasesWithoutHistory
 
 _KEY = "resumes/42/cv.pdf"
 
@@ -73,7 +74,7 @@ def _seed_account(db, keys=(_KEY,)):
     return user, profile
 
 
-class Recording(StorageProvider):
+class Recording(ErasesWithoutHistory, StorageProvider):
     """Records what it was asked to delete, and can be pointed anywhere.
 
     `name` and `identity()` are both explicit because the worker verifies a destination before

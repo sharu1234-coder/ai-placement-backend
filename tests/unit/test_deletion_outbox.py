@@ -29,12 +29,13 @@ from app.services import deletion_outbox
 from app.services.account_service import delete_account
 from app.storage.provider import StorageError, StorageProvider
 from app.workers import deletion_worker
+from tests.storage_doubles import ErasesWithoutHistory
 
 _KEY = "resumes/42/cv.pdf"
 _UNRESOLVED = ("pending", "needs_attention")
 
 
-class FakeStorage(StorageProvider):
+class FakeStorage(ErasesWithoutHistory, StorageProvider):
     """Records what it was asked to delete. Optionally fails a set number of times.
 
     `delete` of an absent object is success here, because that is the contract the real

@@ -63,9 +63,10 @@ from app.models.weakness_record import WeaknessRecord
 from app.services.account_service import delete_account
 from app.storage.provider import StorageError, StorageProvider
 from app.workers import deletion_worker
+from tests.storage_doubles import ErasesWithoutHistory
 
 
-class RecordingStorage(StorageProvider):
+class RecordingStorage(ErasesWithoutHistory, StorageProvider):
     """Records delete() calls instead of touching real storage -- lets tests assert the
     right keys were targeted without needing a filesystem or S3 backend."""
 

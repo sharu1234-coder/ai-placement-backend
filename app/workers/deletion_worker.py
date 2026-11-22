@@ -6,6 +6,11 @@ docs/proposal-account-deletion-outbox.md:
 
 * **Every job is idempotent.** Deleting an object that is already gone is success, because the
   obligation is "the object is not there", not "this process removed it".
+* **"Not there" means no version of it is stored.** On a versioned bucket a plain delete only
+  inserts a delete marker: the object stops being listed, the API answers 404, and every byte
+  is still there. So the job is finished through `StorageProvider.erase`, which deletes each
+  version by id and then re-enumerates to confirm nothing is left, and which raises rather than
+  returning when it cannot confirm that. A job reaches `done` on nothing weaker.
 * **Concurrent workers never both do the same job.** The claim is a single statement using
   `FOR UPDATE SKIP LOCKED`, so a second worker steps over a locked row instead of waiting for
   it or taking it twice.
@@ -40,6 +45,13 @@ from app.models.deletion_job import (
 )
 from app.models.deletion_request import UNRESOLVED_STATUSES, DeletionRequest
 from app.models.user import User
+from app.storage.erasure import (
+    ERASURE_INVENTORY_UNSUPPORTED,
+    ERASURE_LEGAL_HOLD,
+    ERASURE_NOT_IMPLEMENTED,
+    ERASURE_OBJECT_LOCKED,
+    ERASURE_VERSIONING_UNKNOWN,
+)
 from app.storage.identity import StorageIdentity
 from app.storage.provider import StorageError, StorageProvider
 
@@ -70,7 +82,39 @@ ATTENTION_AFTER_ATTEMPTS = 5
 #: escalated on the first occurrence instead of after ATTENTION_AFTER_ATTEMPTS, exactly as a
 #: provider mismatch is. `NoSuchBucket` used to be treated as "already gone" by the S3 adapter,
 #: which turned a misconfigured or missing bucket into a completed erasure.
-CONFIGURATION_ERROR_CODES = frozenset({"NoSuchBucket"})
+#:
+#: The erasure codes join it for the same reason. A bucket whose versioning mode is
+#: unrecognised, a service that will not enumerate versions, and a provider with no
+#: version-aware erasure at all are each a statement that this deployment cannot prove an
+#: erasure -- which a retry does not change.
+CONFIGURATION_ERROR_CODES = frozenset(
+    {
+        "NoSuchBucket",
+        ERASURE_VERSIONING_UNKNOWN,
+        ERASURE_INVENTORY_UNSUPPORTED,
+        ERASURE_NOT_IMPLEMENTED,
+    }
+)
+
+#: An Object Lock retention or a legal hold refused the delete. Held for a person because that
+#: is what honouring a lock means: the bypass exists, using it would make the retention policy
+#: a suggestion, and nothing here will do it. Deliberately not a failure of this worker -- the
+#: storage is doing exactly what it was configured to do.
+PROTECTED_ERROR_CODES = frozenset({ERASURE_OBJECT_LOCKED, ERASURE_LEGAL_HOLD})
+
+#: The request was refused rather than failed. A policy has to change for this to succeed, so
+#: retrying it on a 30-second backoff only delays the moment somebody is told. Escalated at
+#: once, like the configuration codes, and for the same reason.
+AUTHORIZATION_ERROR_CODES = frozenset({"AccessDenied", "AllAccessDisabled", "MethodNotAllowed"})
+
+#: Everything that goes straight to `needs_attention`. What is *not* here is as deliberate: a
+#: throttle, a 503, a transport fault and `VersionsRemain` all retry on the ordinary backoff,
+#: because each of them can and does clear by itself. `VersionsRemain` in particular is the
+#: shape a concurrent writer takes -- a new version arriving between the delete and the
+#: verification -- and the next attempt erases it.
+IMMEDIATE_ATTENTION_CODES = (
+    CONFIGURATION_ERROR_CODES | PROTECTED_ERROR_CODES | AUTHORIZATION_ERROR_CODES
+)
 
 #: Why a job may not proceed to a destructive call. Each is an explicit non-success state, never
 #: an idempotent success, and each stays claimable so it resumes once an operator fixes the
@@ -285,9 +329,16 @@ def execute_job(db: Session, job: DeletionJob, storage: StorageProvider) -> str:
     object that is already gone is success, so the retry is harmless. That is the whole reason
     idempotence is a requirement rather than a nicety.
 
-    `StorageProvider.delete` already treats an absent object as success, so "already absent"
-    and "deleted" arrive here identically; the distinction in the report comes from the
-    provider, not from a second existence check that would race anyway.
+    The call is `erase`, not `delete`, and the difference is the point of this stage. `delete`
+    promises only that the object is no longer current, which on a versioned bucket is
+    satisfied by inserting a delete marker over data that is all still there. `erase` promises
+    that no version and no delete marker remains, and proves it by enumerating the history
+    after deleting each version by id -- so a `done` here rests on a verified end state rather
+    than on a call that did not raise.
+
+    An object that was already absent is still success: the obligation is "the object is not
+    there", and `erase` establishes that by the same enumeration rather than by a 404, which
+    would arrive while every version was intact.
     """
     moment = _now()
 
@@ -325,7 +376,7 @@ def execute_job(db: Session, job: DeletionJob, storage: StorageProvider) -> str:
     # enqueued sends the delete at the wrong destination, where the key is absent, where
     # absence reads as idempotent success -- and the job is marked done having erased nothing.
     #
-    # This runs before `storage.delete` is reachable at all, which is the property that
+    # This runs before `storage.erase` is reachable at all, which is the property that
     # matters: an unverified destination cannot produce a destructive call and cannot produce a
     # `done`.
     refusal = identity_refusal(job, storage)
@@ -339,9 +390,24 @@ def execute_job(db: Session, job: DeletionJob, storage: StorageProvider) -> str:
         )
         return _hold_for_operator(job, error_class=refusal, moment=moment)
 
+    # Resolved rather than called straight, for the same reason `identity_refusal` reads
+    # `identity` with getattr: a storage object that does not implement version-aware erasure
+    # must hold its job for an operator, not raise an AttributeError out of this function and
+    # abandon the rest of the batch to its leases. Real adapters always have it -- the base
+    # class provides a refusing default -- so this covers a non-conforming object only.
+    eraser = getattr(storage, "erase", None)
+    if not callable(eraser):
+        logger.error(
+            "Deletion job %s was not erased: the configured storage cannot erase an object "
+            "version history, so no erasure can be proved. Nothing was deleted and the job "
+            "stays queued.",
+            job.id,
+        )
+        return _hold_for_operator(job, error_class=ERASURE_NOT_IMPLEMENTED, moment=moment)
+
     job.attempts = (job.attempts or 0) + 1
     try:
-        storage.delete(job.storage_key)
+        outcome = eraser(job.storage_key)
     except StorageError as exc:
         # The class and the backend's own error code, never the message: a provider's message
         # routinely contains the key and the bucket, while a code such as `AccessDenied` or
@@ -351,19 +417,20 @@ def execute_job(db: Session, job: DeletionJob, storage: StorageProvider) -> str:
         job.last_error_class = f"{type(exc).__name__}:{code}" if code else type(exc).__name__
         job.next_attempt_at = moment + backoff_for(job.attempts)
         job.locked_until = None
-        if code in CONFIGURATION_ERROR_CODES:
-            # A missing bucket is a fault in the configuration, not in the object, and no
-            # number of attempts will create one -- so it is escalated on the first
-            # occurrence rather than after ATTENTION_AFTER_ATTEMPTS, the same treatment a
-            # provider mismatch gets. The S3 adapter used to count NoSuchBucket as "already
-            # gone", which reported a completed erasure against a bucket that does not exist.
+        if code in IMMEDIATE_ATTENTION_CODES:
+            # A missing bucket, an unprovable erasure, a lock being honoured, a denied
+            # request: none of these is a fault in the object and none of them clears by
+            # being retried, so each is escalated on the first occurrence rather than after
+            # ATTENTION_AFTER_ATTEMPTS -- the same treatment a provider mismatch gets. The S3
+            # adapter used to count NoSuchBucket as "already gone", which reported a completed
+            # erasure against a bucket that does not exist.
             # `attempts` is not incremented here: it was already incremented before the call.
             job.status = STATUS_NEEDS_ATTENTION
             job.updated_at = moment
             logger.error(
-                "Deletion job %s could not reach its destination (%s); nothing was deleted. "
-                "This is a configuration fault and will not clear by retrying. The job stays "
-                "queued.",
+                "Deletion job %s was not erased (%s); nothing was deleted and retrying will "
+                "not change that, so it is held for an operator. The job stays queued and "
+                "resumes once the cause is fixed.",
                 job.id,
                 job.last_error_class,
             )
@@ -389,6 +456,19 @@ def execute_job(db: Session, job: DeletionJob, storage: StorageProvider) -> str:
         )
         return "retry"
 
+    # Only reachable from a verified outcome: `erase` raises rather than returning one it
+    # could not confirm. The evidence is logged because it is the difference between an
+    # enumeration that found nothing left and a 404 -- counts and provider facts only, no key
+    # and no bucket.
+    logger.info(
+        "Deletion job %s erased its object: %s bucket, %s version(s) and %s delete marker(s) "
+        "removed, absence established by %s",
+        job.id,
+        outcome.versioning,
+        outcome.versions_deleted,
+        outcome.markers_deleted,
+        outcome.verified_by,
+    )
     job.status = STATUS_DONE
     job.completed_at = moment
     job.updated_at = moment
