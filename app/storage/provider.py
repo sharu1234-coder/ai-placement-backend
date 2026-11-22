@@ -1,6 +1,8 @@
 from abc import ABC, abstractmethod
 from typing import ClassVar, Optional
 
+from app.storage.identity import StorageIdentity
+
 
 class StorageError(Exception):
     """Raised when a storage backend fails to save or delete a file.
@@ -30,6 +32,25 @@ class StorageProvider(ABC):
     #: the worker refuses to erase against a different backend, because an object key is only
     #: meaningful to the backend that stored it.
     name: ClassVar[str]
+
+    def identity(self) -> Optional[StorageIdentity]:
+        """The destination *this instance* would act on, or None if it cannot say.
+
+        Not abstract, and not read from configuration by the caller. A deletion job verifies
+        its recorded destination against this before anything destructive runs, and the honest
+        answer has to come from the object that would do the deleting -- re-reading settings
+        would compare configuration with itself and prove nothing.
+
+        The default covers every backend whose identity is just its name, which is the
+        filesystem provider. Returning None rather than guessing is deliberate: an instance
+        that cannot state where it points must not be treated as pointing at the right place.
+        `name` is a ClassVar with no default, so a subclass that forgets to declare it lands
+        here and is refused rather than silently matching.
+        """
+        name = getattr(self, "name", None)
+        if not name:
+            return None
+        return StorageIdentity(provider=name)
 
     @abstractmethod
     def save(self, key: str, data: bytes) -> str:

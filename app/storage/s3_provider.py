@@ -4,6 +4,7 @@ import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
 from app.core.config import settings
+from app.storage.identity import StorageIdentity
 from app.storage.provider import StorageError, StorageProvider
 
 logger = logging.getLogger(__name__)
@@ -22,12 +23,25 @@ class S3StorageProvider(StorageProvider):
         if not settings.storage_s3_bucket:
             raise StorageError("STORAGE_S3_BUCKET is not set -- required when STORAGE_PROVIDER=s3.")
         self.bucket = settings.storage_s3_bucket
+        # Held on the instance rather than re-read later, so `identity()` reports the
+        # destination this client was actually built for. Reading settings again at
+        # verification time would compare today's configuration with itself.
+        self.endpoint = settings.storage_s3_endpoint_url
+        self.region = settings.storage_s3_region
         self._client = boto3.client(
             "s3",
             endpoint_url=settings.storage_s3_endpoint_url,
             region_name=settings.storage_s3_region,
             aws_access_key_id=settings.storage_s3_access_key_id,
             aws_secret_access_key=settings.storage_s3_secret_access_key,
+        )
+
+    def identity(self) -> StorageIdentity:
+        """Where this client points. The bucket is the part the provider name cannot carry:
+        every S3-compatible vendor is `s3` here, so bucket and endpoint are what separate one
+        destination from another. No credential is included."""
+        return StorageIdentity(
+            provider=self.name, bucket=self.bucket, endpoint=self.endpoint, region=self.region
         )
 
     def save(self, key: str, data: bytes) -> str:

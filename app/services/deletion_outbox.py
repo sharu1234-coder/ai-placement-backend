@@ -38,6 +38,7 @@ from app.models.deletion_job import DeletionJob
 from app.models.deletion_request import DeletionRequest
 from app.models.resume import Resume
 from app.models.user import User
+from app.storage.identity import StorageIdentity
 
 logger = logging.getLogger(__name__)
 
@@ -46,8 +47,8 @@ def _now() -> datetime.datetime:
     return datetime.datetime.now(datetime.timezone.utc)
 
 
-def collect_storage_keys(db: Session, profile_id: int) -> list[tuple[str, str]]:
-    """Every (provider, key) pair the profile owns, deduplicated.
+def collect_storage_keys(db: Session, profile_id: int) -> list[tuple[StorageIdentity, str]]:
+    """Every (storage identity, key) pair the profile owns, deduplicated.
 
     Read before anything is deleted, because afterwards there is nowhere left to read it from.
     Deduplicated here as well as by the unique constraint: two resume rows may legitimately
@@ -57,22 +58,25 @@ def collect_storage_keys(db: Session, profile_id: int) -> list[tuple[str, str]]:
     second kind of object appears it is added here, and the parity test in
     tests/unit/test_deletion_outbox.py is what will notice if it is not.
     """
-    from app.core.config import settings
-
-    provider = settings.storage_provider
+    # Read once, here, because this is the only moment at which the configuration and the
+    # object are known to agree. The identity is then a fact about the object rather than a
+    # lookup the worker repeats later against whatever is configured by then.
+    identity = StorageIdentity.from_settings()
     keys = (
         db.query(Resume.file_path)
         .filter(Resume.profile_id == profile_id, Resume.file_path.isnot(None))
         .all()
     )
-    seen: dict[str, str] = {}
+    seen: dict[str, StorageIdentity] = {}
     for (key,) in keys:
         if key and key not in seen:
-            seen[key] = provider
-    return [(provider_name, key) for key, provider_name in seen.items()]
+            seen[key] = identity
+    return [(key_identity, key) for key, key_identity in seen.items()]
 
 
-def enqueue(db: Session, *, original_user_id: int, keys: list[tuple[str, str]]) -> DeletionRequest:
+def enqueue(
+    db: Session, *, original_user_id: int, keys: list[tuple[StorageIdentity, str]]
+) -> DeletionRequest:
     """Insert the request and its jobs. Caller owns the transaction, deliberately.
 
     No commit and no flush-and-forget: this has to be part of the same unit of work as the row
@@ -88,12 +92,21 @@ def enqueue(db: Session, *, original_user_id: int, keys: list[tuple[str, str]]) 
     db.flush()
 
     now = _now()
-    for provider, key in keys:
+    for identity, key in keys:
         db.add(
             DeletionJob(
                 deletion_request_id=request.id,
-                storage_provider=provider,
+                storage_provider=identity.provider,
                 storage_key=key,
+                # The destination, written in the same transaction as the job itself, so a job
+                # can never exist without the identity it must be verified against. The
+                # revision is also the marker that capture happened at all -- the worker reads
+                # a NULL there as "this job predates identity capture" and holds it, rather
+                # than binding it to whatever is configured at execution time.
+                storage_bucket=identity.bucket,
+                storage_endpoint=identity.endpoint,
+                storage_region=identity.region,
+                storage_config_revision=identity.revision,
                 status="pending",
                 attempts=0,
                 # Claimable at once. The 5-minute pickup target is about how often the worker
