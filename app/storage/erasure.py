@@ -82,6 +82,49 @@ ERASURE_LEGAL_HOLD = "LegalHoldActive"
 ERASURE_NOT_IMPLEMENTED = "ErasureNotImplemented"
 
 
+#: How an erasure failure is answered. These three sets are facts about the erasure contract,
+#: not about any one caller, which is why they live here beside the codes themselves rather
+#: than in the worker that first needed them. Both callers now classify from the same copy:
+#: `deletion_worker` turns them into `needs_attention`, and `resume_service` turns them into a
+#: refusal the student sees -- and a single resume deletion must not be able to drift into
+#: being more permissive than the account-level one.
+
+#: Backend error codes that describe the *configuration*, not the object. These cannot clear by
+#: being retried -- no number of attempts conjures a bucket into existence. A bucket whose
+#: versioning mode is unrecognised, a service that will not enumerate versions, and a provider
+#: with no version-aware erasure at all are each a statement that this deployment cannot prove
+#: an erasure, which a retry does not change. `NoSuchBucket` belongs here because the S3
+#: adapter once treated it as "already gone", which turned a missing bucket into a completed
+#: erasure.
+CONFIGURATION_ERROR_CODES = frozenset(
+    {
+        "NoSuchBucket",
+        ERASURE_VERSIONING_UNKNOWN,
+        ERASURE_INVENTORY_UNSUPPORTED,
+        ERASURE_NOT_IMPLEMENTED,
+    }
+)
+
+#: An Object Lock retention or a legal hold refused the delete. Honouring the lock is the point
+#: of it: the bypass exists, using it would make the retention policy a suggestion, and nothing
+#: in this package will do it. Deliberately not a failure of the caller -- the storage is doing
+#: exactly what it was configured to do, and the answer is a person, not a retry.
+PROTECTED_ERROR_CODES = frozenset({ERASURE_OBJECT_LOCKED, ERASURE_LEGAL_HOLD})
+
+#: The request was refused rather than failed. A policy has to change for this to succeed, so
+#: retrying it on a backoff only delays the moment somebody is told.
+AUTHORIZATION_ERROR_CODES = frozenset({"AccessDenied", "AllAccessDisabled", "MethodNotAllowed"})
+
+#: Everything that needs a person on the first attempt. What is *not* here is as deliberate: a
+#: throttle, a 503, a transport fault and `VersionsRemain` all clear by themselves, so they are
+#: worth retrying. `VersionsRemain` in particular is the shape a concurrent writer takes -- a
+#: new version arriving between the delete and the verification -- and the next attempt erases
+#: it.
+IMMEDIATE_ATTENTION_CODES = (
+    CONFIGURATION_ERROR_CODES | PROTECTED_ERROR_CODES | AUTHORIZATION_ERROR_CODES
+)
+
+
 @dataclass(frozen=True)
 class StoredVersion:
     """One entry in a key version history.

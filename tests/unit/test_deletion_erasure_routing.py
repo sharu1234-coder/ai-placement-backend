@@ -264,10 +264,14 @@ class TestConfigurationAndAuthorizationFailures:
 
     def test_every_immediate_code_is_one_of_the_three_named_families(self):
         """Completeness, so the set cannot grow a member nobody classified."""
-        assert deletion_worker.IMMEDIATE_ATTENTION_CODES == (
-            deletion_worker.CONFIGURATION_ERROR_CODES
-            | deletion_worker.PROTECTED_ERROR_CODES
-            | deletion_worker.AUTHORIZATION_ERROR_CODES
+        # The classification lives in `erasure` so that the worker and the resume service
+        # classify from one copy. `is` rather than `==`: the worker must escalate on exactly
+        # that set, not on a set that merely happens to agree with it today.
+        assert deletion_worker.IMMEDIATE_ATTENTION_CODES is erasure.IMMEDIATE_ATTENTION_CODES
+        assert erasure.IMMEDIATE_ATTENTION_CODES == (
+            erasure.CONFIGURATION_ERROR_CODES
+            | erasure.PROTECTED_ERROR_CODES
+            | erasure.AUTHORIZATION_ERROR_CODES
         )
         assert erasure.ERASURE_VERSIONS_REMAIN not in deletion_worker.IMMEDIATE_ATTENTION_CODES
 

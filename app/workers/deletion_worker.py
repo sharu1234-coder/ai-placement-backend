@@ -45,13 +45,7 @@ from app.models.deletion_job import (
 )
 from app.models.deletion_request import UNRESOLVED_STATUSES, DeletionRequest
 from app.models.user import User
-from app.storage.erasure import (
-    ERASURE_INVENTORY_UNSUPPORTED,
-    ERASURE_LEGAL_HOLD,
-    ERASURE_NOT_IMPLEMENTED,
-    ERASURE_OBJECT_LOCKED,
-    ERASURE_VERSIONING_UNKNOWN,
-)
+from app.storage.erasure import ERASURE_NOT_IMPLEMENTED, IMMEDIATE_ATTENTION_CODES
 from app.storage.identity import StorageIdentity
 from app.storage.provider import StorageError, StorageProvider
 
@@ -77,44 +71,14 @@ BACKOFF_CAP = datetime.timedelta(minutes=30)
 # Attempts after which the job is *also* flagged for a human. Not a ceiling on retries.
 ATTENTION_AFTER_ATTEMPTS = 5
 
-#: Backend error codes that describe the *configuration*, not the object. These cannot clear by
-#: being retried -- no number of attempts conjures a bucket into existence -- so they are
-#: escalated on the first occurrence instead of after ATTENTION_AFTER_ATTEMPTS, exactly as a
-#: provider mismatch is. `NoSuchBucket` used to be treated as "already gone" by the S3 adapter,
-#: which turned a misconfigured or missing bucket into a completed erasure.
+#: The failure classification now lives in `app.storage.erasure`, beside the codes it
+#: classifies, and is imported above. It moved there when individual resume deletion began
+#: classifying the same failures: the account-level and the resume-level answer have to come
+#: from one copy, or the narrower path can quietly become the more permissive one.
 #:
-#: The erasure codes join it for the same reason. A bucket whose versioning mode is
-#: unrecognised, a service that will not enumerate versions, and a provider with no
-#: version-aware erasure at all are each a statement that this deployment cannot prove an
-#: erasure -- which a retry does not change.
-CONFIGURATION_ERROR_CODES = frozenset(
-    {
-        "NoSuchBucket",
-        ERASURE_VERSIONING_UNKNOWN,
-        ERASURE_INVENTORY_UNSUPPORTED,
-        ERASURE_NOT_IMPLEMENTED,
-    }
-)
-
-#: An Object Lock retention or a legal hold refused the delete. Held for a person because that
-#: is what honouring a lock means: the bypass exists, using it would make the retention policy
-#: a suggestion, and nothing here will do it. Deliberately not a failure of this worker -- the
-#: storage is doing exactly what it was configured to do.
-PROTECTED_ERROR_CODES = frozenset({ERASURE_OBJECT_LOCKED, ERASURE_LEGAL_HOLD})
-
-#: The request was refused rather than failed. A policy has to change for this to succeed, so
-#: retrying it on a 30-second backoff only delays the moment somebody is told. Escalated at
-#: once, like the configuration codes, and for the same reason.
-AUTHORIZATION_ERROR_CODES = frozenset({"AccessDenied", "AllAccessDisabled", "MethodNotAllowed"})
-
-#: Everything that goes straight to `needs_attention`. What is *not* here is as deliberate: a
-#: throttle, a 503, a transport fault and `VersionsRemain` all retry on the ordinary backoff,
-#: because each of them can and does clear by itself. `VersionsRemain` in particular is the
-#: shape a concurrent writer takes -- a new version arriving between the delete and the
-#: verification -- and the next attempt erases it.
-IMMEDIATE_ATTENTION_CODES = (
-    CONFIGURATION_ERROR_CODES | PROTECTED_ERROR_CODES | AUTHORIZATION_ERROR_CODES
-)
+#: What it means here: everything in `IMMEDIATE_ATTENTION_CODES` goes straight to
+#: `needs_attention` instead of waiting for ATTENTION_AFTER_ATTEMPTS, exactly as a provider
+#: mismatch does.
 
 #: Why a job may not proceed to a destructive call. Each is an explicit non-success state, never
 #: an idempotent success, and each stays claimable so it resumes once an operator fixes the
