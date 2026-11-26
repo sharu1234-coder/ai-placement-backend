@@ -1,3 +1,4 @@
+from pathlib import Path
 from typing import Optional
 
 import pytest
@@ -381,3 +382,162 @@ def test_get_resume_file_reports_unavailable_when_storage_fails(client, auth_hea
 
     assert resp.status_code == 503
     assert "uploads" not in resp.text and ".pdf" not in resp.text
+
+
+# --- a deletion that could not erase the file ----------------------------------------------
+#
+# 204 used to mean "the rows are gone", whether or not the file was. These cover what it means
+# now, and the one property every failure answer shares: the resume is still there, so the
+# client's list is still right and the request can simply be repeated.
+
+
+class _RefusingStorage:
+    """A provider whose erasure always fails with one chosen code."""
+
+    name = "refusing"
+
+    def __init__(self, code):
+        self.code = code
+        self.deletes = 0
+
+    def identity(self):
+        from app.storage.identity import StorageIdentity
+
+        return StorageIdentity(provider="refusing")
+
+    def save(self, key, data):
+        raise NotImplementedError
+
+    def load(self, key):
+        raise NotImplementedError
+
+    def delete(self, key):
+        self.deletes += 1
+
+    def erase(self, key):
+        from app.storage.provider import StorageError
+
+        raise StorageError("refused", code=self.code)
+
+
+@pytest.fixture()
+def refuse_erasure():
+    """Make the delete endpoint's provider refuse, leaving the upload path's provider alone.
+
+    The override is installed only after the resume has been uploaded, so uploads still go to
+    the real local provider and the test exercises deletion rather than a broken upload.
+    """
+    from app.storage.provider import get_storage_provider
+
+    installed = []
+
+    def _refuse(code):
+        storage = _RefusingStorage(code)
+        app.dependency_overrides[get_storage_provider] = lambda: storage
+        installed.append(storage)
+        return storage
+
+    yield _refuse
+    app.dependency_overrides.pop(get_storage_provider, None)
+
+
+def _upload(client, auth_headers):
+    return client.post(
+        "/resumes",
+        files={"file": ("resume.pdf", make_pdf_with_text("Some resume text."), "application/pdf")},
+        headers=auth_headers,
+    ).json()["id"]
+
+
+@pytest.mark.parametrize("code", ["ObjectLockActive", "LegalHoldActive"])
+def test_a_retention_hold_is_a_409_and_the_resume_stays(
+    client, auth_headers, use_fake_ai, refuse_erasure, code
+):
+    """The storage is doing exactly what it was configured to do, so this is a conflict between
+    two obligations rather than a fault -- and no retry moves it."""
+    use_fake_ai(FakeAIProvider(parsed=SAMPLE_PARSED_RESUME))
+    resume_id = _upload(client, auth_headers)
+    refuse_erasure(code)
+
+    resp = client.delete(f"/resumes/{resume_id}", headers=auth_headers)
+
+    assert resp.status_code == 409
+    # The analysis read goes to the database, not to storage, so the refusing override does not
+    # affect it -- it is the evidence that the resume and its derived rows both survived.
+    assert client.get(f"/resumes/{resume_id}/analysis", headers=auth_headers).status_code == 200
+
+
+@pytest.mark.parametrize(
+    "code", ["NoSuchBucket", "VersioningStateUnknown", "InventoryUnsupported", "AccessDenied"]
+)
+def test_a_misconfiguration_is_a_500_not_a_503(
+    client, auth_headers, use_fake_ai, refuse_erasure, code
+):
+    """503 would promise it clears by itself. None of these does: each needs somebody to change
+    a configuration or a policy."""
+    use_fake_ai(FakeAIProvider(parsed=SAMPLE_PARSED_RESUME))
+    resume_id = _upload(client, auth_headers)
+    refuse_erasure(code)
+
+    resp = client.delete(f"/resumes/{resume_id}", headers=auth_headers)
+
+    assert resp.status_code == 500
+
+
+@pytest.mark.parametrize("code", ["SlowDown", "VersionsRemain", "RequestTimeout", None])
+def test_a_transient_failure_is_a_503(client, auth_headers, use_fake_ai, refuse_erasure, code):
+    """These do clear by themselves -- a throttle, a transport fault, or a version arriving
+    from a concurrent write between the delete and the verification -- so "try again" is
+    honest. An unclassified code lands here too, which is the safe default: retryable and
+    explicitly unfinished, never a 204."""
+    use_fake_ai(FakeAIProvider(parsed=SAMPLE_PARSED_RESUME))
+    resume_id = _upload(client, auth_headers)
+    refuse_erasure(code)
+
+    resp = client.delete(f"/resumes/{resume_id}", headers=auth_headers)
+
+    assert resp.status_code == 503
+
+
+def test_a_refused_deletion_leaks_no_storage_detail(
+    client, auth_headers, use_fake_ai, refuse_erasure
+):
+    """The body reaches a student. A bucket, an endpoint, an account id or the key -- which is
+    a user-scoped path -- would each be a configuration detail in a student-facing message."""
+    use_fake_ai(FakeAIProvider(parsed=SAMPLE_PARSED_RESUME))
+    resume_id = _upload(client, auth_headers)
+    refuse_erasure("NoSuchBucket")
+
+    resp = client.delete(f"/resumes/{resume_id}", headers=auth_headers)
+
+    body = resp.text
+    for leak in ("NoSuchBucket", "bucket", "s3", "uploads", ".pdf", "VersionId"):
+        assert leak not in body, f"the response body names {leak!r}"
+
+
+def test_a_refused_deletion_never_falls_back_to_delete(
+    client, auth_headers, use_fake_ai, refuse_erasure
+):
+    """A fallback would reinstate the original defect exactly when it matters: the bucket that
+    refused the proper erasure would get a delete marker instead."""
+    use_fake_ai(FakeAIProvider(parsed=SAMPLE_PARSED_RESUME))
+    resume_id = _upload(client, auth_headers)
+    storage = refuse_erasure("ObjectLockActive")
+
+    client.delete(f"/resumes/{resume_id}", headers=auth_headers)
+
+    assert storage.deletes == 0
+
+
+def test_the_file_is_really_gone_after_a_204(client, auth_headers, use_fake_ai):
+    """204 now means the object was erased and verified absent, not that the rows went. On the
+    local provider that is the file not being on disk -- checked directly, because a 404 from
+    the read path is exactly the evidence Stage B showed to be worthless."""
+    use_fake_ai(FakeAIProvider(parsed=SAMPLE_PARSED_RESUME))
+    resume_id = _upload(client, auth_headers)
+    stored = list(Path(settings.upload_dir).rglob("*.pdf"))
+    assert stored, "the upload should have written a file to erase"
+
+    assert client.delete(f"/resumes/{resume_id}", headers=auth_headers).status_code == 204
+
+    assert [p for p in stored if p.exists()] == []

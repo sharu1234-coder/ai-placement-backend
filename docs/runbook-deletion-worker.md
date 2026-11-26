@@ -327,9 +327,34 @@ not claims of completeness:
   configurable, and deleting a *version* is not replicated by default at all.
 * **Backups and snapshots** of the bucket or the database are out of reach of this worker
   entirely.
-* **Single resume deletion** (a user deleting one resume rather than their account) still goes
-  through `delete`, so on a versioned bucket it leaves the previous content as a non-current
-  version with no deletion job recording it. Only account deletion is version-aware today.
-
 Until those are closed, "all your data is permanently deleted" is not a claim this system can
 support in full, and §11.2 of the proposal is where that is recorded.
+
+### Single resume deletion does not reach this worker
+
+A student deleting one resume (`DELETE /resumes/{id}`) is version-aware as of Stage B.1, but it
+does **not** create a deletion job, so nothing about it appears in `deletion_jobs`, in
+`unresolved_obligations`, or in the held-jobs report. There is nothing for an operator to find
+here, and that is deliberate.
+
+It calls the same `erase` on the same provider, synchronously, inside the request, and deletes
+the resume row only after the erasure is verified. The asymmetry with account deletion is the
+point rather than an inconsistency: the outbox exists so that a student's ability to *leave*
+never depends on a bucket being reachable, which is why the obligation is written down and
+handed to a worker. Deleting one resume carries no such obligation -- if storage is unreachable
+the honest answer is to refuse, keep the resume, and let the student try again, which is what it
+does.
+
+So when a student reports that a resume would not delete, the evidence is in the API logs, not
+in this worker's tables. Look for `Could not erase the file for resume_id=` at WARNING, which
+carries the resume id and the same erasure code as §13's table, and for the status the student
+saw:
+
+| Status | Meaning | Who fixes it |
+| --- | --- | --- |
+| 409 | An Object Lock retention or legal hold covers the file | whoever owns the retention policy |
+| 500 | A storage misconfiguration or a refused authorization | an operator, using §13's table |
+| 503 | A throttle, a transport fault, or a concurrent write | nobody; the student retries |
+
+In every one of those the resume, its derived rows and its file are all still in place, so a
+retry is safe and adds no delete marker.

@@ -312,8 +312,9 @@ def delete_resume(db: Session, resume_id: int, profile_id: int, storage: Storage
     so the retry succeeds and adds nothing. That only holds because `erase` is idempotent, and
     it is why this order is safe rather than merely tidier.
 
-    A resume with no `file_path` has nothing stored, so there is nothing to erase and the rows
-    go as before. That is a real state in this schema (the column is nullable), not a shortcut.
+    The `if resume.file_path` guard is defensive, not a path: the column is NOT NULL, so there
+    is normally always an object to erase. It is there so that an empty string -- which the
+    database permits and which no key can be -- is not handed to a provider as a key to erase.
     """
     resume = db.get(Resume, resume_id)
     if resume is None or resume.profile_id != profile_id:
