@@ -23,10 +23,11 @@ from app.core.rate_limit import limiter
 from app.models.user import User
 from app.schemas.resume import ResumeAnalysisRead, ResumeSummaryRead, ResumeUploadResponse
 from app.schemas.resume_ats_check import AtsCheckListItemRead, AtsCheckReportRead, CreateAtsCheckRequest
-from app.services import idempotency
+from app.services import idempotency, resume_service
 from app.services.ats_check_service import generate_ats_check, get_ats_check, list_ats_checks
 from app.services.profile_service import get_or_create_profile
 from app.services.resume_service import (
+    ResumeErasureFailed,
     ResumeFileUnavailable,
     ResumeProcessingError,
     delete_resume,
@@ -36,6 +37,7 @@ from app.services.resume_service import (
     process_resume_upload,
     read_uploaded_resume,
 )
+from app.storage.erasure import IMMEDIATE_ATTENTION_CODES, PROTECTED_ERROR_CODES
 from app.storage.provider import StorageProvider, get_storage_provider
 
 logger = logging.getLogger(__name__)
@@ -245,6 +247,17 @@ def create_ats_check_endpoint(
         raise idempotency_http_error(exc, logger, "resume.ats_check")
 
 
+#: Erasure failures that need an operator, not a retry: a missing bucket, a provider that
+#: cannot enumerate versions or cannot erase them, a provider that cannot say where it points,
+#: a refused authorization. Reported as 500 rather than 503 because "try again later" would be
+#: false -- none of these clears without somebody changing a configuration or a policy. A
+#: retention hold is excluded: it is answered separately, because it is the storage behaving
+#: correctly rather than a fault.
+_OPERATOR_FAULT_CODES = (IMMEDIATE_ATTENTION_CODES - PROTECTED_ERROR_CODES) | {
+    resume_service.ERASURE_IDENTITY_UNKNOWN
+}
+
+
 @router.delete("/{resume_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_resume_endpoint(
     resume_id: int,
@@ -252,6 +265,59 @@ def delete_resume_endpoint(
     db: Session = Depends(get_db),
     storage: StorageProvider = Depends(get_storage_provider),
 ) -> None:
+    """Delete a resume and permanently erase its stored file.
+
+    204 now means what it says. Before Stage B.1 this endpoint answered 204 whenever the
+    database rows went, including when the file could not be deleted at all -- and on a
+    versioned bucket, including when the "delete" had only inserted a delete marker and left
+    every byte in place. It now answers 204 only after the provider has verified that no
+    version and no delete marker of the object remains.
+
+    The failure answers all share one property: **the resume is still there.** Nothing was
+    deleted, so the client's list is still correct and the request can simply be repeated.
+
+    * 409 -- an Object Lock retention or a legal hold covers the file. The storage is doing
+      exactly what it was configured to do, so this is a conflict between two obligations and
+      not a fault; it needs whoever owns the retention policy, and no amount of retrying moves
+      it. Phrased for the student, because this is the one failure they may be told about.
+    * 500 -- a misconfiguration or a refused authorization on our side (see
+      `_OPERATOR_FAULT_CODES`). Not 503: nothing about it is temporary.
+    * 503 -- anything else, which in practice is a throttle, a transport fault, or a version
+      arriving from a concurrent write between the delete and the verification. These do clear
+      by themselves, so "try again" is honest.
+
+    None of the details reach the response. A bucket name, an endpoint, an account id or a
+    storage key would each be a configuration detail in a student-facing body, and the key
+    itself is a user-scoped path.
+    """
     profile = get_or_create_profile(db, current_user)
-    if not delete_resume(db, resume_id, profile.id, storage):
+    try:
+        deleted = delete_resume(db, resume_id, profile.id, storage)
+    except ResumeErasureFailed as exc:
+        # The code is the whole diagnosis that crosses this boundary. `exc` is logged by the
+        # service, which has the resume id; re-logging the message here could carry a bucket.
+        if exc.code in PROTECTED_ERROR_CODES:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "This resume's file is under a retention hold and cannot be permanently "
+                    "deleted yet. The resume has not been removed."
+                ),
+            ) from exc
+        if exc.code in _OPERATOR_FAULT_CODES:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=(
+                    "The resume could not be permanently deleted because of a storage "
+                    "configuration problem. The resume has not been removed."
+                ),
+            ) from exc
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "The resume's file could not be permanently deleted just now. The resume has "
+                "not been removed -- please try again."
+            ),
+        ) from exc
+    if not deleted:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Resume not found")

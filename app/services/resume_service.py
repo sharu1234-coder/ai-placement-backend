@@ -17,7 +17,8 @@ from app.models.resume_analysis import ResumeAnalysis
 from app.models.resume_ats_check import ResumeAtsCheck
 from app.schemas.resume import ResumeAnalysisRead, ResumeSummaryRead, ResumeUploadResponse
 from app.services.ai_boundary import outside_transaction
-from app.storage.provider import StorageProvider
+from app.storage.erasure import ERASURE_NOT_IMPLEMENTED
+from app.storage.provider import StorageError, StorageProvider
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +27,32 @@ _PROMPT_PATH = Path(__file__).resolve().parent.parent / "ai" / "prompts" / "resu
 
 class ResumeProcessingError(Exception):
     """Raised when the uploaded file can't be read at all (not a valid/readable PDF)."""
+
+
+#: A deletion refused because the provider could not state where it would be deleting from.
+#: Not an erasure failure reported by storage -- the destructive call was never made. It
+#: matches `deletion_worker.IDENTITY_UNKNOWN` deliberately: the same refusal, reached the same
+#: way, should read the same in both places.
+ERASURE_IDENTITY_UNKNOWN = "StorageIdentityUnknown"
+
+
+class ResumeErasureFailed(Exception):
+    """The resume's file could not be *proved* erased, so nothing was deleted.
+
+    Deliberately not a boolean. `delete_resume` used to swallow every storage failure and
+    delete the database rows anyway, which destroyed the only remaining pointer to an object
+    that was still stored -- the exact invariant the account-deletion outbox exists to hold.
+    Raising forces the caller to answer for it, and the resume and its file are both still
+    there when it does.
+
+    `code` is the erasure contract's code (`app.storage.erasure`), so the caller classifies
+    with the same sets the deletion worker uses rather than inventing a second taxonomy. It
+    names a condition, never a bucket, a key or a credential.
+    """
+
+    def __init__(self, message: str, *, code: Optional[str] = None) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 def extract_text_from_pdf(file_bytes: bytes) -> str:
@@ -255,10 +282,47 @@ def delete_resume(db: Session, resume_id: int, profile_id: int, storage: Storage
     Job Hunt setup -- target role, location, work mode, declared skills -- is their own data
     and has nothing to do with which resume it was once linked to. The `resume_skills`
     provenance key goes with it, exactly as update_search_profile(clear_resume=True) does, so
-    the profile never claims a signal came from a resume that no longer exists."""
+    the profile never claims a signal came from a resume that no longer exists.
+
+    **Erasure comes first, and the rows only go once it is proved.** This used to call
+    `storage.delete`, catch every exception, log a warning and delete the rows regardless.
+    Three things were wrong with that, and Stage B made all three visible:
+
+    `delete` is not an erasure. On a versioned bucket a delete without a version id inserts a
+    delete marker; the object stops being listed, reads answer 404, and every byte stays
+    stored. The student was told their resume was deleted and it was not. `erase` is the
+    contract that actually promises it -- it enumerates the key's version history, deletes each
+    version and marker by id, enumerates again, and raises rather than returning if anything is
+    left. Account deletion has gone through it since Stage B; this was the last path that had
+    not, so the two told the student different truths about the same word.
+
+    Swallowing the failure destroyed the last pointer. With the row gone, nothing anywhere
+    recorded that the object existed -- not the database, not an outbox job. It could never be
+    found again, let alone erased. So a failure now raises `ResumeErasureFailed` and the row,
+    the file path and the file all stay exactly where they are, which is the same invariant the
+    account-deletion outbox holds by writing the key down before deleting anything.
+
+    The order is now erase, then mutate, which is the opposite of before and is the only safe
+    order here. The FK clean-up below is destructive in its own right: it deletes this resume's
+    analyses and ATS checks. Doing that first and *then* discovering the file cannot be erased
+    would leave a resume whose derived data had been thrown away. Erasing first also makes the
+    crash window benign rather than fatal: if the process dies between the erasure and the
+    commit, the row survives pointing at an object that is already gone, and the retry calls
+    `erase` again -- which reports `already_absent` on an empty history and deletes no marker,
+    so the retry succeeds and adds nothing. That only holds because `erase` is idempotent, and
+    it is why this order is safe rather than merely tidier.
+
+    A resume with no `file_path` has nothing stored, so there is nothing to erase and the rows
+    go as before. That is a real state in this schema (the column is nullable), not a shortcut.
+    """
     resume = db.get(Resume, resume_id)
     if resume is None or resume.profile_id != profile_id:
+        # Ownership, unchanged and still first: a resume belonging to another profile is
+        # reported as absent and never reaches the erasure below.
         return False
+
+    if resume.file_path:
+        _erase_stored_file(storage, resume.file_path, resume_id=resume.id)
 
     db.query(ResumeAnalysis).filter(ResumeAnalysis.resume_id == resume.id).delete()
     db.query(ResumeAtsCheck).filter(ResumeAtsCheck.resume_id == resume.id).delete()
@@ -273,11 +337,80 @@ def delete_resume(db: Session, resume_id: int, profile_id: int, storage: Storage
         provenance.pop("resume_skills", None)
         search_profile.signal_provenance = provenance
 
-    try:
-        storage.delete(resume.file_path)
-    except Exception as exc:  # best-effort: a stuck file must never block the DB delete
-        logger.warning("Could not delete resume file %s for resume_id=%s: %s", resume.file_path, resume.id, exc)
-
     db.delete(resume)
     db.commit()
     return True
+
+
+def _erase_stored_file(storage: StorageProvider, key: str, *, resume_id: int) -> None:
+    """Permanently erase one stored resume file, or raise without having changed anything.
+
+    Returns only on an `ErasureOutcome`, which the provider returns only after verifying that
+    no version and no delete marker of the key remains. There is no partial success and no
+    best-effort path: every other ending raises.
+
+    Two refusals happen before the destructive call, and both fail closed:
+
+    A provider with no `erase` is resolved with `getattr` rather than called directly, so a
+    conforming-looking object that predates the erasure contract is refused instead of raising
+    `AttributeError` from the middle of a request. Real adapters cannot reach this -- the base
+    class supplies an `erase` that refuses -- but a duck-typed one can.
+
+    A provider that cannot state its own destination does not get to perform a destructive
+    operation. `StorageProvider.identity()` returns None exactly when the instance cannot say
+    where it points, and the base class is explicit that such an instance "must not be treated
+    as pointing at the right place". The deletion worker refuses the same condition under the
+    same name. Note what is *not* checked here, and why: the worker compares a recorded identity
+    against the live one because days can pass between enqueue and execution, and configuration
+    can drift in between. Here the identity is read and acted on in the same breath, so there is
+    no window to guard -- only the question of whether the provider can answer at all.
+
+    Nothing in here logs the key. `resumes.file_path` is a user-scoped path, so the resume id
+    and the erasure code carry the diagnosis instead, which is the same rule Stage A set for
+    the worker's logs.
+    """
+    eraser = getattr(storage, "erase", None)
+    if not callable(eraser):
+        logger.error(
+            "Storage provider %s has no version-aware erasure, so resume_id=%s was not deleted",
+            type(storage).__name__,
+            resume_id,
+        )
+        raise ResumeErasureFailed(
+            f"Storage provider {type(storage).__name__} cannot prove an object has been erased",
+            code=ERASURE_NOT_IMPLEMENTED,
+        )
+
+    identify = getattr(storage, "identity", None)
+    if not callable(identify) or identify() is None:
+        logger.error(
+            "Storage provider %s cannot state its destination, so resume_id=%s was not deleted",
+            type(storage).__name__,
+            resume_id,
+        )
+        raise ResumeErasureFailed(
+            f"Storage provider {type(storage).__name__} cannot state where it would delete from",
+            code=ERASURE_IDENTITY_UNKNOWN,
+        )
+
+    try:
+        outcome = eraser(key)
+    except StorageError as exc:
+        # The code, not the message: the message can name a bucket, the code never does.
+        logger.warning(
+            "Could not erase the file for resume_id=%s (%s); the resume was left in place",
+            resume_id,
+            exc.code or type(exc).__name__,
+        )
+        raise ResumeErasureFailed(
+            f"The stored file for resume {resume_id} could not be erased", code=exc.code
+        ) from exc
+
+    logger.info(
+        "Erased the file for resume_id=%s (versioning=%s versions=%s markers=%s verified_by=%s)",
+        resume_id,
+        outcome.versioning,
+        outcome.versions_deleted,
+        outcome.markers_deleted,
+        outcome.verified_by,
+    )

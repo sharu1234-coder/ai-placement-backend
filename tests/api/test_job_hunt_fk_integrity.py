@@ -37,6 +37,8 @@ from app.models.saved_job import SavedJob
 from app.models.user import User
 from app.services.job_hunt import alerts as job_alerts
 from app.services.job_hunt import service
+from app.storage.identity import StorageIdentity
+from tests.storage_doubles import ErasesWithoutHistory
 
 NOW = datetime.datetime(2026, 9, 9, 12, 0, 0)
 
@@ -310,9 +312,20 @@ class TestDeletingAResumeLinkedToJobHunt:
         db.commit()
         return resume
 
-    class _NullStorage:
+    class _NullStorage(ErasesWithoutHistory):
+        """A provider that erases nothing and can say where it does it.
+
+        These tests are about the FK graph, not about storage, so the erasure is a no-op. It
+        still has to be a real `erase` and a real `identity`: `delete_resume` refuses to touch
+        the rows when the provider has neither, which is the point of the refusal -- a double
+        that is allowed to skip them would be the one place the guard does not hold.
+        """
+
         def delete(self, *args, **kwargs):
             return None
+
+        def identity(self):
+            return StorageIdentity(provider="null")
 
     def test_a_resume_linked_to_a_job_hunt_profile_can_still_be_deleted(self, db):
         from app.models.resume import Resume
