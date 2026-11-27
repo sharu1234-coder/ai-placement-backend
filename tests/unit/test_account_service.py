@@ -126,8 +126,22 @@ def _seed_full_account(db, email: str):
     db.add(Project(profile_id=profile.id, title="Portfolio site"))
     db.commit()
 
+    # Recorded at "upload" time, as a real upload does. `delete_account` copies this onto each
+    # deletion job, and the worker will not erase a job whose destination it cannot confirm, so
+    # an unstamped resume produces a job that is held rather than erased. The identity comes
+    # from the double that stands in for the storage these tests run under.
+    destination = RecordingStorage().identity()
     resume = Resume(
-        profile_id=profile.id, file_path="resumes/1_abc.pdf", raw_text="raw", parse_status="completed"
+        profile_id=profile.id,
+        file_path="resumes/1_abc.pdf",
+        raw_text="raw",
+        parse_status="completed",
+        storage_provider=destination.provider,
+        storage_bucket=destination.bucket,
+        storage_endpoint=destination.endpoint,
+        storage_region=destination.region,
+        storage_expected_owner=destination.expected_owner,
+        storage_config_revision=destination.revision,
     )
     db.add(resume)
     db.commit()
@@ -827,11 +841,18 @@ def test_a_retry_after_a_storage_failure_completes(db_session):
 def test_every_object_is_attempted_before_giving_up(db_session):
     """One bad key must not strand the others: a retry should have less to do, not the same."""
     user, profile, resume, question, role = _seed_full_account(db_session, "many@example.com")
+    extra_destination = RecordingStorage().identity()
     extra = Resume(
         profile_id=profile.id,
         file_path="resumes/second-file.pdf",
         raw_text="raw",
         parse_status="completed",
+        storage_provider=extra_destination.provider,
+        storage_bucket=extra_destination.bucket,
+        storage_endpoint=extra_destination.endpoint,
+        storage_region=extra_destination.region,
+        storage_expected_owner=extra_destination.expected_owner,
+        storage_config_revision=extra_destination.revision,
     )
     db_session.add(extra)
     db_session.commit()

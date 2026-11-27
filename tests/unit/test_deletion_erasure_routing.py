@@ -119,7 +119,25 @@ def _one_job(db):
     profile = StudentProfile(user_id=user.id)
     db.add(profile)
     db.flush()
-    db.add(Resume(profile_id=profile.id, file_path=_KEY, raw_text="r", parse_status="done"))
+    # The destination the file was written to, recorded the way a real upload records it.
+    # `delete_account` copies it onto the job, and the worker refuses a job that cannot say
+    # where its object is -- so a resume seeded without one never reaches the erasure routing
+    # these tests exist to exercise. `Erasing` is the provider doing the writing here.
+    destination = Erasing().identity()
+    db.add(
+        Resume(
+            profile_id=profile.id,
+            file_path=_KEY,
+            raw_text="r",
+            parse_status="done",
+            storage_provider=destination.provider,
+            storage_bucket=destination.bucket,
+            storage_endpoint=destination.endpoint,
+            storage_region=destination.region,
+            storage_expected_owner=destination.expected_owner,
+            storage_config_revision=destination.revision,
+        )
+    )
     db.commit()
     delete_account(db, user, Erasing())
     return db.query(DeletionJob).one()
