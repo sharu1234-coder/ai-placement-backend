@@ -235,8 +235,9 @@ If two fingerprints both have real objects behind them, run a worker against eac
 
 ### Recovering a job with no recorded destination
 
-These are jobs created before identity capture existed. **Do not stamp the current
-configuration onto them**, and note that no tooling here offers to: the only value available is
+These are jobs created before identity capture existed, or jobs whose resume had no
+recorded destination of its own (see §14 — the job's identity is copied from the resume, so a
+legacy resume produces a legacy job). **Do not stamp the current configuration onto them**, and note that no tooling here offers to: the only value available is
 whatever this process is configured with, and if that is wrong the object becomes permanently
 unreachable the moment the job is marked done, because closing the request deletes the last row
 that held its key. An unrecoverable silent miss is strictly worse than a job that waits.
@@ -358,3 +359,78 @@ saw:
 
 In every one of those the resume, its derived rows and its file are all still in place, so a
 retry is safe and adds no delete marker.
+
+
+## 14. A resume held because *its own* destination is unconfirmed
+
+§12 covers a deletion **job** whose destination cannot be confirmed. This covers the stage
+before it, which is where the destination now comes from.
+
+A resume records where its file was written, at upload time, in six columns on `resumes`
+mirroring the ones on `deletion_jobs`. Every object operation on a resume checks that record
+against the live provider before acting: the download endpoint, the ATS PDF read, individual
+deletion, and the identity copied onto an account-deletion job. The rule is the same
+fail-closed one §12 describes, and it is literally the same code —
+`app.storage.identity.destination_refusal`.
+
+### Why this exists separately from §12
+
+A job is created and executed within one configuration era if nothing changes in between, so
+recording its destination closes a window of minutes to days. A resume's file was written
+whenever the student uploaded it, which may be months before anything reads it again, and
+`get_storage_provider()` rebuilds the provider from current settings on every request.
+
+Before this, `deletion_outbox.collect_storage_keys` stamped every key with
+`StorageIdentity.from_settings()` — the configuration current at **deletion** time. The worker
+then compared that against the live provider, found them equal, and reported the destination
+verified. The comparison ran; it compared configuration with itself. A student who uploaded to
+bucket A and deleted their account after a move to bucket B had the job completed against B,
+the request closed, the last row holding the key deleted, and the object left in A.
+
+### Finding out what is affected
+
+```
+python scripts/review_resume_identity.py
+```
+
+Read-only: it opens no storage connection and cannot change a row. It prints no key, bucket,
+endpoint or account id — resumes are grouped by the same short configuration fingerprint the
+job report uses, so the output is safe to paste into an incident channel. It separates three
+cases: resumes with no recorded destination, resumes whose record is unusable (an `s3` resume
+with no bucket), and resumes grouped by fingerprint with the live one marked.
+
+### What a student sees
+
+| Status | Condition | Who fixes it |
+| --- | --- | --- |
+| 500 on download | recorded destination is not the live one, or was never recorded | an operator |
+| 500 on delete | the same | an operator |
+| a weaker ATS score | the same, on the PDF read only | an operator; the check still runs |
+
+The ATS path is the deliberate exception. That read is already best-effort — `score_resume`
+falls back to text-only checks when the PDF is unavailable — so a refusal degrades the score
+instead of breaking the feature for every resume uploaded before capture. The reason is logged
+with its code: `Scoring resume_id=... without its PDF: storage not confirmed (...)`.
+
+In every case the resume, its derived rows and its file are untouched. The check runs before any
+I/O and before any row is deleted, so a retry after the configuration is corrected simply works,
+and nothing has been written into the wrong bucket in the meantime — not even a delete marker.
+
+### Recovering
+
+A resume under a fingerprint that is merely not the live one needs no data change: point the
+service at the storage those uploads went to and it resolves, because the refusal is stateless.
+
+A resume with **no** recorded destination is the same decision as §12's, with the same
+prohibition. **Do not stamp the current configuration onto it.** The only value available is
+this process's own, and if it is wrong the object becomes unreachable rather than deleted the
+moment a deletion reports success. Establish which bucket was configured when the resume was
+uploaded, from deployment history against `resumes.created_at`, then set the columns narrowly by
+resume id and re-run the review script before letting anything act on them. If that cannot be
+established, those objects cannot be confirmed erased, and that is the honest thing to record
+rather than a deletion that reports success.
+
+The migration is `b2e7f14ac903`. Its `downgrade()` drops the columns, which makes **every**
+resume unconfirmable — fail-closed in that direction too, so downloads and deletions refuse
+across the board until it is reapplied. `file_path` is untouched, so nothing becomes
+unreachable.
