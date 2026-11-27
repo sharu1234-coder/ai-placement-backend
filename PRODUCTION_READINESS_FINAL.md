@@ -202,8 +202,11 @@ native Android app via OkHttp/Retrofit, which is not subject to browser CORS enf
 all. `TrustedHostMiddleware` (Host header allowlist), a body-size cap (12MB ASGI middleware),
 and conditional HSTS (production + actual HTTPS only, checked fresh per request) are all
 wired in and tested. TLS itself terminates at the reverse proxy/platform, not this app —
-documented, with the required Uvicorn `--proxy-headers`/`--forwarded-allow-ips` flags spelled
-out in README. **FUTURE ENHANCEMENT**: if a browser-based admin dashboard or web client is
+documented. The trusted-proxy policy is no longer a documented flag at all: it is fixed in
+`app/server.py`, enforced at startup by `validate_for_production`, and specified in
+`docs/PRODUCTION_DEPLOYMENT.md` section 28.2. The README's HTTPS entry covers scheme
+detection and HSTS only -- it is not the authority on client-IP trust, and reading it as such
+is what produced the error corrected in item 5 of the go-live list below. **FUTURE ENHANCEMENT**: if a browser-based admin dashboard or web client is
 ever added, CORS middleware will need to be added then, scoped to that client's real origin.
 
 ### 9. Rate limiting and abuse protection — READY
@@ -401,10 +404,25 @@ billing, domains, or physical keys/devices.
    without being asked to. *(#1, #11 area)*
 4. **Set `ENVIRONMENT=production`, `DEBUG=false`, and `ALLOWED_HOSTS`** to the real
    production domain(s) once one exists. *(#1, #8)*
-5. **Run the backend behind a reverse proxy / platform that terminates TLS**, and start
-   Uvicorn with `--proxy-headers --forwarded-allow-ips=<proxy IP or "*">` so HSTS and
-   scheme-detection work correctly (documented in backend README's "HTTPS / network
-   security" entry). *(#8)*
+5. **Run the backend behind a reverse proxy that terminates TLS**, and start it with
+   `python -m app.server` -- the only supported start, which fixes the bind, the worker
+   count and the trusted-proxy policy itself. Do **not** hand-write a `uvicorn` command.
+   See `docs/PRODUCTION_DEPLOYMENT.md` section 28 for the committed DigitalOcean + Nginx
+   topology, section 28.2 for the trusted-proxy policy, and `deploy/` for the reviewed
+   Nginx and systemd files. *(#8)*
+
+   **Corrected 2026-11-28 (Phase 2B).** This item previously read
+   `--forwarded-allow-ips=<proxy IP or "*">`, offering the wildcard as an equal option, and
+   cited the README's HTTPS entry as the source. That was wrong and it was the most
+   dangerous sentence in this document, because this is the checklist an operator actually
+   follows at deploy time. The README entry it cited was written about `X-Forwarded-Proto`
+   and HSTS, where the wildcard is harmless; for client-IP resolution it is not. With the
+   wildcard, Uvicorn trusts every peer and takes the leftmost `X-Forwarded-For` value --
+   the one the caller wrote -- so any attacker chooses their own rate-limit key, rotates it
+   per request, and every IP-keyed authentication limit (login 5/minute, signup 3/hour,
+   password reset 10/minute) stops applying to anybody. `app/core/config.py` now refuses to
+   start production on that value, and `tests/unit/test_proxy_trust.py` demonstrates the
+   attack rather than asserting the rule.
 6. **Generate a real Android release keystore** (`keytool -genkeypair ...`, command already in
    `keystore.properties.example`) and store it somewhere safe, backed up, **outside version
    control** — losing it means never being able to publish an update to an already-published
@@ -444,8 +462,10 @@ actually ready to deploy:
 3. Pick and configure AI/storage/email vendors → get their credentials.
 4. Set all of the above plus `ENVIRONMENT=production`, `DEBUG=false`, `ALLOWED_HOSTS` in the
    backend's deployment platform's secret/env store.
-5. Deploy the backend behind a TLS-terminating reverse proxy/platform;
-   start with `--proxy-headers --forwarded-allow-ips=...`.
+5. Deploy the backend behind a TLS-terminating reverse proxy, and start it with
+   `python -m app.server`. Never with a hand-written `uvicorn` command, and never with
+   `--forwarded-allow-ips="*"` -- see item 5 above and `docs/PRODUCTION_DEPLOYMENT.md`
+   section 28.2.
 6. Run `alembic upgrade head` against the real production database (or let the deployment
    platform's release step do it) — verify via `GET /health/ready` (`schema: "current"`).
 7. Confirm `GET /health` and `GET /health/ready` both return 200 from the real public URL.

@@ -1,0 +1,71 @@
+[Unit]
+# TALVIORA AI -- the account-deletion outbox worker.
+#
+# A TEMPLATE, like talviora-api.service. Install as
+# /etc/systemd/system/talviora-worker.service.
+#
+# This is a separate process from the API on purpose. It erases stored objects, and
+# `scripts/run_deletion_worker.py` claims jobs under a lease so that exactly one pass
+# acts on a job at a time. Running it inside a web worker would tie erasure progress
+# to request traffic and make a deploy interrupt an in-flight erasure.
+#
+# It holds no public listener, accepts no input from the internet, and needs no proxy
+# configuration at all -- so nothing in this unit concerns FORWARDED_ALLOW_IPS. The
+# API's rate limits are unaffected by it.
+#
+# RUN EXACTLY ONE INSTANCE. Not for rate-limit reasons -- the lease handles
+# concurrency correctly -- but because a second instance doubles the request rate
+# against object storage for no gain. If a second one is ever wanted, read the lease
+# and retry semantics in docs/runbook-deletion-worker.md first.
+
+Description=TALVIORA AI account-deletion outbox worker
+Documentation=file:///opt/talviora/ai-placement-backend/docs/runbook-deletion-worker.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+
+User=talviora
+Group=talviora
+
+WorkingDirectory=/opt/talviora/ai-placement-backend
+
+# The same unversioned secrets file as the API: this worker needs DATABASE_URL and the
+# STORAGE_S3_* credentials, and must see the same ones.
+EnvironmentFile=/etc/talviora/api.env
+Environment=PYTHONUNBUFFERED=1
+
+# A long-running loop with its own interval, not a cron job: it holds leases and backs
+# off per job. --interval and --batch default inside the script; set them here only
+# with a reason, because the defaults are tuned to the retry schedule in the runbook.
+ExecStart=/opt/talviora/ai-placement-backend/.venv/bin/python scripts/run_deletion_worker.py
+
+# SIGINT so a pass can finish its current job rather than being cut between the
+# storage erase and the database update. 60s because an erase enumerates and deletes
+# object versions over the network, which is slower than a web request.
+#
+# Being killed mid-pass is safe by design -- a job keeps its lease, the lease expires,
+# and another pass reclaims it -- but finishing cleanly avoids the wait.
+KillSignal=SIGINT
+TimeoutStopSec=60
+
+Restart=on-failure
+RestartSec=10s
+
+# --- hardening ----------------------------------------------------------------------
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+
+ReadWritePaths=/var/log/talviora
+
+[Install]
+WantedBy=multi-user.target

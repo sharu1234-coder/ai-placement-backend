@@ -597,6 +597,16 @@ secret-shaped setting that had no fail-safe.
   (`request.url.scheme`, checked fresh per request, not cached at import) — verified live
   via a `TestClient(app, base_url="https://testserver")` in tests, not just asserted from
   reading the code.
+- **Superseded for production by Phase 2B (2026-11-28).** The two flags described below are no
+  longer something a deployment passes by hand. `python -m app.server` is the only supported
+  production start: it fixes `proxy_headers`, `forwarded_allow_ips=127.0.0.1`, the loopback
+  bind and `workers=1`, then verifies the middleware object it built. `validate_for_production`
+  refuses to boot if the environment states no policy or an unsafe one. The committed topology,
+  the Nginx config and the reasoning are in `docs/PRODUCTION_DEPLOYMENT.md` section 28, which is
+  the authority; the two bullets below remain as the explanation of *why* the flags matter.
+  Note especially that this entry is about `X-Forwarded-Proto` and HSTS -- it is not the
+  authority on client-IP trust, and citing it as such is what produced the unsafe wildcard
+  recommendation corrected in `PRODUCTION_READINESS_FINAL.md`.
 - **Deployment requirement, documented not automated**: if this app runs behind a reverse
   proxy (the normal case), start Uvicorn with `--proxy-headers` and `--forwarded-allow-ips`
   set to the proxy's IP or CIDR (see the rate-limiting bullet below before reaching for `*` —

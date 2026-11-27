@@ -1,0 +1,79 @@
+[Unit]
+# TALVIORA AI -- the API process.
+#
+# A TEMPLATE. Review it, adjust the three paths and the user, then install it as
+# /etc/systemd/system/talviora-api.service. Nothing here is secret and nothing here
+# should ever become secret -- see EnvironmentFile below.
+#
+# The ExecStart line is the whole point of this file. It names app.server and passes
+# no arguments, because `python -m app.server` takes none: the host, port, worker
+# count and trusted-proxy policy are fixed in app/server.py, where they are reviewed
+# in commits rather than edited on a host at 2am. A unit that instead invoked
+# `uvicorn app.main:app --host 0.0.0.0 --forwarded-allow-ips="*"` would start
+# perfectly and silently disable every IP-keyed authentication limit in the
+# application, and nothing in the process could detect it. There is deliberately no
+# second supported way to start this service.
+
+Description=TALVIORA AI API (FastAPI/Uvicorn behind Nginx)
+Documentation=file:///opt/talviora/ai-placement-backend/docs/PRODUCTION_DEPLOYMENT.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+
+# A dedicated unprivileged account. Never root: this process accepts untrusted input
+# from the internet, and it only ever needs to read the application directory and
+# reach PostgreSQL and object storage over the network.
+User=talviora
+Group=talviora
+
+WorkingDirectory=/opt/talviora/ai-placement-backend
+
+# Secrets live ONLY here -- DATABASE_URL, JWT_SECRET_KEY, STORAGE_S3_*, SMTP_*,
+# ANTHROPIC_API_KEY, TOKEN_ENCRYPTION_KEY. This file is not in version control and
+# must not be. Create it as root with `install -m 0640 -o root -g talviora`, so the
+# service can read it and other users on the host cannot.
+#
+# FORWARDED_ALLOW_IPS deliberately does NOT belong in that file. app/server.py sets
+# the policy itself, and refuses to start if the environment states a different one --
+# so putting it here can only create a second place for the policy to drift or be
+# weakened. Leave it out and let the launcher own it.
+EnvironmentFile=/etc/talviora/api.env
+
+# Unbuffered, so journald sees a log line when it is written rather than when a buffer
+# happens to flush. Matters while reading logs during an incident.
+Environment=PYTHONUNBUFFERED=1
+
+ExecStart=/opt/talviora/ai-placement-backend/.venv/bin/python -m app.server
+
+# SIGINT rather than SIGTERM: Uvicorn treats it as a graceful shutdown and finishes
+# in-flight requests. 30s is enough for a slow AI-backed request to complete; a live
+# voice WebSocket will be cut, which is correct on a deliberate restart.
+KillSignal=SIGINT
+TimeoutStopSec=30
+
+Restart=on-failure
+RestartSec=5s
+
+# --- hardening ----------------------------------------------------------------------
+# Each of these would be noticed immediately if it broke something, which is why they
+# are worth having rather than being left to a later "hardening pass" that never comes.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+
+# ProtectSystem=strict makes the filesystem read-only, so name the exceptions. Add a
+# ReadWritePaths line for an upload directory only if STORAGE_PROVIDER is local -- and
+# it must not be in production, which validate_for_production already enforces.
+ReadWritePaths=/var/log/talviora
+
+[Install]
+WantedBy=multi-user.target

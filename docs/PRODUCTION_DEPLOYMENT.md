@@ -912,6 +912,269 @@ alert on the Cron Job exiting 1.
 | Cron exits 1 hourly | No env group attached | Step 12 |
 | Intermittent "too many connections" | Workers × 30 over the plan cap | Lower `--workers` (section 26.1) |
 
+## 28. DigitalOcean BLR1 — the committed single-server topology
+
+The design this repository is configured for, as of Phase 2B. Section 26 (Render) remains as an
+alternative and section 7 remains the general rule; this section is the specific one, and where
+they disagree about the trusted proxy, **this section and section 7 are right**.
+
+```
+Internet
+  -> DigitalOcean Cloud Firewall  (443, 80, and 22 from admin IPs only)
+     -> Nginx on the Droplet      (public :443 and :80, TLS terminated here)
+        -> Uvicorn                (127.0.0.1:8000, ONE worker)
+           -> app/core/rate_limit.py  (authentication limits keyed on the client address)
+
+  talviora-worker.service          (same host, no listener, no public surface)
+  DigitalOcean Managed PostgreSQL  (private network, trusted sources = this Droplet only)
+```
+
+One 4 GB / 2 vCPU Droplet in BLR1, Ubuntu, plus Managed PostgreSQL. No Redis or Valkey — see the
+scaling gate below for the condition under which that changes.
+
+### 28.1 What is committed, and why that matters
+
+| File | What it fixes |
+| --- | --- |
+| `app/server.py` | The only supported start. Takes no arguments; fixes host, port, workers and trusted proxy |
+| `app/core/config.py` | `validate_for_production` refuses to boot on an absent or unsafe proxy policy |
+| `deploy/nginx/talviora-api.conf` | The reverse proxy, including the `X-Forwarded-For` overwrite |
+| `deploy/systemd/talviora-api.service` | The API unit, whose `ExecStart` is `python -m app.server` |
+| `deploy/systemd/talviora-worker.service` | The deletion-outbox worker unit |
+| `tests/unit/test_proxy_trust.py` | Tests against the real pinned `ProxyHeadersMiddleware` |
+| `tests/unit/test_auth_rate_limit_keys.py` | The five IP-keyed limits and the IPv6 /64 behaviour |
+
+Before this, none of it existed in version control: the topology was prose, the trusted-proxy
+value was whatever a command line happened to say, and nothing could be reviewed or diffed.
+
+### 28.2 Trusted proxy configuration
+
+**`FORWARDED_ALLOW_IPS=127.0.0.1`, and nothing else, ever.**
+
+Nginx and Uvicorn share a host; Uvicorn listens only on loopback. So exactly one address can ever
+speak for a client, and the policy is that one address written literally — not a range, not a
+CIDR, not `*`.
+
+Three independent layers enforce it, and it is worth being exact about what each one does and
+does not cover, because overstating any of them is how this gets weakened later:
+
+1. **`app/server.py` passes the policy to Uvicorn itself** and then inspects the
+   `ProxyHeadersMiddleware` object it built — the real trust container, not the configuration
+   meant to produce it. This is the only check that sees what will actually serve traffic. It
+   covers a start made through the supported path.
+2. **`validate_for_production` reads `FORWARDED_ALLOW_IPS` from the process environment** and
+   refuses to boot on unset, empty, `*`, any range, any other address, a stray comma, or anything
+   unparseable. It reads `os.environ` and not a `Settings` field on purpose: pydantic loads
+   `.env` and Uvicorn does not, so a value written only to `.env` would satisfy a settings-based
+   check while Uvicorn kept its own default. This covers a start made *outside* the launcher —
+   including a hand-typed `uvicorn app.main:app`, which fails closed.
+3. **The unit file names `python -m app.server`** and there is no second supported command.
+
+**What none of them covers:** a command line that contradicts the environment. A
+`--forwarded-allow-ips` flag wins inside Uvicorn, and `ProxyHeadersMiddleware` wraps the ASGI app
+from outside, so no code in the process can observe the flag that was used. This is closed by
+having one start mechanism, not by a check. Do not describe layer 2 as protection against a CLI
+override.
+
+**Why the wildcard is never acceptable, including temporarily.** With `always_trust`, Uvicorn
+takes the *leftmost* `X-Forwarded-For` value — the one the caller wrote — and skips the peer check
+entirely, so it works from anywhere. An attacker then sets their own rate-limit key and rotates it
+per request, and every IP-keyed limit, including login, signup and password reset, applies to
+nobody. `tests/unit/test_proxy_trust.py::TestWhyTheWildcardIsForbidden` demonstrates this rather
+than asserting it.
+
+**The failure that looks like an outage.** A *malformed* policy is more likely than a malicious one
+and is worse to diagnose. Uvicorn keeps anything it cannot parse as a string literal that matches
+no client address, and its own source says "it is not possible for the user to know they provided a
+malformed IP type". So `127.0.0.1/33` or `127.0.0..1` trusts **nothing**: every request resolves to
+Nginx, all unauthenticated callers share one bucket, and **login caps at 5/minute for the entire
+user base** — one person's attempts lock out everybody. That is why the guard parses strictly and
+refuses at startup instead of warning.
+
+**How to verify it on the host**, rather than assuming:
+
+```bash
+# From a machine that is NOT the Droplet, against a staging domain:
+curl -s -H 'X-Forwarded-For: 203.0.113.99' https://api.example.com/health/ready
+# Then confirm in the logs that the request was attributed to YOUR address,
+# not to 203.0.113.99 and not to 127.0.0.1.
+journalctl -u talviora-api -n 50 --no-pager
+```
+
+If the log shows `203.0.113.99`, the policy is too permissive — stop and fix it before going
+further. If it shows `127.0.0.1` for every request, Nginx is not forwarding or the policy is
+malformed; both are the all-one-bucket failure.
+
+### 28.3 Nginx
+
+Install `deploy/nginx/talviora-api.conf`, replacing `api.example.com`:
+
+```bash
+sudo cp deploy/nginx/talviora-api.conf /etc/nginx/sites-available/talviora-api
+sudo ln -sf /etc/nginx/sites-available/talviora-api /etc/nginx/sites-enabled/talviora-api
+sudo rm -f /etc/nginx/sites-enabled/default      # or it answers on the same port
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+Two properties of that file are load-bearing:
+
+- **`proxy_set_header X-Forwarded-For $remote_addr;`** — overwrite, never append. Nginx's
+  documentation defines `$proxy_add_x_forwarded_for` as the client's own header *with*
+  `$remote_addr` appended, so it preserves caller-supplied content. Uvicorn would still resolve
+  correctly (it walks right-to-left), but overwriting means nothing a caller wrote reaches the
+  application at all. **Do not use `$proxy_add_x_forwarded_for` in this topology.**
+- **Every `proxy_set_header` is repeated in every `location`.** Nginx inherits these
+  all-or-nothing: defining one at a level discards every inherited one. A `location` that set only
+  `Upgrade` would silently lose `X-Forwarded-For` and resolve every client to `127.0.0.1`.
+
+TLS via Let's Encrypt:
+
+```bash
+sudo mkdir -p /var/www/certbot
+sudo certbot certonly --webroot -w /var/www/certbot -d api.example.com
+sudo systemctl list-timers | grep certbot      # confirm renewal is actually scheduled
+```
+
+### 28.4 Firewall rules
+
+**DigitalOcean Cloud Firewall** (applied to the Droplet, in the control panel or via `doctl`):
+
+| Direction | Protocol / port | Sources / destinations | Why |
+| --- | --- | --- | --- |
+| Inbound | TCP 443 | `0.0.0.0/0`, `::/0` | HTTPS |
+| Inbound | TCP 80 | `0.0.0.0/0`, `::/0` | ACME challenge and the 301 only |
+| Inbound | TCP 22 | **your admin IP(s) only** | SSH. Never `0.0.0.0/0` |
+| Inbound | TCP 8000 | **no rule at all** | Uvicorn must never be publicly reachable |
+| Outbound | TCP 443 | `0.0.0.0/0` | Managed PostgreSQL, object storage, AI and email providers |
+| Outbound | TCP 25 | **no rule** | Blocked; use the provider's submission port |
+
+**UFW on the Droplet**, as defence in depth — the cloud firewall can be detached from a Droplet by
+a console action, and then the host rules are all that remain:
+
+```bash
+sudo ufw default deny incoming
+sudo ufw default allow outgoing
+sudo ufw allow from <ADMIN_IP> to any port 22 proto tcp
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+sudo ufw enable
+sudo ufw status verbose          # confirm 8000 appears nowhere
+```
+
+Port 8000 is deliberately absent from both. It needs no rule because `app/server.py` binds
+loopback, and that bind — not the firewall — is the primary control: it holds even if every
+firewall rule is wrong.
+
+**SSH hardening** in `/etc/ssh/sshd_config`:
+
+```
+PermitRootLogin no
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+AllowUsers talviora-admin
+```
+
+Keys only. Reload with `sudo systemctl reload ssh`, and **keep the current session open** until a
+second one has authenticated successfully.
+
+### 28.5 Managed PostgreSQL
+
+- **Trusted sources:** add the Droplet (or its VPC) as the only trusted source. A managed database
+  that accepts connections from any IP is reachable by anyone holding a leaked connection string,
+  and that string lives in `/etc/talviora/api.env`.
+- **Use the private network / VPC host** from the connection details, not the public one, so
+  traffic between the Droplet and the database never leaves DigitalOcean's network.
+- **TLS is required outbound.** Append `?sslmode=require` to `DATABASE_URL`. `sslmode=require`
+  encrypts; `verify-full` also authenticates the server and is preferable where the CA certificate
+  is available from the control panel. Note that `validate_for_production` currently only rejects a
+  SQLite URL — it does **not** assert `sslmode`, so this is an operator responsibility today and a
+  candidate for a future guard.
+- **Automated backups** are on by default for managed databases; confirm the retention window and
+  check section 11 for what this repository's own backup script adds.
+
+### 28.6 Operating the services
+
+```bash
+sudo cp deploy/systemd/talviora-api.service    /etc/systemd/system/
+sudo cp deploy/systemd/talviora-worker.service /etc/systemd/system/
+sudo install -d -m 0750 -o root -g talviora /etc/talviora
+sudo install -m 0640 -o root -g talviora /dev/null /etc/talviora/api.env   # then edit it
+sudo systemctl daemon-reload
+sudo systemctl enable --now talviora-api talviora-worker
+```
+
+`/etc/talviora/api.env` holds every secret and **is not in version control**. Do not put
+`FORWARDED_ALLOW_IPS` in it: `app/server.py` sets the policy and refuses to start if the
+environment contradicts it, so a copy there can only create a second place for it to drift.
+
+**Restart procedure.** Nginx and the API restart independently, and the order matters only in that
+Nginx keeps answering while the API is down — clients see 502 rather than a connection failure:
+
+```bash
+# Application code change:
+sudo systemctl restart talviora-api        # in-flight requests finish (SIGINT, 30s grace)
+
+# Proxy change -- test before reloading, and reload rather than restart:
+sudo nginx -t && sudo systemctl reload nginx
+
+# After any restart:
+curl -fsS https://api.example.com/health/ready && echo OK
+journalctl -u talviora-api -n 30 --no-pager
+```
+
+A restart cuts live voice WebSocket sessions and **resets every rate-limit counter** — see the
+scaling gate. Prefer `reload` for Nginx; there is no reload for the API.
+
+### 28.7 The scaling gate
+
+**Do not add a second Uvicorn worker, a second Droplet, or a load balancer until a shared
+rate-limit store is in place and verified.**
+
+The limiter's counters are in-process (`limits` 5.8.0 in-memory storage). With one worker there is
+one copy of every counter and the configured limit is the real limit. With N processes each
+enforces its own copy, so every limit — including login at 5/minute — silently becomes N times
+itself. There is no error, no log line and no failing health check;
+`tests/unit/test_auth_rate_limit_keys.py::TestWhatOneProcessGuarantees` demonstrates it
+deliberately so the cost is executable rather than a sentence.
+
+This is why `app/server.py` fixes `workers=1`. It is a security setting, not a capacity tuning knob.
+
+When capacity genuinely runs out, in order of preference:
+
+1. **Vertical first.** A larger Droplet keeps one process and needs no new guarantees.
+2. **Then a shared counter store.** `limits` 5.8.0 ships Redis, Redis Cluster, Redis Sentinel,
+   Memcached and MongoDB backends, so Valkey is a storage-URI change — but the `redis` client is
+   **not currently a dependency**, so it is a new pin as well as a new service. DigitalOcean
+   Managed Valkey is $15.00/month at 1 GiB, which is ample for counters. There is **no PostgreSQL
+   backend** in `limits`; using the existing database would mean writing a custom `Storage`
+   subclass with correct atomic increment-and-expire semantics plus expiry sweeping. Cheaper in
+   dollars, considerably more code and risk.
+3. **Only then** more workers or replicas, with the shared store verified under load.
+
+**Accepted limitation, recorded rather than hidden:** counters reset on restart, so an attacker who
+can trigger or wait out a deploy gets a fresh set of login attempts. Closing it needs durable
+per-account state, which is a separate threat model and deliberately out of this phase — account
+lockout can itself be abused to deny a student access to their own account, so it is not a change
+to make casually.
+
+### 28.8 Cloudflare is a different topology
+
+If Cloudflare is ever put in front of this, **nothing in this section carries over** and its headers
+must not be trusted until the chain is explicitly configured:
+
+- The client address would arrive in `CF-Connecting-IP`, which Uvicorn 0.52.4 does not read at all,
+  and `X-Forwarded-For` would then be Cloudflare-supplied.
+- Trusting it requires pinning Cloudflare's published IP ranges in nginx's `set_real_ip_from` (the
+  realip module accepts `address | CIDR | unix:` and supports IPv6), setting `real_ip_recursive on`
+  to skip trusted hops, **and** refusing any connection that does not originate from those ranges —
+  otherwise an attacker simply bypasses Cloudflare, hits the origin directly, and spoofs freely.
+  Closing the origin to everything except Cloudflare is the part most often skipped, and without it
+  the proxy adds an attack path instead of removing one.
+- `FORWARDED_ALLOW_IPS` stays `127.0.0.1`: Nginx remains Uvicorn's only peer. The new trust decision
+  belongs in Nginx, not in Uvicorn.
+
+Treat it as a new design with its own test matrix, not a configuration tweak.
+
 ## Android handoff
 
 Backend deployment gives Android exactly these:
