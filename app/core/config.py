@@ -1,3 +1,5 @@
+import ipaddress
+import os
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -555,3 +557,134 @@ def validate_for_production() -> None:
                 'python -c "from cryptography.fernet import Fernet; '
                 'print(Fernet.generate_key().decode())"'
             )
+
+    # Last, because it is the only check here about something OUTSIDE this process. Everything
+    # above reads a `Settings` field; this reads the real environment, deliberately.
+    #
+    # FORWARDED_ALLOW_IPS is Uvicorn's variable, not this app's, and the distinction matters:
+    # `Settings` loads `.env` (see model_config above) and Uvicorn does not. A value written
+    # only into `.env` would satisfy a pydantic-backed check while Uvicorn kept its own
+    # default -- the guard would pass and prove nothing. So this reads os.environ, which is
+    # exactly what the server process will see.
+    #
+    # What this covers, precisely: a production start whose environment does not state a
+    # trusted-proxy policy, or states an unsafe or unparseable one. What it does NOT cover: a
+    # command line that contradicts the environment. `uvicorn --forwarded-allow-ips="*"` wins
+    # over this variable inside Uvicorn, and ProxyHeadersMiddleware wraps the ASGI app from
+    # outside, so nothing running in here can observe it. That hole is closed by not having a
+    # second way to start the server -- see app/server.py, which takes no proxy arguments at
+    # all -- and not by this check. Do not describe this guard as protection against a CLI
+    # override; it is protection against an absent or wrong policy.
+    fault = forwarded_allow_ips_fault(os.environ.get(FORWARDED_ALLOW_IPS_ENV))
+    if fault is not None:
+        raise RuntimeError(
+            f"{fault} Client IP resolution feeds the authentication rate limits "
+            "(app/core/rate_limit.py), so getting this wrong either hands every attacker a "
+            "fresh login quota per request or collapses the whole user base into one bucket. "
+            "Start the server with app/server.py (python -m app.server), which sets this "
+            "policy itself, or set the variable to exactly "
+            f"{TRUSTED_PROXY_IPS!r} in the unit's environment file."
+        )
+
+
+#: The only trusted-proxy value this deployment topology permits, as a bare address.
+#:
+#: Internet -> Nginx -> Uvicorn on 127.0.0.1:8000, all on one host. Nginx is the only thing
+#: that can reach Uvicorn, so the set of addresses allowed to speak for a client is exactly
+#: one loopback address. It is written here rather than inferred so that a reviewer can see
+#: the policy, and so `app/server.py` and this guard cannot drift apart.
+TRUSTED_PROXY_IPS = "127.0.0.1"
+
+#: Rejected outright rather than range-checked. `0.0.0.0/0` and `::/0` are every address;
+#: `127.0.0.0/8` is wider than the one proxy that exists. A CIDR is never correct for a
+#: single-proxy same-host topology, so the guard refuses the whole shape.
+FORWARDED_ALLOW_IPS_ENV = "FORWARDED_ALLOW_IPS"
+
+
+def forwarded_allow_ips_fault(raw: Optional[str]) -> Optional[str]:
+    """Why `raw` is not an acceptable trusted-proxy policy, or None if it is.
+
+    Pure and string-in/string-out so the whole decision table is testable without starting a
+    server or setting process state. `validate_for_production` turns a fault into a startup
+    failure; `app/server.py` uses the same function to check what it is about to hand Uvicorn.
+
+    This deliberately does NOT reproduce Uvicorn's parsing. `uvicorn.middleware.proxy_headers`
+    puts anything it cannot parse as an address or network into a set of string literals and
+    carries on -- its own source comment says "it is not possible for the user to know they
+    provided a malformed IP type - this may lead to unexpected / difficult to debug
+    behaviour". A literal can never equal a parsed client address, so a typo such as
+    `127.0.0..1` or `127.0.0.1/33` silently trusts *nothing*: every request then appears to
+    come from Nginx, every unauthenticated caller shares one rate-limit bucket, and login
+    caps at 5/minute for the entire user base. That is an outage shaped like an attack, and it
+    is the reason this guard parses strictly and refuses rather than warning.
+    """
+    if raw is None:
+        return (
+            f"{FORWARDED_ALLOW_IPS_ENV} is not set. Uvicorn would fall back to its own "
+            f"default, which happens to be {TRUSTED_PROXY_IPS!r} today -- but a trusted-proxy "
+            "policy that is only correct by accident is not a policy. Set it explicitly."
+        )
+    if not raw.strip():
+        return f"{FORWARDED_ALLOW_IPS_ENV} is set but empty, which trusts nothing and no-one."
+
+    entries = [entry.strip() for entry in raw.split(",")]
+
+    if any(not entry for entry in entries):
+        return (
+            f"{FORWARDED_ALLOW_IPS_ENV}={raw!r} contains an empty entry (a stray or trailing "
+            "comma). Uvicorn would treat it as an unparseable literal and trust nothing."
+        )
+    if "*" in entries:
+        return (
+            f"{FORWARDED_ALLOW_IPS_ENV}={raw!r} contains '*', which trusts every peer. "
+            "Uvicorn then takes the LEFTMOST X-Forwarded-For value -- the one the caller "
+            "chose -- as the client address, so any attacker can set their own rate-limit "
+            "key and rotate it per request. Every IP-keyed limit, including login, signup and "
+            "password reset, stops applying to anybody. This is never acceptable, not even "
+            "temporarily, and not behind another proxy."
+        )
+    for entry in entries:
+        if "/" in entry:
+            try:
+                network = ipaddress.ip_network(entry, strict=False)
+            except ValueError:
+                return (
+                    f"{FORWARDED_ALLOW_IPS_ENV}={raw!r} contains {entry!r}, which is not a "
+                    "valid network. Uvicorn would keep it as a string literal and trust "
+                    "nothing, with no error."
+                )
+            if network.num_addresses > 1:
+                return (
+                    f"{FORWARDED_ALLOW_IPS_ENV}={raw!r} contains the range {entry!r}, which "
+                    f"covers {network.num_addresses} addresses. This topology has exactly one "
+                    f"proxy, on the same host, so the policy is the single address "
+                    f"{TRUSTED_PROXY_IPS!r}. A range is either wider than the proxy or -- for "
+                    "0.0.0.0/0 and ::/0 -- every address on the internet."
+                )
+            return (
+                f"{FORWARDED_ALLOW_IPS_ENV}={raw!r} uses CIDR notation for a single host. "
+                f"Write the bare address {TRUSTED_PROXY_IPS!r} instead, so that what is "
+                "configured reads the same as the policy it implements."
+            )
+        try:
+            address = ipaddress.ip_address(entry)
+        except ValueError:
+            return (
+                f"{FORWARDED_ALLOW_IPS_ENV}={raw!r} contains {entry!r}, which is not a valid "
+                "IP address. Uvicorn would keep it as a string literal, match it against no "
+                "client, and trust nothing -- silently."
+            )
+        if str(address) != TRUSTED_PROXY_IPS:
+            return (
+                f"{FORWARDED_ALLOW_IPS_ENV}={raw!r} trusts {entry!r}, which is not this "
+                f"topology's proxy. Uvicorn is reachable only on 127.0.0.1:8000, so the only "
+                f"peer that can ever speak for a client is {TRUSTED_PROXY_IPS!r}. If the "
+                "proxy has genuinely moved to another host, that is a different topology: "
+                "change this policy deliberately, in one place, and re-run the proxy tests."
+            )
+    if entries != [TRUSTED_PROXY_IPS]:
+        return (
+            f"{FORWARDED_ALLOW_IPS_ENV}={raw!r} lists {len(entries)} entries. One proxy "
+            f"exists, so the policy is exactly {TRUSTED_PROXY_IPS!r} and nothing else."
+        )
+    return None
