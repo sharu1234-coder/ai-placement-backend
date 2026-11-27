@@ -307,6 +307,15 @@ class TestTheFileIsStoredButTheDatabaseFails:
         """
         from pathlib import Path
 
+        # Captured BEFORE `monkeypatch.undo()`, and that is the whole correctness of this test.
+        # `local_storage` points `settings.upload_dir` at a throwaway directory using the same
+        # function-scoped `monkeypatch` this test requests, so `undo()` restores the real
+        # configured directory as well as `db.commit`. Reading `settings.upload_dir` after the
+        # undo therefore inspects the developer's actual uploads folder: on a machine with
+        # leftover files there this passed while looking at nothing it had written, and on a
+        # clean checkout it failed. Neither outcome said anything about the orphan.
+        uploads = Path(settings.upload_dir)
+
         profile_id = make_profile(db)
         monkeypatch.setattr(db, "commit", lambda: (_ for _ in ()).throw(RuntimeError("gone")))
 
@@ -315,7 +324,7 @@ class TestTheFileIsStoredButTheDatabaseFails:
 
         monkeypatch.undo()
         db.rollback()
-        written = list(Path(settings.upload_dir).rglob("*.pdf"))
+        written = list(uploads.rglob("*.pdf"))
         assert written, "the object really is left behind -- this is the gap, not a pass"
         assert db.query(Resume).count() == 0, "with no row pointing at it"
 
