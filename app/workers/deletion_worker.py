@@ -45,6 +45,7 @@ from app.models.deletion_job import (
 )
 from app.models.deletion_request import UNRESOLVED_STATUSES, DeletionRequest
 from app.models.user import User
+from app.storage import identity as identity_module
 from app.storage.erasure import ERASURE_NOT_IMPLEMENTED, IMMEDIATE_ATTENTION_CODES
 from app.storage.identity import StorageIdentity
 from app.storage.provider import StorageError, StorageProvider
@@ -83,47 +84,35 @@ ATTENTION_AFTER_ATTEMPTS = 5
 #: Why a job may not proceed to a destructive call. Each is an explicit non-success state, never
 #: an idempotent success, and each stays claimable so it resumes once an operator fixes the
 #: cause.
-IDENTITY_UNKNOWN = "StorageIdentityUnknown"
-IDENTITY_INCOMPLETE = "StorageIdentityIncomplete"
-IDENTITY_UNDETERMINABLE = "StorageIdentityUndeterminable"
-IDENTITY_MISMATCH = "StorageIdentityMismatch"
+# Re-exported, not redefined. These moved to `app/storage/identity.py` when `resumes`
+# started recording an identity too, so that the rule deciding whether a destination is
+# confirmed exists once. The names stay reachable here because this module is where the
+# reasoning was established and where the runbook, the operator report and the tests refer to
+# them. See `destination_refusal` for the long-form justification of each branch.
+IDENTITY_UNKNOWN = identity_module.IDENTITY_UNKNOWN
+IDENTITY_INCOMPLETE = identity_module.IDENTITY_INCOMPLETE
+IDENTITY_UNDETERMINABLE = identity_module.IDENTITY_UNDETERMINABLE
+IDENTITY_MISMATCH = identity_module.IDENTITY_MISMATCH
 #: The job recorded an owner guard and this worker is configured with a different one.
-IDENTITY_OWNER_MISMATCH = "StorageOwnerMismatch"
+IDENTITY_OWNER_MISMATCH = identity_module.IDENTITY_OWNER_MISMATCH
 #: The job recorded an owner guard and this worker has none, so it cannot assert it on the
 #: wire. Distinct from a mismatch because the fix is different: one is a wrong value, the
 #: other is a missing setting.
-IDENTITY_OWNER_UNCONFIRMED = "StorageOwnerUnconfirmed"
+IDENTITY_OWNER_UNCONFIRMED = identity_module.IDENTITY_OWNER_UNCONFIRMED
 
 #: The identity failures, for the operator report and for tests that assert none of them can
 #: reach storage.
-IDENTITY_FAILURES = frozenset(
-    {
-        IDENTITY_UNKNOWN,
-        IDENTITY_INCOMPLETE,
-        IDENTITY_UNDETERMINABLE,
-        IDENTITY_MISMATCH,
-        IDENTITY_OWNER_MISMATCH,
-        IDENTITY_OWNER_UNCONFIRMED,
-    }
-)
+IDENTITY_FAILURES = identity_module.IDENTITY_FAILURES
 
 
 def recorded_identity(job: DeletionJob) -> Optional[StorageIdentity]:
     """The destination this job was enqueued against, or None if it was never captured.
 
-    `storage_config_revision` is the marker rather than the bucket: a job whose provider is
-    `local` has no bucket either way, so without the revision there is no way to tell a job
-    created before identity capture from one created after it.
+    A thin alias now: the reader is duck-typed over the `storage_*` columns in
+    `app/storage/identity.py` because `resumes` carries the same five, and this keeps the
+    job-typed name the rest of this module and its tests use.
     """
-    if not job.storage_config_revision:
-        return None
-    return StorageIdentity(
-        provider=job.storage_provider,
-        bucket=job.storage_bucket,
-        endpoint=job.storage_endpoint,
-        region=job.storage_region,
-        expected_owner=job.storage_expected_owner,
-    )
+    return identity_module.recorded_identity(job)
 
 
 def identity_refusal(job: DeletionJob, storage: StorageProvider) -> Optional[str]:
@@ -154,26 +143,7 @@ def identity_refusal(job: DeletionJob, storage: StorageProvider) -> Optional[str
     reason -- the comparison belongs here, where the direction can be stated, rather than in a
     dataclass equality that can only say "different".
     """
-    recorded = recorded_identity(job)
-    if recorded is None:
-        return IDENTITY_UNKNOWN
-    if not recorded.is_complete:
-        return IDENTITY_INCOMPLETE
-
-    reader = getattr(storage, "identity", None)
-    live = reader() if callable(reader) else None
-    if live is None:
-        return IDENTITY_UNDETERMINABLE
-    if recorded != live:
-        return IDENTITY_MISMATCH
-    # Destination confirmed. The owner guard is compared separately because `==` above ignores
-    # it on purpose; see the docstring for why the two directions are not symmetric.
-    if recorded.expected_owner:
-        if not live.expected_owner:
-            return IDENTITY_OWNER_UNCONFIRMED
-        if recorded.expected_owner != live.expected_owner:
-            return IDENTITY_OWNER_MISMATCH
-    return None
+    return identity_module.destination_refusal(recorded_identity(job), storage)
 
 
 def _now() -> datetime.datetime:

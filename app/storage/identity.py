@@ -25,7 +25,10 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:  # avoids a cycle: provider.py imports this module.
+    from app.storage.provider import StorageProvider
 
 #: Providers for which a bucket is part of the identity rather than optional. `local` stores on
 #: the filesystem and has no bucket, so an identity without one is complete for it.
@@ -139,3 +142,122 @@ class StorageIdentity:
                 expected_owner=settings.storage_s3_expected_bucket_owner,
             )
         return cls(provider=provider)
+
+
+# --- has this destination been positively confirmed? -----------------------------------
+#
+# These codes and the rule below were `deletion_worker`'s, which is where the reasoning was
+# worked out and where its long-form justification still lives. They are here now because
+# `resumes` records an identity too, and the question "may I act on this destination" has to
+# be answered the same way for a single resume as for an account-deletion job. Two copies of a
+# fail-closed rule is one copy that can quietly become permissive; the worker imports these.
+#
+# They are facts about comparing a recorded destination with a live one, not about any one
+# caller, so nothing here knows what is being erased or read.
+
+#: No identity was recorded, so the row predates identity capture.
+IDENTITY_UNKNOWN = "StorageIdentityUnknown"
+#: An identity was recorded but does not say enough to target an object, e.g. `s3` with no
+#: bucket.
+IDENTITY_INCOMPLETE = "StorageIdentityIncomplete"
+#: The live provider cannot state where it points, so there is nothing to compare against.
+IDENTITY_UNDETERMINABLE = "StorageIdentityUndeterminable"
+#: Both destinations are known and they disagree.
+IDENTITY_MISMATCH = "StorageIdentityMismatch"
+#: An owner guard was recorded and this process is configured with a different one.
+IDENTITY_OWNER_MISMATCH = "StorageOwnerMismatch"
+#: An owner guard was recorded and this process has none, so it cannot assert it on the wire.
+#: Distinct from a mismatch because the fix differs: one is a wrong value, the other a missing
+#: setting.
+IDENTITY_OWNER_UNCONFIRMED = "StorageOwnerUnconfirmed"
+
+#: Every identity failure, for operator reports and for tests that assert none of them can
+#: reach storage.
+IDENTITY_FAILURES = frozenset(
+    {
+        IDENTITY_UNKNOWN,
+        IDENTITY_INCOMPLETE,
+        IDENTITY_UNDETERMINABLE,
+        IDENTITY_MISMATCH,
+        IDENTITY_OWNER_MISMATCH,
+        IDENTITY_OWNER_UNCONFIRMED,
+    }
+)
+
+
+def recorded_identity(row: object) -> Optional[StorageIdentity]:
+    """The destination recorded on a row, or None if it was never captured.
+
+    Duck-typed over the five `storage_*` columns rather than tied to one model, because two
+    tables now carry them -- `deletion_jobs`, where the identity is the destination of a
+    queued erasure, and `resumes`, where it is where the student's file was actually written.
+    A single reader means the "was this captured at all" question cannot be answered one way
+    in one place and another way elsewhere.
+
+    `storage_config_revision` is the marker rather than the bucket: a `local` row has no
+    bucket either way, so without the revision there is no way to tell a row written before
+    identity capture from one written after it.
+    """
+    if not getattr(row, "storage_config_revision", None):
+        return None
+    return StorageIdentity(
+        provider=getattr(row, "storage_provider", None) or "",
+        bucket=getattr(row, "storage_bucket", None),
+        endpoint=getattr(row, "storage_endpoint", None),
+        region=getattr(row, "storage_region", None),
+        expected_owner=getattr(row, "storage_expected_owner", None),
+    )
+
+
+def destination_refusal(
+    recorded: Optional[StorageIdentity], storage: "StorageProvider"
+) -> Optional[str]:
+    """Why this storage must not be acted on for that recorded destination, or None.
+
+    Fail-closed in every branch. The question is not "can I find a reason to refuse" but "has
+    the destination been positively confirmed", and anything short of that is a refusal:
+
+    * no identity recorded -- the row predates capture, and binding it to current
+      configuration is the silent-wrong-bucket path this exists to close;
+    * identity recorded but incomplete, e.g. `s3` with no bucket;
+    * the live provider cannot state where it points, so there is nothing to compare against;
+    * the two disagree;
+    * or an owner guard was recorded that this process cannot assert.
+
+    None of these can be fixed by retrying, and none is a failure of the object -- they are
+    facts about configuration.
+
+    The owner check is deliberately asymmetric, and the asymmetry is the part to review. A
+    recorded owner that this process cannot honour is a refusal: the row was written on the
+    understanding that the destination would be proved to belong to that account, and dropping
+    that proof silently is how a bucket re-created under new ownership accepts a delete it will
+    happily ignore. A recorded NULL against a process that now *has* a guard is not a refusal:
+    the guard only narrows what is accepted, the service enforces it on every call, and
+    refusing everything because an operator added a safety setting would punish adding one.
+    `StorageIdentity.expected_owner` is excluded from `==` for exactly this reason -- the
+    comparison belongs here, where the direction can be stated, rather than in a dataclass
+    equality that can only say "different".
+
+    `storage` is read through `getattr` rather than called directly so that a provider which
+    never implemented `identity` is refused rather than raising: an object that cannot say
+    where it points must not be treated as pointing at the right place.
+    """
+    if recorded is None:
+        return IDENTITY_UNKNOWN
+    if not recorded.is_complete:
+        return IDENTITY_INCOMPLETE
+
+    reader = getattr(storage, "identity", None)
+    live = reader() if callable(reader) else None
+    if live is None:
+        return IDENTITY_UNDETERMINABLE
+    if recorded != live:
+        return IDENTITY_MISMATCH
+    # Destination confirmed. The owner guard is compared separately because `==` above ignores
+    # it on purpose; see the docstring for why the two directions are not symmetric.
+    if recorded.expected_owner:
+        if not live.expected_owner:
+            return IDENTITY_OWNER_UNCONFIRMED
+        if recorded.expected_owner != live.expected_owner:
+            return IDENTITY_OWNER_MISMATCH
+    return None
