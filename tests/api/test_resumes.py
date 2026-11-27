@@ -401,9 +401,22 @@ class _RefusingStorage:
         self.deletes = 0
 
     def identity(self):
-        from app.storage.identity import StorageIdentity
+        """The *local* provider's destination, because that is where the upload really went.
 
-        return StorageIdentity(provider="refusing")
+        This double replaces the provider only for the delete call, after the file has been
+        written by the real local provider. Reporting a destination of its own would make every
+        test below fail as a destination mismatch -- correctly, since Stage B.2 refuses a
+        resume whose recorded destination is not the live one -- and the mismatch would stand
+        in for the erasure refusal each test is actually about. Impersonating the real provider
+        keeps these tests pointed at `erase`; the mismatch itself is covered on its own, in
+        `test_a_resume_stored_elsewhere_is_never_erased_from_here`.
+
+        Taken from the provider rather than hard-coded so that a change to what `local`
+        reports cannot silently turn these into mismatch tests again.
+        """
+        from app.storage.local_provider import LocalStorageProvider
+
+        return LocalStorageProvider().identity()
 
     def save(self, key, data):
         raise NotImplementedError
@@ -541,3 +554,123 @@ def test_the_file_is_really_gone_after_a_204(client, auth_headers, use_fake_ai):
     assert client.delete(f"/resumes/{resume_id}", headers=auth_headers).status_code == 204
 
     assert [p for p in stored if p.exists()] == []
+
+
+# --- storage was reconfigured after the upload ---------------------------------------------
+#
+# The case Stage B could not see. Its identity guard compared the destination recorded on a
+# deletion *job* against the live provider, which closes the window between a deletion request
+# and the worker running it. A resume's file was written long before either, so the window that
+# actually matters runs from the upload to now -- and across it, `get_storage_provider()`
+# rebuilds the provider from whatever settings say today.
+
+
+class _ElsewhereStorage:
+    """A provider pointing at a different bucket than the one that holds the file.
+
+    Deliberately able to erase and to delete, and to record both. The point is not that it
+    fails -- it would happily succeed, which is the danger. A key that is absent from the wrong
+    bucket is an idempotent success, so without the guard this reports a clean erasure, the
+    rows are deleted, and the object stays in the original bucket with nothing left pointing
+    at it.
+    """
+
+    name = "s3"
+
+    def __init__(self):
+        self.erased = []
+        self.deletes = 0
+
+    def identity(self):
+        from app.storage.identity import StorageIdentity
+
+        return StorageIdentity(
+            provider="s3", bucket="bucket-b", endpoint="https://s3.example.com"
+        )
+
+    def save(self, key, data):
+        raise NotImplementedError
+
+    def load(self, key):
+        raise NotImplementedError
+
+    def delete(self, key):
+        self.deletes += 1
+
+    def erase(self, key):
+        from app.storage import erasure
+
+        self.erased.append(key)
+        return erasure.ErasureOutcome(
+            versioning=erasure.VERSIONING_NONE,
+            verified_by=erasure.VERIFIED_BY_ABSENCE_WITHOUT_HISTORY,
+            versions_deleted=1,
+        )
+
+
+@pytest.fixture()
+def point_elsewhere():
+    """Swap in a provider for a different bucket, after the upload has already happened."""
+    from app.storage.provider import get_storage_provider
+
+    storage = _ElsewhereStorage()
+
+    def _swap():
+        app.dependency_overrides[get_storage_provider] = lambda: storage
+        return storage
+
+    yield _swap
+    app.dependency_overrides.pop(get_storage_provider, None)
+
+
+def test_a_resume_stored_elsewhere_is_never_erased_from_here(
+    client, auth_headers, use_fake_ai, point_elsewhere
+):
+    """Bucket A to bucket B. The resume stays, its file stays, and -- the assertion that
+    matters -- `erase` is never reached, so no delete marker is written into the wrong bucket
+    and nothing is reported as deleted that was not."""
+    use_fake_ai(FakeAIProvider(parsed=SAMPLE_PARSED_RESUME))
+    resume_id = _upload(client, auth_headers)
+    stored = list(Path(settings.upload_dir).rglob("*.pdf"))
+    assert stored, "the upload should have written a file"
+    storage = point_elsewhere()
+
+    resp = client.delete(f"/resumes/{resume_id}", headers=auth_headers)
+
+    assert resp.status_code == 500
+    assert storage.erased == [], "the wrong bucket must not be touched at all"
+    assert storage.deletes == 0, "and certainly not through the old delete path"
+    assert [p for p in stored if p.exists()] == stored, "the real file is still where it was"
+
+
+def test_a_resume_stored_elsewhere_is_not_downloaded_from_here(
+    client, auth_headers, use_fake_ai, point_elsewhere
+):
+    """A read from the wrong bucket almost always 404s, because the key is a random path --
+    which would tell the student their resume is lost when it is not. The one case that does
+    not 404 is worse: it returns an object that is not the one asked for. Refused either way,
+    and explicitly not as a 404 or a 503."""
+    use_fake_ai(FakeAIProvider(parsed=SAMPLE_PARSED_RESUME))
+    resume_id = _upload(client, auth_headers)
+    point_elsewhere()
+
+    resp = client.get(f"/resumes/{resume_id}/file", headers=auth_headers)
+
+    assert resp.status_code == 500
+    for leak in ("bucket-b", "s3.example.com", "resumes/", ".pdf"):
+        assert leak not in resp.text, f"the response body names {leak!r}"
+
+
+def test_a_reconfigured_destination_leaks_nothing_about_either_bucket(
+    client, auth_headers, use_fake_ai, point_elsewhere
+):
+    """Both destinations are configuration. Neither belongs in a student-facing body, and the
+    recorded one is not the live process's to disclose either."""
+    use_fake_ai(FakeAIProvider(parsed=SAMPLE_PARSED_RESUME))
+    resume_id = _upload(client, auth_headers)
+    point_elsewhere()
+
+    body = client.delete(f"/resumes/{resume_id}", headers=auth_headers).text
+
+    for leak in ("bucket-b", "s3.example.com", "local", "StorageIdentityMismatch", "uploads"):
+        assert leak not in body, f"the response body names {leak!r}"

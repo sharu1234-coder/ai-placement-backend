@@ -23,13 +23,14 @@ from app.core.rate_limit import limiter
 from app.models.user import User
 from app.schemas.resume import ResumeAnalysisRead, ResumeSummaryRead, ResumeUploadResponse
 from app.schemas.resume_ats_check import AtsCheckListItemRead, AtsCheckReportRead, CreateAtsCheckRequest
-from app.services import idempotency, resume_service
+from app.services import idempotency
 from app.services.ats_check_service import generate_ats_check, get_ats_check, list_ats_checks
 from app.services.profile_service import get_or_create_profile
 from app.services.resume_service import (
     ResumeErasureFailed,
     ResumeFileUnavailable,
     ResumeProcessingError,
+    ResumeStorageUnconfirmed,
     delete_resume,
     get_latest_resume,
     get_resume_analysis,
@@ -38,6 +39,7 @@ from app.services.resume_service import (
     read_uploaded_resume,
 )
 from app.storage.erasure import IMMEDIATE_ATTENTION_CODES, PROTECTED_ERROR_CODES
+from app.storage.identity import IDENTITY_FAILURES
 from app.storage.provider import StorageProvider, get_storage_provider
 
 logger = logging.getLogger(__name__)
@@ -98,6 +100,17 @@ async def upload_resume(
             )
         except ResumeProcessingError as exc:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+        except ResumeStorageUnconfirmed:
+            # 500 rather than 422: the upload is fine and the student can do nothing about it.
+            # Nothing was stored -- the destination is captured before the save precisely so
+            # that a provider which cannot say where it writes does not leave an object behind.
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=(
+                    "The resume could not be stored because the storage destination could "
+                    "not be confirmed"
+                ),
+            )
         return created, created.id
 
     try:
@@ -183,6 +196,14 @@ def get_resume_file_endpoint(
     profile = get_or_create_profile(db, current_user)
     try:
         result = get_resume_file(db, resume_id, profile.id, storage)
+    except ResumeStorageUnconfirmed:
+        # Explicitly not the 503 below, and explicitly not a 404. 503 would promise it clears
+        # by itself; a 404 would tell the student their resume is gone when the row and very
+        # likely the object are both still there. This resume cannot be read until an operator
+        # points the service back at the storage that has it, or recovers the identity.
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=_UNCONFIRMED_DETAIL
+        )
     except ResumeFileUnavailable:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -247,15 +268,24 @@ def create_ats_check_endpoint(
         raise idempotency_http_error(exc, logger, "resume.ats_check")
 
 
+#: One body for every unconfirmable destination, on purpose. The student cannot act on which
+#: of the six refusals it was, and the codes name configuration -- a bucket that moved, an
+#: owner guard that is no longer asserted -- so the detail belongs in the log, which carries
+#: the resume id and the code instead.
+_UNCONFIRMED_DETAIL = (
+    "The storage holding this resume could not be confirmed, so the request was refused"
+)
+
+
 #: Erasure failures that need an operator, not a retry: a missing bucket, a provider that
 #: cannot enumerate versions or cannot erase them, a provider that cannot say where it points,
 #: a refused authorization. Reported as 500 rather than 503 because "try again later" would be
 #: false -- none of these clears without somebody changing a configuration or a policy. A
 #: retention hold is excluded: it is answered separately, because it is the storage behaving
 #: correctly rather than a fault.
-_OPERATOR_FAULT_CODES = (IMMEDIATE_ATTENTION_CODES - PROTECTED_ERROR_CODES) | {
-    resume_service.ERASURE_IDENTITY_UNKNOWN
-}
+_OPERATOR_FAULT_CODES = (
+    IMMEDIATE_ATTENTION_CODES - PROTECTED_ERROR_CODES
+) | IDENTITY_FAILURES
 
 
 @router.delete("/{resume_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -293,6 +323,12 @@ def delete_resume_endpoint(
     profile = get_or_create_profile(db, current_user)
     try:
         deleted = delete_resume(db, resume_id, profile.id, storage)
+    except ResumeStorageUnconfirmed:
+        # The resume, its derived rows and its file are all untouched: the check runs before
+        # the erasure, which runs before any row is deleted.
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=_UNCONFIRMED_DETAIL
+        )
     except ResumeErasureFailed as exc:
         # The code is the whole diagnosis that crosses this boundary. `exc` is logged by the
         # service, which has the resume id; re-logging the message here could carry a bucket.

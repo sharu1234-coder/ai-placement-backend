@@ -36,7 +36,7 @@ from app.models.resume_analysis import ResumeAnalysis
 from app.models.user import User
 from app.services import resume_service
 from app.services.resume_service import ResumeErasureFailed, delete_resume
-from app.storage import erasure
+from app.storage import erasure, identity
 from app.storage.identity import StorageIdentity
 from app.storage.provider import StorageError
 from app.storage.s3_provider import S3StorageProvider
@@ -80,17 +80,36 @@ def make_profile(db) -> StudentProfile:
     return profile
 
 
-def make_resume(db, profile, *, key: str = KEY, with_analysis: bool = True) -> Resume:
+def make_resume(
+    db, profile, *, key: str = KEY, with_analysis: bool = True, stored_by=None
+) -> Resume:
     """A resume with the derived row the FK clean-up would delete.
 
     The analysis matters to several tests below: it is destroyed by `delete_resume`'s FK
     clean-up, so it is the evidence that the clean-up did not run when an erasure was refused.
+
+    `stored_by` is the provider that would have written the file, and its identity is recorded
+    on the row the way a real upload records it. It is not decoration: every object path on a
+    resume now refuses unless the recorded destination matches the live provider, so a resume
+    created without one is a resume no storage can act on. The default matches `_Identified`,
+    which is what most doubles below report; tests driving the real S3 adapter pass the
+    provider itself, because its identity carries a bucket and an endpoint that a bare name
+    cannot.
     """
+    destination = (
+        stored_by.identity() if stored_by is not None else StorageIdentity(provider="double")
+    )
     resume = Resume(
         profile_id=profile.id,
         file_path=key,
         original_filename="cv.pdf",
         raw_text="Python SQL",
+        storage_provider=destination.provider,
+        storage_bucket=destination.bucket,
+        storage_endpoint=destination.endpoint,
+        storage_region=destination.region,
+        storage_expected_owner=destination.expected_owner,
+        storage_config_revision=destination.revision,
     )
     db.add(resume)
     db.commit()
@@ -224,7 +243,7 @@ class TestDeletingAResumeOnVersionedStorage:
     def test_every_stored_version_is_deleted_by_id(self, db, s3):
         """The defect, closed. A delete without a version id is what left the data behind."""
         profile = make_profile(db)
-        resume = make_resume(db, profile)
+        resume = make_resume(db, profile, stored_by=s3)
         _versioned_then_empty(s3, KEY, versions=("v1", "v2", "v3"))
 
         assert delete_resume(db, resume.id, profile.id, s3) is True
@@ -237,7 +256,7 @@ class TestDeletingAResumeOnVersionedStorage:
     def test_a_delete_marker_is_removed_too(self, db, s3):
         """A marker left behind keeps the key listed as deleted with live versions under it."""
         profile = make_profile(db)
-        resume = make_resume(db, profile)
+        resume = make_resume(db, profile, stored_by=s3)
         _versioned_then_empty(s3, KEY, versions=("v1",), markers=("m1",))
 
         assert delete_resume(db, resume.id, profile.id, s3) is True
@@ -248,7 +267,7 @@ class TestDeletingAResumeOnVersionedStorage:
     def test_no_version_less_delete_is_ever_issued(self, db, s3):
         """The whole point. `delete_object` without a VersionId is the original bug."""
         profile = make_profile(db)
-        resume = make_resume(db, profile)
+        resume = make_resume(db, profile, stored_by=s3)
         _versioned_then_empty(s3, KEY, versions=("v1",))
 
         delete_resume(db, resume.id, profile.id, s3)
@@ -257,7 +276,7 @@ class TestDeletingAResumeOnVersionedStorage:
 
     def test_governance_bypass_is_never_sent(self, db, s3):
         profile = make_profile(db)
-        resume = make_resume(db, profile)
+        resume = make_resume(db, profile, stored_by=s3)
         _versioned_then_empty(s3, KEY, versions=("v1",))
 
         delete_resume(db, resume.id, profile.id, s3)
@@ -268,7 +287,7 @@ class TestDeletingAResumeOnVersionedStorage:
     def test_a_remaining_version_is_not_reported_as_a_deletion(self, db, s3):
         """Verification, not optimism: the second enumeration still finds v2."""
         profile = make_profile(db)
-        resume = make_resume(db, profile)
+        resume = make_resume(db, profile, stored_by=s3)
         s3._client.get_bucket_versioning.return_value = {"Status": "Enabled"}
         s3._client.list_object_versions.side_effect = [
             _history(KEY, ("v1", "v2")),
@@ -355,7 +374,7 @@ class TestTheResumeSurvivesARefusedErasure:
         """An EndpointConnectionError must arrive as a refusal, not as a raw botocore error
         escaping through the service into a 500 with a stack trace."""
         profile = make_profile(db)
-        resume = make_resume(db, profile)
+        resume = make_resume(db, profile, stored_by=s3)
         s3._client.get_bucket_versioning.side_effect = EndpointConnectionError(
             endpoint_url="https://s3.example.com"
         )
@@ -401,35 +420,77 @@ class TestAProviderThatCannotProveAnErasure:
                 raise AssertionError("delete must never be reached")
 
         profile = make_profile(db)
-        resume = make_resume(db, profile)
+        # Stored *by this provider*, so the refusal under test is the missing `erase` and not
+        # a destination mismatch standing in for it.
+        storage = Forgetful()
+        resume = make_resume(db, profile, stored_by=storage)
 
         with pytest.raises(ResumeErasureFailed) as caught:
-            delete_resume(db, resume.id, profile.id, Forgetful())
+            delete_resume(db, resume.id, profile.id, storage)
 
         assert caught.value.code == erasure.ERASURE_NOT_IMPLEMENTED
 
     def test_one_that_cannot_state_its_destination_never_erases(self, db):
         """`identity()` returning None means the instance cannot say where it points. The base
         class is explicit that such an instance must not be treated as pointing at the right
-        place, so the destructive call is not made at all."""
+        place, so the destructive call is not made at all.
+
+        The resume *does* have a recorded destination here, so this is not the legacy case: it
+        is a live provider that cannot be compared against anything, which is why it reports
+        `IDENTITY_UNDETERMINABLE` rather than `IDENTITY_UNKNOWN`. The two are kept apart
+        because the fixes differ -- one needs a provider that answers, the other needs an
+        operator to recover a destination that was never written down.
+        """
         profile = make_profile(db)
         resume = make_resume(db, profile)
         storage = AnonymousStorage()
 
-        with pytest.raises(ResumeErasureFailed) as caught:
+        with pytest.raises(resume_service.ResumeStorageUnconfirmed) as caught:
             delete_resume(db, resume.id, profile.id, storage)
 
-        assert caught.value.code == resume_service.ERASURE_IDENTITY_UNKNOWN
+        assert caught.value.code == identity.IDENTITY_UNDETERMINABLE
         assert storage.erased == [], "the refusal must come before the erasure, not after"
         db.rollback()
         assert db.query(Resume).count() == 1
 
-    def test_the_identity_refusal_uses_the_workers_name_for_it(self):
-        """Same refusal, same word. An operator reading either log should not have to learn
-        two names for one condition."""
+    def test_a_resume_with_no_recorded_destination_is_refused(self, db):
+        """The legacy row: uploaded before identity capture existed, so nothing says which
+        bucket holds its file. Refused rather than attempted against current configuration,
+        because a key that is absent from the wrong bucket is an idempotent success -- the rows
+        would go and the object would stay. There is no provider that can satisfy this; it
+        needs a human, which is what `scripts/review_resume_identity.py` is for.
+        """
+        profile = make_profile(db)
+        resume = make_resume(db, profile)
+        for column in (
+            "storage_provider",
+            "storage_bucket",
+            "storage_endpoint",
+            "storage_region",
+            "storage_expected_owner",
+            "storage_config_revision",
+        ):
+            setattr(resume, column, None)
+        db.commit()
+        storage = RecordingStorage()
+
+        with pytest.raises(resume_service.ResumeStorageUnconfirmed) as caught:
+            delete_resume(db, resume.id, profile.id, storage)
+
+        assert caught.value.code == identity.IDENTITY_UNKNOWN
+        assert storage.erased == [], "a legacy resume must not be erased from a guessed bucket"
+        assert storage.deleted == [], "and certainly not through the old delete path"
+        db.rollback()
+        assert db.query(Resume).count() == 1
+
+    def test_the_identity_refusal_uses_one_vocabulary(self):
+        """Same refusal, same word. An operator reading the worker's log or the API's log
+        should not have to learn two names for one condition, which is why both read their
+        codes from `app.storage.identity` rather than each defining its own."""
         from app.workers import deletion_worker
 
-        assert resume_service.ERASURE_IDENTITY_UNKNOWN == deletion_worker.IDENTITY_UNKNOWN
+        assert deletion_worker.IDENTITY_UNKNOWN is identity.IDENTITY_UNKNOWN
+        assert deletion_worker.IDENTITY_FAILURES is identity.IDENTITY_FAILURES
 
 
 class TestRepeatingADeletion:
@@ -437,7 +498,7 @@ class TestRepeatingADeletion:
         """What makes erase-then-commit safe: a crash between the two leaves a row pointing at
         an object that is already gone, and the retry has to succeed."""
         profile = make_profile(db)
-        resume = make_resume(db, profile)
+        resume = make_resume(db, profile, stored_by=s3)
         s3._client.get_bucket_versioning.return_value = {"Status": "Enabled"}
         s3._client.list_object_versions.return_value = _history(KEY)
 
@@ -449,7 +510,7 @@ class TestRepeatingADeletion:
     def test_a_retry_adds_no_delete_marker(self, db, s3):
         """A version-less delete adds a marker every time it is repeated. This must not."""
         profile = make_profile(db)
-        resume = make_resume(db, profile)
+        resume = make_resume(db, profile, stored_by=s3)
         s3._client.get_bucket_versioning.return_value = {"Status": "Enabled"}
         s3._client.list_object_versions.return_value = _history(KEY)
 
@@ -558,7 +619,7 @@ class TestWhatTheProviderIsAskedAboutTheBucket:
         """No history can exist, so absence is sufficient evidence -- and the outcome says so
         rather than letting it look like an enumeration."""
         profile = make_profile(db)
-        resume = make_resume(db, profile)
+        resume = make_resume(db, profile, stored_by=s3)
         s3._client.get_bucket_versioning.return_value = {}
         s3._client.head_object.side_effect = [
             {"ContentLength": 1},
@@ -574,7 +635,7 @@ class TestWhatTheProviderIsAskedAboutTheBucket:
         """Unknown is never zero. Guessing "unversioned" here would accept a 404 as proof on a
         bucket that may hold history."""
         profile = make_profile(db)
-        resume = make_resume(db, profile)
+        resume = make_resume(db, profile, stored_by=s3)
         s3._client.get_bucket_versioning.return_value = {"Status": "Sideways"}
 
         with pytest.raises(ResumeErasureFailed) as caught:
@@ -586,7 +647,7 @@ class TestWhatTheProviderIsAskedAboutTheBucket:
 
     def test_a_missing_bucket_is_never_a_successful_erasure(self, db, s3):
         profile = make_profile(db)
-        resume = make_resume(db, profile)
+        resume = make_resume(db, profile, stored_by=s3)
         s3._client.get_bucket_versioning.side_effect = ClientError(
             {"Error": {"Code": "NoSuchBucket", "Message": "no"}}, "GetBucketVersioning"
         )

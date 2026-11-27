@@ -18,6 +18,13 @@ from app.models.resume_ats_check import ResumeAtsCheck
 from app.schemas.resume import ResumeAnalysisRead, ResumeSummaryRead, ResumeUploadResponse
 from app.services.ai_boundary import outside_transaction
 from app.storage.erasure import ERASURE_NOT_IMPLEMENTED
+from app.storage.identity import (
+    IDENTITY_INCOMPLETE,
+    IDENTITY_UNDETERMINABLE,
+    StorageIdentity,
+    destination_refusal,
+    recorded_identity,
+)
 from app.storage.provider import StorageError, StorageProvider
 
 logger = logging.getLogger(__name__)
@@ -29,11 +36,31 @@ class ResumeProcessingError(Exception):
     """Raised when the uploaded file can't be read at all (not a valid/readable PDF)."""
 
 
-#: A deletion refused because the provider could not state where it would be deleting from.
-#: Not an erasure failure reported by storage -- the destructive call was never made. It
-#: matches `deletion_worker.IDENTITY_UNKNOWN` deliberately: the same refusal, reached the same
-#: way, should read the same in both places.
-ERASURE_IDENTITY_UNKNOWN = "StorageIdentityUnknown"
+class ResumeStorageUnconfirmed(Exception):
+    """The storage this request holds is not provably the storage that has the resume's file.
+
+    Raised instead of doing the I/O, on every path that touches a resume's object -- upload,
+    download, the ATS PDF read and deletion -- because the three ways this can go wrong are
+    each worse than a refusal:
+
+    * a **read** from the wrong destination finds nothing and reports a missing file, or, if a
+      key ever collides, hands back an object that is not the one asked for;
+    * an **erasure** against the wrong destination finds the key absent, and absence is
+      idempotent success, so the rows are deleted while the object stays where it is;
+    * an **upload** whose destination was never recorded leaves a row that no later request can
+      safely act on, which is the legacy state this stage exists to stop creating more of.
+
+    `code` is one of `app.storage.identity.IDENTITY_FAILURES`, the same taxonomy the deletion
+    worker reports, so an operator reads one vocabulary across both. It names a condition and
+    never a bucket, an endpoint, an account or a key.
+
+    Every one of these is a fact about configuration rather than about the request, which is
+    why callers answer 500 and not 503: nothing about it clears on its own.
+    """
+
+    def __init__(self, message: str, *, code: Optional[str] = None) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class ResumeErasureFailed(Exception):
@@ -53,6 +80,66 @@ class ResumeErasureFailed(Exception):
     def __init__(self, message: str, *, code: Optional[str] = None) -> None:
         super().__init__(message)
         self.code = code
+
+
+def capture_destination(storage: StorageProvider) -> StorageIdentity:
+    """Where this provider is about to write, as a fact to persist beside the key.
+
+    Read from the provider instance that will perform the `save`, not from settings. The two
+    are normally the same, but only the instance can answer for itself, and a provider built
+    from configuration that has since been re-read would make the recorded destination a claim
+    about settings rather than about the object.
+
+    Refuses rather than recording a partial answer. An identity that cannot be stated, or that
+    does not say enough to find the object again (`s3` with no bucket), is worse than no
+    identity at all: it looks captured, so every later request treats it as confirmable.
+    """
+    reader = getattr(storage, "identity", None)
+    live = reader() if callable(reader) else None
+    if live is None:
+        raise ResumeStorageUnconfirmed(
+            f"Storage provider {type(storage).__name__} cannot state where it stores objects",
+            code=IDENTITY_UNDETERMINABLE,
+        )
+    if not live.is_complete:
+        raise ResumeStorageUnconfirmed(
+            f"Storage provider {type(storage).__name__} did not say enough about its "
+            "destination to record it",
+            code=IDENTITY_INCOMPLETE,
+        )
+    return live
+
+
+def confirm_destination(resume: Resume, storage: StorageProvider, *, action: str) -> None:
+    """Refuse unless this storage is provably the storage holding this resume's file.
+
+    The single gate in front of every object operation on a resume. It compares the
+    destination recorded when the file was written against the one the live provider states,
+    using the same fail-closed rule as the deletion worker
+    (`app.storage.identity.destination_refusal`) -- so a resume uploaded under one
+    configuration cannot be read from, or erased from, another.
+
+    A resume with no recorded destination is refused too. That is the whole point of not
+    backfilling: the alternative is to assume current configuration, which is indistinguishable
+    from a correct answer afterwards and is exactly how an object becomes permanently
+    unreachable while we report it deleted. `scripts/review_resume_identity.py` lists these.
+
+    `action` appears only in the log line, never in a response. Nothing here logs the key, the
+    bucket or the endpoint: the resume id, the action and the refusal code carry the diagnosis,
+    which is the rule Stage A set for the worker and Stage B.1 kept for this service.
+    """
+    refusal = destination_refusal(recorded_identity(resume), storage)
+    if refusal is None:
+        return
+    logger.error(
+        "Refusing to %s resume_id=%s: its storage destination is not confirmed (%s)",
+        action,
+        resume.id,
+        refusal,
+    )
+    raise ResumeStorageUnconfirmed(
+        f"The storage holding resume {resume.id} could not be confirmed", code=refusal
+    )
 
 
 def extract_text_from_pdf(file_bytes: bytes) -> str:
@@ -105,6 +192,10 @@ def process_resume_upload(
     storage: StorageProvider,
 ) -> ResumeUploadResponse:
     raw_text = extract_text_from_pdf(file_bytes)
+    # Before the save, deliberately. If the provider cannot say where it writes, the honest
+    # outcome is that nothing is stored -- an object on disk that no row can be proved to point
+    # at is the orphan this stage exists to stop manufacturing.
+    destination = capture_destination(storage)
     file_path = _save_upload(storage, profile_id, filename, file_bytes)
 
     resume = Resume(
@@ -114,6 +205,17 @@ def process_resume_upload(
         file_size_bytes=len(file_bytes),
         raw_text=raw_text,
         parse_status="processing",
+        # The destination, written in the same INSERT as the key it belongs to, so a resume
+        # cannot exist with a key whose destination was never recorded. The revision is also the
+        # "captured" marker that `recorded_identity` reads -- a `local` resume has no bucket
+        # either way, so without it there is no telling a pre-capture row from a post-capture
+        # one.
+        storage_provider=destination.provider,
+        storage_bucket=destination.bucket,
+        storage_endpoint=destination.endpoint,
+        storage_region=destination.region,
+        storage_expected_owner=destination.expected_owner,
+        storage_config_revision=destination.revision,
     )
     db.add(resume)
     db.commit()
@@ -250,6 +352,11 @@ def get_resume_file(
     if resume is None or resume.profile_id != profile_id:
         return None
 
+    # Before the read, and after ownership. A load from the wrong destination is not a harmless
+    # miss: the key is a random path, so it almost always 404s and looks like a lost file, but
+    # the one case that does not is handing a student bytes that are not theirs.
+    confirm_destination(resume, storage, action="download")
+
     try:
         data = storage.load(resume.file_path)
     except Exception as exc:  # storage backends raise their own error types (OSError, ClientError, ...)
@@ -323,6 +430,11 @@ def delete_resume(db: Session, resume_id: int, profile_id: int, storage: Storage
         return False
 
     if resume.file_path:
+        # Before the erasure, so a wrong destination costs nothing. This is the case the Stage
+        # B identity guard could not see: it compared the destination recorded on a *job*
+        # against the live provider, which closes the window between a deletion request and the
+        # worker running, but a resume's file was written long before either.
+        confirm_destination(resume, storage, action="delete")
         _erase_stored_file(storage, resume.file_path, resume_id=resume.id)
 
     db.query(ResumeAnalysis).filter(ResumeAnalysis.resume_id == resume.id).delete()
@@ -350,21 +462,20 @@ def _erase_stored_file(storage: StorageProvider, key: str, *, resume_id: int) ->
     no version and no delete marker of the key remains. There is no partial success and no
     best-effort path: every other ending raises.
 
-    Two refusals happen before the destructive call, and both fail closed:
+    One refusal happens before the destructive call, and it fails closed: a provider with no
+    `erase` is resolved with `getattr` rather than called directly, so a conforming-looking
+    object that predates the erasure contract is refused instead of raising `AttributeError`
+    from the middle of a request. Real adapters cannot reach this -- the base class supplies an
+    `erase` that refuses -- but a duck-typed one can.
 
-    A provider with no `erase` is resolved with `getattr` rather than called directly, so a
-    conforming-looking object that predates the erasure contract is refused instead of raising
-    `AttributeError` from the middle of a request. Real adapters cannot reach this -- the base
-    class supplies an `erase` that refuses -- but a duck-typed one can.
-
-    A provider that cannot state its own destination does not get to perform a destructive
-    operation. `StorageProvider.identity()` returns None exactly when the instance cannot say
-    where it points, and the base class is explicit that such an instance "must not be treated
-    as pointing at the right place". The deletion worker refuses the same condition under the
-    same name. Note what is *not* checked here, and why: the worker compares a recorded identity
-    against the live one because days can pass between enqueue and execution, and configuration
-    can drift in between. Here the identity is read and acted on in the same breath, so there is
-    no window to guard -- only the question of whether the provider can answer at all.
+    The destination check is no longer here. Stage B.1 checked only whether the provider could
+    state an identity at all, and said so in this docstring on the grounds that "the identity is
+    read and acted on in the same breath, so there is no window to guard". That was wrong about
+    where the window is. The object was written at upload time, so the gap to guard runs from
+    then to now, not from this line to the next -- which is what `confirm_destination` compares,
+    at the one call site in `delete_resume` that knows which resume is being deleted. A
+    provider that cannot state its destination is still refused, now as
+    `IDENTITY_UNDETERMINABLE` rather than under a code of this module's own.
 
     Nothing in here logs the key. `resumes.file_path` is a user-scoped path, so the resume id
     and the erasure code carry the diagnosis instead, which is the same rule Stage A set for
@@ -380,18 +491,6 @@ def _erase_stored_file(storage: StorageProvider, key: str, *, resume_id: int) ->
         raise ResumeErasureFailed(
             f"Storage provider {type(storage).__name__} cannot prove an object has been erased",
             code=ERASURE_NOT_IMPLEMENTED,
-        )
-
-    identify = getattr(storage, "identity", None)
-    if not callable(identify) or identify() is None:
-        logger.error(
-            "Storage provider %s cannot state its destination, so resume_id=%s was not deleted",
-            type(storage).__name__,
-            resume_id,
-        )
-        raise ResumeErasureFailed(
-            f"Storage provider {type(storage).__name__} cannot state where it would delete from",
-            code=ERASURE_IDENTITY_UNKNOWN,
         )
 
     try:

@@ -37,7 +37,6 @@ from app.models.saved_job import SavedJob
 from app.models.user import User
 from app.services.job_hunt import alerts as job_alerts
 from app.services.job_hunt import service
-from app.storage.identity import StorageIdentity
 from tests.storage_doubles import ErasesWithoutHistory
 
 NOW = datetime.datetime(2026, 9, 9, 12, 0, 0)
@@ -302,11 +301,22 @@ class TestDeletingAResumeLinkedToJobHunt:
     def _resume(self, db, profile):
         from app.models.resume import Resume
 
+        # The destination is recorded the way a real upload records it, and it matches what
+        # `_NullStorage` reports below. Without it the delete is refused before any row is
+        # touched -- correctly, since a resume whose storage was never written down cannot be
+        # safely erased -- and this class's subject, the FK graph, would never be reached.
+        destination = self._NullStorage().identity()
         resume = Resume(
             profile_id=profile.id,
             file_path="cv.pdf",
             original_filename="cv.pdf",
             raw_text="Python SQL",
+            storage_provider=destination.provider,
+            storage_bucket=destination.bucket,
+            storage_endpoint=destination.endpoint,
+            storage_region=destination.region,
+            storage_expected_owner=destination.expected_owner,
+            storage_config_revision=destination.revision,
         )
         db.add(resume)
         db.commit()
@@ -325,7 +335,14 @@ class TestDeletingAResumeLinkedToJobHunt:
             return None
 
         def identity(self):
-            return StorageIdentity(provider="null")
+            # The local provider's destination: the upload above was written by the real
+            # provider, and Stage B.2 refuses a delete whose live destination differs from the
+            # recorded one. These tests are about the FK graph, so the double impersonates the
+            # provider that stored the file rather than introducing a mismatch that would
+            # refuse before any row was touched.
+            from app.storage.local_provider import LocalStorageProvider
+
+            return LocalStorageProvider().identity()
 
     def test_a_resume_linked_to_a_job_hunt_profile_can_still_be_deleted(self, db):
         from app.models.resume import Resume
