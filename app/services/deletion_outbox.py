@@ -76,17 +76,30 @@ def collect_storage_keys(
     second kind of object appears it is added here, and the parity test in
     tests/unit/test_deletion_outbox.py is what will notice if it is not.
     """
+    # The key and the six destination columns, and nothing else. Selecting whole `Resume`
+    # entities here would load `raw_text` -- the entire extracted text of every resume the
+    # profile owns -- to read a path and six short strings from each. `recorded_identity` is
+    # duck-typed over the `storage_*` attributes, so a Row satisfies it exactly as a model
+    # instance does.
     rows = (
-        db.query(Resume)
+        db.query(
+            Resume.file_path,
+            Resume.storage_provider,
+            Resume.storage_bucket,
+            Resume.storage_endpoint,
+            Resume.storage_region,
+            Resume.storage_expected_owner,
+            Resume.storage_config_revision,
+        )
         .filter(Resume.profile_id == profile_id, Resume.file_path.isnot(None))
         .all()
     )
     seen: dict[str, Optional[StorageIdentity]] = {}
-    for resume in rows:
-        key = resume.file_path
+    for row in rows:
+        key = row.file_path
         if not key or key in seen:
             continue
-        seen[key] = recorded_identity(resume)
+        seen[key] = recorded_identity(row)
     return [(key_identity, key) for key, key_identity in seen.items()]
 
 
@@ -108,6 +121,13 @@ def enqueue(
     db.flush()
 
     now = _now()
+    # Resolved once for the whole batch, and only when a legacy key is actually present.
+    # `from_settings()` re-reads configuration, so calling it inside the loop would repeat that
+    # per key for no benefit -- every legacy job in one request gets the same value anyway.
+    current_provider: Optional[str] = None
+    if any(identity is None for identity, _ in keys):
+        current_provider = StorageIdentity.from_settings().provider
+
     for identity, key in keys:
         db.add(
             DeletionJob(
@@ -119,9 +139,7 @@ def enqueue(
                 # current provider name is written because it is the most useful thing an
                 # operator can see about a job they will have to resolve by hand -- never as a
                 # claim about where the object is.
-                storage_provider=(
-                    identity.provider if identity else StorageIdentity.from_settings().provider
-                ),
+                storage_provider=(identity.provider if identity else current_provider),
                 storage_key=key,
                 # The destination, written in the same transaction as the job itself, so a job
                 # can never exist without the identity it must be verified against. The
