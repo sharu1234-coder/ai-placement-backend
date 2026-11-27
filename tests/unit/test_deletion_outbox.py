@@ -92,6 +92,15 @@ def _seed_account(db, email="leaving@example.com", keys=(_KEY,)):
     profile = StudentProfile(user_id=user.id)
     db.add(profile)
     db.flush()
+    # The destination is recorded on the resume the way a real upload records it, and it
+    # matches what `FakeStorage` reports. Since Stage B.2 the job's identity is copied from the
+    # resume rather than read from settings at deletion time -- a resume's file was written
+    # whenever the student uploaded it, not when they asked to leave -- so a resume seeded
+    # without one produces a job with no revision, which the worker correctly holds for an
+    # operator. That is a real behaviour worth its own test, and it has one
+    # (`TestALegacyResumeWithNoRecordedDestination`); here it would just stop every job
+    # draining.
+    destination = FakeStorage().identity()
     for index, key in enumerate(keys):
         db.add(
             Resume(
@@ -99,6 +108,12 @@ def _seed_account(db, email="leaving@example.com", keys=(_KEY,)):
                 file_path=key,
                 raw_text=f"resume {index}",
                 parse_status="done",
+                storage_provider=destination.provider,
+                storage_bucket=destination.bucket,
+                storage_endpoint=destination.endpoint,
+                storage_region=destination.region,
+                storage_expected_owner=destination.expected_owner,
+                storage_config_revision=destination.revision,
             )
         )
     db.commit()
@@ -1012,3 +1027,66 @@ class TestFinalizationRecoversFromACrashBeforeClosure:
         assert statuses[finished_user] == "done"
         assert statuses[waiting_user] == "pending"
         assert db_session.get(User, waiting_user) is not None
+
+
+class TestALegacyResumeWithNoRecordedDestination:
+    """A resume uploaded before identity capture existed: `file_path` but no destination.
+
+    These rows are not backfilled, deliberately. The only value available to stamp on them is
+    this process's current configuration, and if that is wrong the object becomes permanently
+    unreachable the moment the job is marked done, because closing the request deletes the last
+    row that held the key. So they fail closed instead and wait for a human, which is what
+    `scripts/review_resume_identity.py` exists to surface.
+    """
+
+    def _seed_legacy(self, db):
+        user, profile = _seed_account(db)
+        for resume in db.query(Resume).filter(Resume.profile_id == profile.id).all():
+            resume.storage_provider = None
+            resume.storage_bucket = None
+            resume.storage_endpoint = None
+            resume.storage_region = None
+            resume.storage_expected_owner = None
+            resume.storage_config_revision = None
+        db.commit()
+        return user
+
+    def test_the_job_is_still_created_so_the_object_is_not_forgotten(self, db_session):
+        """Refusing to enqueue would be worse than enqueuing something held: the resume row is
+        deleted by Phase 1 either way, so skipping the job would destroy the only pointer to an
+        object nobody would ever come looking for again."""
+        user = self._seed_legacy(db_session)
+
+        delete_account(db_session, user, FakeStorage())
+
+        job = db_session.query(DeletionJob).one()
+        assert job.storage_key, "the key must be written down even without a destination"
+        assert job.storage_config_revision is None, "and marked as never having been captured"
+
+    def test_the_worker_holds_it_instead_of_erasing_on_a_guess(self, db_session):
+        """`IDENTITY_UNKNOWN`, the same code and the same treatment a legacy *job* gets. Held,
+        not failed and not completed, and still claimable so that it resumes by itself once an
+        operator supplies the destination."""
+        user = self._seed_legacy(db_session)
+        delete_account(db_session, user, FakeStorage())
+        storage = FakeStorage()
+
+        deletion_worker.run_once(db_session, storage)
+
+        job = db_session.query(DeletionJob).one()
+        assert storage.deleted == [], "nothing may be erased from a guessed destination"
+        assert job.status != "done"
+        assert job.last_error_class == deletion_worker.IDENTITY_UNKNOWN
+
+    def test_the_account_still_leaves_and_access_is_still_revoked(self, db_session):
+        """The held job must not hold up Phase 1. A student's ability to leave does not depend
+        on a bucket being reachable, let alone on an operator resolving a destination -- their
+        access is revoked in the same transaction that records the obligation.
+        """
+        user = self._seed_legacy(db_session)
+
+        delete_account(db_session, user, FakeStorage())
+
+        db_session.refresh(user)
+        assert user.is_active is False
+        assert db_session.query(Resume).count() == 0, "the profile's rows still go"

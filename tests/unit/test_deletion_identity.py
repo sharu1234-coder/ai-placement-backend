@@ -64,10 +64,26 @@ def _seed_account(db, keys=(_KEY,)):
     profile = StudentProfile(user_id=user.id)
     db.add(profile)
     db.flush()
+    # Read here, at seed time, because that is when these resumes are notionally uploaded --
+    # and since Stage B.2 the job's destination is copied from the resume rather than read from
+    # settings when the account is deleted. Tests that monkeypatch storage settings do so
+    # before seeding, so the resume records the configuration under test and the job carries it
+    # forward, which is the property worth asserting: a job's destination is where the file was
+    # put, not where this process happens to be pointed when the student asks to leave.
+    destination = StorageIdentity.from_settings()
     for index, key in enumerate(keys):
         db.add(
             Resume(
-                profile_id=profile.id, file_path=key, raw_text=f"r{index}", parse_status="done"
+                profile_id=profile.id,
+                file_path=key,
+                raw_text=f"r{index}",
+                parse_status="done",
+                storage_provider=destination.provider,
+                storage_bucket=destination.bucket,
+                storage_endpoint=destination.endpoint,
+                storage_region=destination.region,
+                storage_expected_owner=destination.expected_owner,
+                storage_config_revision=destination.revision,
             )
         )
     db.commit()
@@ -650,3 +666,62 @@ class TestTheBucketOwnerGuard:
         review = deletion_worker.review_identities(db_session)
 
         assert "999988887777" not in repr(review)
+
+
+class TestTheDestinationComesFromTheUploadNotTheDeletion:
+    """The gap Stage B.2 closes, and the one Stage B's guard could not see.
+
+    `collect_storage_keys` used to read `StorageIdentity.from_settings()` once and stamp it on
+    every one of a profile's keys. So a job created today recorded *today's* bucket, the worker
+    compared that against today's live provider, found them equal, and declared the destination
+    verified -- for an object written to a different bucket months earlier. The comparison
+    happened; it just compared configuration with itself.
+
+    A file's destination is a fact about the upload. These assert it survives a reconfiguration
+    that happens in between.
+    """
+
+    def _reconfigure_to(self, monkeypatch, bucket):
+        from app.core.config import settings
+
+        monkeypatch.setattr(settings, "storage_provider", "s3")
+        monkeypatch.setattr(settings, "storage_s3_bucket", bucket)
+        monkeypatch.setattr(settings, "storage_s3_endpoint_url", "https://e.example.com")
+        monkeypatch.setattr(settings, "storage_s3_region", "ap-south-1")
+
+    def test_a_job_records_the_bucket_the_file_was_written_to(self, db_session, monkeypatch):
+        """Uploaded to bucket A, account deleted after the move to bucket B. The job must say
+        A, because that is where the object is."""
+        self._reconfigure_to(monkeypatch, "bucket-a")
+        user, _ = _seed_account(db_session)
+
+        # The move. Everything after this point sees bucket B.
+        self._reconfigure_to(monkeypatch, "bucket-b")
+        delete_account(db_session, user, Recording())
+
+        job = db_session.query(DeletionJob).one()
+        assert job.storage_bucket == "bucket-a", "the job must point where the object is"
+
+    def test_the_worker_will_not_erase_it_from_the_new_bucket(self, db_session, monkeypatch):
+        """The consequence, which is the part that matters. A delete sent to bucket B finds the
+        key absent, and absence is idempotent success -- so without this the job completes,
+        the request closes, the last row holding the key is deleted, and the object sits in
+        bucket A forever."""
+        self._reconfigure_to(monkeypatch, "bucket-a")
+        user, _ = _seed_account(db_session)
+        self._reconfigure_to(monkeypatch, "bucket-b")
+        delete_account(db_session, user, Recording())
+
+        # A worker pointed at the new bucket, which is what a deployed worker would be.
+        worker_storage = Recording(
+            identity=StorageIdentity(
+                provider="s3", bucket="bucket-b", endpoint="https://e.example.com",
+                region="ap-south-1",
+            )
+        )
+        deletion_worker.run_once(db_session, worker_storage)
+
+        job = db_session.query(DeletionJob).one()
+        assert worker_storage.deleted == [], "nothing may be deleted from the wrong bucket"
+        assert job.status != "done", "an unverified destination must never complete a job"
+        assert job.last_error_class == deletion_worker.IDENTITY_MISMATCH

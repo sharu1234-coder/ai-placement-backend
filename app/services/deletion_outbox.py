@@ -38,7 +38,7 @@ from app.models.deletion_job import DeletionJob
 from app.models.deletion_request import DeletionRequest
 from app.models.resume import Resume
 from app.models.user import User
-from app.storage.identity import StorageIdentity
+from app.storage.identity import StorageIdentity, recorded_identity
 
 logger = logging.getLogger(__name__)
 
@@ -47,35 +47,51 @@ def _now() -> datetime.datetime:
     return datetime.datetime.now(datetime.timezone.utc)
 
 
-def collect_storage_keys(db: Session, profile_id: int) -> list[tuple[StorageIdentity, str]]:
-    """Every (storage identity, key) pair the profile owns, deduplicated.
+def collect_storage_keys(
+    db: Session, profile_id: int
+) -> list[tuple[Optional[StorageIdentity], str]]:
+    """Every (recorded destination, key) pair the profile owns, deduplicated.
 
     Read before anything is deleted, because afterwards there is nowhere left to read it from.
     Deduplicated here as well as by the unique constraint: two resume rows may legitimately
     reference one object, and that is one object to erase, not two jobs that race each other.
 
+    The destination comes from the resume row, not from settings, and that is the Stage B.2
+    correction. This function used to read `StorageIdentity.from_settings()` once and stamp it
+    on every key, with a comment claiming it was "the only moment at which the configuration
+    and the object are known to agree". That is true of a *job*, which is created and executed
+    within one configuration era if nothing changes in between -- but it was never true of a
+    resume, whose file was written whenever the student uploaded it. So the job recorded the
+    configuration current at deletion time, the worker compared that against the live provider,
+    found them equal, and confirmed a destination nobody had checked against the object. The
+    guard was real; what it verified was not.
+
+    None means the resume predates identity capture, and it is passed through rather than
+    filled in. `enqueue` writes a job with no revision, the worker holds it for an operator,
+    and nothing is erased on a guess -- which is the whole point, because a key absent from the
+    wrong bucket is an idempotent success that would mark the job done and delete the last row
+    holding the key.
+
     `resumes.file_path` is the only profile-owned storage key in this schema today. When a
     second kind of object appears it is added here, and the parity test in
     tests/unit/test_deletion_outbox.py is what will notice if it is not.
     """
-    # Read once, here, because this is the only moment at which the configuration and the
-    # object are known to agree. The identity is then a fact about the object rather than a
-    # lookup the worker repeats later against whatever is configured by then.
-    identity = StorageIdentity.from_settings()
-    keys = (
-        db.query(Resume.file_path)
+    rows = (
+        db.query(Resume)
         .filter(Resume.profile_id == profile_id, Resume.file_path.isnot(None))
         .all()
     )
-    seen: dict[str, StorageIdentity] = {}
-    for (key,) in keys:
-        if key and key not in seen:
-            seen[key] = identity
+    seen: dict[str, Optional[StorageIdentity]] = {}
+    for resume in rows:
+        key = resume.file_path
+        if not key or key in seen:
+            continue
+        seen[key] = recorded_identity(resume)
     return [(key_identity, key) for key, key_identity in seen.items()]
 
 
 def enqueue(
-    db: Session, *, original_user_id: int, keys: list[tuple[StorageIdentity, str]]
+    db: Session, *, original_user_id: int, keys: list[tuple[Optional[StorageIdentity], str]]
 ) -> DeletionRequest:
     """Insert the request and its jobs. Caller owns the transaction, deliberately.
 
@@ -96,21 +112,32 @@ def enqueue(
         db.add(
             DeletionJob(
                 deletion_request_id=request.id,
-                storage_provider=identity.provider,
+                # `storage_provider` is NOT NULL, so a resume with no recorded destination
+                # still needs a value here. It is informational only in that case: the NULL
+                # revision below is what `recorded_identity` reads, and it returns None for the
+                # whole identity regardless of what this says, so the worker holds the job. The
+                # current provider name is written because it is the most useful thing an
+                # operator can see about a job they will have to resolve by hand -- never as a
+                # claim about where the object is.
+                storage_provider=(
+                    identity.provider if identity else StorageIdentity.from_settings().provider
+                ),
                 storage_key=key,
                 # The destination, written in the same transaction as the job itself, so a job
                 # can never exist without the identity it must be verified against. The
                 # revision is also the marker that capture happened at all -- the worker reads
                 # a NULL there as "this job predates identity capture" and holds it, rather
                 # than binding it to whatever is configured at execution time.
-                storage_bucket=identity.bucket,
-                storage_endpoint=identity.endpoint,
-                storage_region=identity.region,
+                storage_bucket=identity.bucket if identity else None,
+                storage_endpoint=identity.endpoint if identity else None,
+                storage_region=identity.region if identity else None,
                 # The owner guard travels with the job so the worker can send it as
                 # ExpectedBucketOwner. NULL means no guard was configured at capture time,
                 # which is a supported state and not the same as unverified.
-                storage_expected_owner=identity.expected_owner,
-                storage_config_revision=identity.revision,
+                storage_expected_owner=identity.expected_owner if identity else None,
+                # NULL here is the "never captured" marker the worker fails closed on. It is
+                # the one field that must not be invented.
+                storage_config_revision=identity.revision if identity else None,
                 status="pending",
                 attempts=0,
                 # Claimable at once. The 5-minute pickup target is about how often the worker

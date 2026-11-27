@@ -22,6 +22,10 @@ from app.schemas.resume_ats_check import (
 from app.services.ai_boundary import outside_transaction
 from app.services.ats_scoring.config import CATEGORY_LABELS
 from app.services.ats_scoring.engine import ScoringResult, score_resume
+from app.services.resume_service import (
+    ResumeStorageUnconfirmed,
+    confirm_destination,
+)
 from app.storage.provider import StorageError, StorageProvider
 
 logger = logging.getLogger(__name__)
@@ -104,7 +108,25 @@ def generate_ats_check(
 
     pdf_bytes: Optional[bytes] = None
     try:
+        # The destination is confirmed before the read, like every other object path on a
+        # resume. What happens on a refusal is different here, and deliberately so: this read
+        # is already best-effort -- `score_resume` falls back to text-only checks when the PDF
+        # is unavailable -- so a refusal degrades exactly as an unreadable file does, and the
+        # student still gets a check. Turning it into a hard failure would break a working
+        # feature for every resume uploaded before identity capture, which is a worse answer
+        # than a slightly weaker score. The reason is logged with its code either way.
+        #
+        # What it must not do is read from an unconfirmed destination, because the key is a
+        # random path and the one case that does not simply 404 is scoring a student against
+        # bytes that are not theirs.
+        confirm_destination(resume, storage, action="score")
         pdf_bytes = storage.load(resume.file_path)
+    except ResumeStorageUnconfirmed as exc:
+        logger.warning(
+            "Scoring resume_id=%s without its PDF: storage not confirmed (%s)",
+            resume_id,
+            exc.code,
+        )
     except StorageError as exc:
         logger.warning("Could not load stored PDF for resume_id=%s: %s", resume_id, exc)
 
