@@ -31,6 +31,16 @@ alembic upgrade head          # creates app.db (SQLite) with the current schema
 
 ## Run
 
+**Local development only.** The command below is for a dev checkout: it binds all
+interfaces by default, reloads on edit, and passes no trusted-proxy policy. Do not use it,
+or any hand-written `uvicorn` command, to run a deployment.
+
+The approved production start is `python -m app.server` -- see
+`docs/PRODUCTION_DEPLOYMENT.md` section 28 and `deploy/systemd/talviora-api.service`, whose
+`ExecStart` runs exactly that. In production `validate_for_production` refuses to boot
+without a stated trusted-proxy policy, so the command below would fail there rather than
+start insecurely.
+
 ```bash
 uvicorn app.main:app --reload
 ```

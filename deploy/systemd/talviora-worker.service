@@ -13,6 +13,18 @@
 # configuration at all -- so nothing in this unit concerns FORWARDED_ALLOW_IPS. The
 # API's rate limits are unaffected by it.
 #
+# NOT A UVICORN WORKER. The word is overloaded and the two meanings are unrelated:
+#
+#   * "worker" HERE means this background process -- a separate service that drains the
+#     account-deletion outbox. It runs no Uvicorn and serves no HTTP.
+#   * "workers" in app/server.py means Uvicorn's process count, fixed at 1 because the
+#     rate limiter's counters are per process (see the scaling gate in
+#     docs/PRODUCTION_DEPLOYMENT.md section 28.7).
+#
+# Running this service does NOT add a Uvicorn worker and does not affect that count, so it
+# does not weaken any authentication rate limit. Conversely, the one-worker rule says
+# nothing about this service: it is required for the API process only.
+#
 # RUN EXACTLY ONE INSTANCE. Not for rate-limit reasons -- the lease handles
 # concurrency correctly -- but because a second instance doubles the request rate
 # against object storage for no gain. If a second one is ever wanted, read the lease

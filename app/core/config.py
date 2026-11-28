@@ -581,9 +581,13 @@ def validate_for_production() -> None:
             f"{fault} Client IP resolution feeds the authentication rate limits "
             "(app/core/rate_limit.py), so getting this wrong either hands every attacker a "
             "fresh login quota per request or collapses the whole user base into one bucket. "
-            "Start the server with app/server.py (python -m app.server), which sets this "
-            "policy itself, or set the variable to exactly "
-            f"{TRUSTED_PROXY_IPS!r} in the unit's environment file."
+            "The approved start is `python -m app.server` (app/server.py, which the "
+            "systemd unit's ExecStart runs), which sets this policy itself -- so the normal fix is to use "
+            "it rather than to set this variable anywhere. If you are deliberately starting "
+            "the server some other way, export "
+            f"{FORWARDED_ALLOW_IPS_ENV}={TRUSTED_PROXY_IPS!r} in that process's own "
+            "environment, and note that this check cannot see a conflicting Uvicorn command "
+            "line: see docs/PRODUCTION_DEPLOYMENT.md section 28.2."
         )
 
 

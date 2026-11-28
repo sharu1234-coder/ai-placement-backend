@@ -1007,6 +1007,15 @@ malformed; both are the all-one-bucket failure.
 
 ### 28.3 Nginx
 
+> **Validation status: UNVERIFIED.** `nginx -t` has not been run against
+> `deploy/nginx/talviora-api.conf`. Nginx is not installed on the machine where it was
+> written, so the file has been reviewed but never parsed by nginx. Run `nginx -v` and
+> `sudo nginx -t` on the intended deployment host and confirm both "syntax is ok" and "test
+> is successful" before relying on it -- and resolve the version-gated `http2` directive
+> first (it needs nginx >= 1.25.1; Ubuntu 24.04 LTS ships 1.24.0, where it is an unknown
+> directive and nginx will not start). This status must only be updated from the output of
+> `nginx -t` on that host.
+
 Install `deploy/nginx/talviora-api.conf`, replacing `api.example.com`:
 
 ```bash
