@@ -310,12 +310,26 @@ class TestTheLauncherIsTheOnlySupportedStart:
             server.align_environment()
 
     def test_it_sets_the_policy_when_the_environment_is_silent(self, monkeypatch):
-        from app import server
+        """`align_environment` writes to os.environ, so this test has to clean up after it.
 
-        monkeypatch.delenv(FORWARDED_ALLOW_IPS_ENV, raising=False)
-        server.align_environment()
+        It mutates the real process environment -- that is its job, since `app.main` reads the
+        variable at import. `monkeypatch.delenv` only records the state it removed, so it will
+        not undo a value written afterwards by the code under test. Setting the variable
+        through monkeypatch first means there IS a recorded prior state to restore.
+
+        This matters beyond tidiness: an earlier version of this test leaked
+        FORWARDED_ALLOW_IPS into the process, and tests/unit/test_config_validation.py then
+        passed in the same run only because this file happened to run first. That is a false
+        pass, and it hid the fact that the new guard had added a production requirement those
+        tests did not state.
+        """
         import os
 
+        from app import server
+
+        monkeypatch.setenv(FORWARDED_ALLOW_IPS_ENV, "placeholder-so-undo-restores-this")
+        monkeypatch.delenv(FORWARDED_ALLOW_IPS_ENV)
+        server.align_environment()
         assert os.environ[FORWARDED_ALLOW_IPS_ENV] == TRUSTED_PROXY_IPS
 
     def test_it_leaves_an_already_correct_environment_alone(self, monkeypatch):

@@ -1,6 +1,30 @@
 import pytest
 
-from app.core.config import Settings, settings, validate_for_production
+from app.core.config import (
+    FORWARDED_ALLOW_IPS_ENV,
+    TRUSTED_PROXY_IPS,
+    Settings,
+    settings,
+    validate_for_production,
+)
+
+
+@pytest.fixture(autouse=True)
+def _trusted_proxy_policy(monkeypatch) -> None:
+    """A stated trusted-proxy policy is part of a production-ready environment (Phase 2B).
+
+    Autouse because every test in this file is about one *other* setting, and the pattern this
+    file already follows is to neutralise unrelated production requirements rather than restate
+    them per test -- see `_production_ready_ai` below for the same move.
+
+    Set as a real environment variable because that is what the guard reads. It deliberately
+    does not read a `Settings` field: pydantic loads `.env` and Uvicorn does not, so a value
+    present only in `.env` would satisfy a settings-based check while Uvicorn kept its own
+    default. `monkeypatch.setenv` restores the previous state, including absence.
+
+    The guard's own behaviour is covered in tests/unit/test_proxy_trust.py, not here.
+    """
+    monkeypatch.setenv(FORWARDED_ALLOW_IPS_ENV, TRUSTED_PROXY_IPS)
 
 
 def _production_ready_ai(monkeypatch) -> None:
